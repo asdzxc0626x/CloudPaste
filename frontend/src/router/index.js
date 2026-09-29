@@ -221,13 +221,13 @@ const routes = [
           adminOnly: true, // 只有管理员可访问
         },
       },
-      // 修改点（代码仓库备份功能）：新增管理页面路由
+      // 修改点（代码仓库备份功能）：新增管理页面路由（优化项：入口改名「仓库管理」）
       {
         path: "repo-backup",
         name: "AdminRepoBackup",
-        component: createOfflineAwareImport(() => import("../modules/admin/views/RepoBackupView.vue"), "代码仓库备份"),
+        component: createOfflineAwareImport(() => import("../modules/admin/views/RepoBackupView.vue"), "仓库管理"),
         meta: {
-          title: "代码仓库备份 - CloudPaste",
+          title: "仓库管理 - CloudPaste",
           adminOnly: true, // 只有管理员可访问
         },
       },

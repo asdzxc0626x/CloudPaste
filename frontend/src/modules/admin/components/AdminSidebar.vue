@@ -558,6 +558,8 @@ const visibleMenuItems = computed(() => {
       { id: "dashboard", name: t("admin.sidebar.dashboard"), icon: "chart-bar", type: "item", routeName: "AdminDashboard" },
       { id: "text-management", name: t("admin.sidebar.textManagement"), icon: "document-text", type: "item", routeName: "AdminTextManagement" },
       { id: "file-management", name: t("admin.sidebar.fileManagement"), icon: "folder", type: "item", routeName: "AdminFileManagement" },
+      // 修改点（代码仓库备份优化）：入口从「任务管理」分组移到「文件管理」下面，并改名「仓库管理」
+      { id: "repo-backup", name: t("admin.sidebar.repoBackup"), icon: "code", type: "item", routeName: "AdminRepoBackup" },
       { id: "storage", name: t("admin.sidebar.storageConfig"), icon: "cloud", type: "item", routeName: "AdminStorage" },
       { id: "mount-management", name: t("admin.sidebar.mountManagement"), icon: "server", type: "item", routeName: "AdminMountManagement" },
       { id: "fs-meta-management", name: t("admin.sidebar.fsMetaManagement"), icon: "information-circle", type: "item", routeName: "AdminFsMetaManagement" },
@@ -569,8 +571,6 @@ const visibleMenuItems = computed(() => {
         children: [
           { id: "scheduled-jobs", name: t("admin.sidebar.scheduledJobs"), icon: "bell-alert", type: "item", routeName: "AdminScheduledJobs" },
           { id: "tasks", name: t("admin.sidebar.tasks"), icon: "list-bullet", type: "item", routeName: "AdminTasks" },
-          // 修改点（代码仓库备份功能）：挂在任务管理分组下
-          { id: "repo-backup", name: t("admin.sidebar.repoBackup"), icon: "code", type: "item", routeName: "AdminRepoBackup" },
         ],
       },
       { id: "fs-index-management", name: t("admin.sidebar.fsIndexManagement"), icon: "search", type: "item", routeName: "AdminFsIndexManagement" },

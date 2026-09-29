@@ -50,7 +50,7 @@ export default {
     taskManagement: "Task Management",
     tasks: "Tasks",
     scheduledJobs: "Scheduled Jobs",
-    repoBackup: "Repository Backup",
+    repoBackup: "Repositories",
     systemSettings: "System Settings",
     globalSettings: "Global Settings",
     previewSettings: "Preview Settings",

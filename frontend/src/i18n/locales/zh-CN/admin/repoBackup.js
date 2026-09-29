@@ -1,8 +1,8 @@
 // 代码仓库备份（修改点：新增功能）
 export default {
   repoBackup: {
-    title: "代码仓库备份",
-    subtitle: "将外部代码仓库的源码快照备份到已配置的存储挂载点，防止仓库删除、封禁导致源码丢失",
+    title: "仓库管理",
+    subtitle: "登记外部代码仓库，按分支或 Release 自动检查更新，并将源码快照备份到一个或多个存储挂载点",
 
     toolbar: {
       create: "添加仓库",

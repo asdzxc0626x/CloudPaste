@@ -50,7 +50,7 @@ export default {
     taskManagement: "任务管理",
     tasks: "任务列表",
     scheduledJobs: "定时任务",
-    repoBackup: "代码仓库备份",
+    repoBackup: "仓库管理",
     systemSettings: "系统设置",
     globalSettings: "全局设置",
     previewSettings: "预览设置",

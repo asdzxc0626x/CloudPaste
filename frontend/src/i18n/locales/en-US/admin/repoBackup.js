@@ -1,9 +1,9 @@
 // Repository backup (new feature)
 export default {
   repoBackup: {
-    title: "Repository Backup",
+    title: "Repositories",
     subtitle:
-      "Back up source snapshots of external code repositories to a configured storage mount, protecting against repository deletion or suspension",
+      "Register external code repositories, watch them by branch or release, and back up source snapshots to one or more storage mounts",
 
     toolbar: {
       create: "Add Repository",
