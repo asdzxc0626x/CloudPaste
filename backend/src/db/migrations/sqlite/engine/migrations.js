@@ -121,6 +121,74 @@ async function normalizeStorageConfigsBooleanFields(db) {
   return { total: rows.length, updated, skipped, failed };
 }
 
+/**
+ * 版本36：代码仓库备份结构升级
+ *
+ * 修改点（仓库备份优化）：
+ * - 多分支：track_refs_json 存分支数组（track_ref 保留为“主分支”以兼容旧代码与 NOT NULL 约束）
+ * - 多备份目标：target_mount_ids_json 存挂载点数组（target_mount_id 保留为第一个目标）
+ * - 版本保留数：retention_count，默认 10
+ * - 新增 code_repository_backup_targets（每个目标一行的落盘结果）
+ *
+ * 幂等/可重入：列存在性用 PRAGMA 判断；回填只在数组仍为空时执行。
+ */
+export async function migrateCodeRepositoryMultiTrackAndTargets(db) {
+  // 1) 旧唯一索引基于单个 track_ref，多分支下不再适用；删掉后由 createCodeRepositoryTables 重建为普通索引
+  try {
+    await db.prepare(`DROP INDEX IF EXISTS idx_code_repositories_identity`).run();
+  } catch (e) {
+    console.warn("版本36：删除旧身份唯一索引失败（可忽略）:", e?.message || e);
+  }
+
+  // 2) 新增列
+  await addTableField(db, DbTables.CODE_REPOSITORIES, "track_refs_json", `track_refs_json TEXT NOT NULL DEFAULT '[]'`);
+  await addTableField(db, DbTables.CODE_REPOSITORIES, "target_mount_ids_json", `target_mount_ids_json TEXT NOT NULL DEFAULT '[]'`);
+  await addTableField(db, DbTables.CODE_REPOSITORIES, "retention_count", `retention_count INTEGER NOT NULL DEFAULT 10`);
+
+  // 3) 回填：把旧的单值字段搬进数组字段
+  try {
+    const res = await db
+      .prepare(
+        `SELECT id, track_mode, track_ref, target_mount_id, track_refs_json, target_mount_ids_json
+         FROM ${DbTables.CODE_REPOSITORIES}`,
+      )
+      .all();
+    const rows = Array.isArray(res?.results) ? res.results : [];
+
+    for (const row of rows) {
+      const sets = [];
+      const binds = [];
+
+      const refsEmpty = !row.track_refs_json || row.track_refs_json === "[]";
+      if (refsEmpty && row.track_ref) {
+        sets.push("track_refs_json = ?");
+        binds.push(JSON.stringify([String(row.track_ref)]));
+      }
+
+      const mountsEmpty = !row.target_mount_ids_json || row.target_mount_ids_json === "[]";
+      if (mountsEmpty && row.target_mount_id) {
+        sets.push("target_mount_ids_json = ?");
+        binds.push(JSON.stringify([String(row.target_mount_id)]));
+      }
+
+      if (sets.length === 0) continue;
+      binds.push(row.id);
+      await db
+        .prepare(`UPDATE ${DbTables.CODE_REPOSITORIES} SET ${sets.join(", ")} WHERE id = ?`)
+        .bind(...binds)
+        .run();
+    }
+    console.log(`版本36：回填仓库跟踪引用/备份目标数组完成，共检查 ${rows.length} 条`);
+  } catch (e) {
+    console.warn("版本36：回填仓库数组字段失败（可忽略）:", e?.message || e);
+  }
+
+  // 4) 重建索引 + 新建备份目标结果表（均幂等）
+  await createCodeRepositoryTables(db);
+
+  return { ok: true };
+}
+
 export async function addTableField(db, tableName, fieldName, fieldDefinition) {
   try {
     const columnInfo = await db.prepare(`PRAGMA table_info(${tableName})`).all();
@@ -842,6 +910,17 @@ export async function runLegacyMigrationByVersion(db, version) {
       break;
     }
 
+    // 修改点（仓库备份优化：多分支 + 多备份目标 + 版本保留数）
+    case 36: {
+      console.log("版本36：code_repositories 支持多分支 / 多备份目标 / 版本保留数，并新增备份目标结果表...");
+      try {
+        await migrateCodeRepositoryMultiTrackAndTargets(db);
+      } catch (e) {
+        console.warn("版本36：仓库备份结构升级失败（可忽略，后续会再次尝试）:", e?.message || e);
+      }
+      break;
+    }
+
     default:
       console.log(`未知的迁移版本: ${version}`);
       break;
@@ -851,6 +930,7 @@ export async function runLegacyMigrationByVersion(db, version) {
 export default {
   addTableField,
   removeTableField,
+  migrateCodeRepositoryMultiTrackAndTargets,
   migrateFilesTableToMultiStorage,
   rebuildFilesTable,
   migrateToBitFlagPermissions,

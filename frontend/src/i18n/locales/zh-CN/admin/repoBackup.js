@@ -1,4 +1,4 @@
-// 代码仓库备份（修改点：新增功能）
+// 仓库管理（修改点：新增功能）
 export default {
   repoBackup: {
     title: "仓库管理",
@@ -21,6 +21,8 @@ export default {
       checkedAt: "检查于",
       neverBackedUp: "尚未备份",
       mountMissing: "挂载点已丢失",
+      retention: "保留 {count} 个版本",
+      targetsOk: "目标 {ok}/{total} 写入成功",
     },
 
     status: {
@@ -30,6 +32,8 @@ export default {
     backupStatus: {
       running: "进行中",
       success: "成功",
+      // partial = 多目标时只有部分目标写成功
+      partial: "部分成功",
       failed: "失败",
       skipped: "已跳过",
     },
@@ -40,8 +44,12 @@ export default {
     },
 
     check: {
-      hasUpdate: "检测到新版本：{version}，可以备份",
-      upToDate: "最新版本 {version} 已备份",
+      hasUpdate: "检测到新版本，可以备份",
+      upToDate: "最新版本已备份",
+      allFailed: "全部跟踪分支检查失败",
+      partialFailed: "（{count} 个分支检查失败）",
+      refHasUpdate: "该分支有新版本待备份",
+      refUpToDate: "该分支已是最新备份",
     },
 
     actions: {
@@ -72,23 +80,34 @@ export default {
       repoIdentifierHint: "支持 owner/repo 或完整仓库 URL，第一阶段仅支持公开仓库",
       name: "展示名称",
       namePlaceholder: "留空则使用 owner/repo",
+
+      trackSection: "跟踪设置",
       trackMode: "跟踪模式",
       trackModeHint: {
         branch: "跟踪指定分支的最新 commit",
         release: "跟踪最新 Release；仓库没有 Release 时回退到最新 Tag",
       },
-      branch: "分支名",
+      branches: "跟踪分支",
+      branchesHint: "可添加多个分支，每个分支独立检查更新、去重与备份。输入后按回车或逗号确认",
+      addBranchPlaceholder: "继续添加分支…",
+      removeBranch: "移除该分支",
       tag: "指定 Tag",
       tagPlaceholder: "留空 = 最新 Release",
       tagHint: "留空表示每次取最新 Release",
+
       targetSection: "备份目标",
       targetMount: "目标挂载点",
-      targetMountHint: "只列出支持写入的挂载点（只读存储无法作为备份目标）",
+      targetMountHint: "可多选，一次备份会同步写入全部选中的目标；只列出支持写入的挂载点",
       selectMount: "请选择挂载点",
+      selectedCount: "已选 {count} 个",
+      mountMissingCount: "{count} 个已丢失",
       noWritableMount: "没有可写入的挂载点，请先在「挂载管理」中添加一个支持写入的挂载点",
       pathPrefix: "路径前缀",
       pathPrefixHint: "挂载点内的存放目录，默认根目录；每个仓库会在其下自动建子目录",
-      advancedSection: "高级配置",
+      retentionCount: "保留版本数",
+      retentionCountHint: "超过该数量后自动删除最旧的版本，默认 {count} 个",
+
+      advancedSection: "高级配置（可选）",
       enabled: "启用该仓库（禁用后不可备份）",
       saving: "保存中...",
       show: "显示",
@@ -132,6 +151,7 @@ export default {
       refresh: "刷新",
       empty: "该仓库还没有备份记录",
       downloadArchive: "下载快照",
+      downloadTarget: "下载 #{index}",
       prev: "上一页",
       next: "下一页",
       pageInfo: "第 {from} - {to} 条，共 {total} 条",
@@ -145,8 +165,9 @@ export default {
 
     validation: {
       repoRequired: "请填写仓库标识（owner/repo）",
-      branchRequired: "分支模式下必须填写分支名",
-      mountRequired: "请选择备份目标挂载点",
+      branchRequired: "分支模式下至少需要添加一个分支",
+      mountRequired: "请至少选择一个备份目标挂载点",
+      retentionRange: "保留版本数必须在 {min} ~ {max} 之间",
     },
 
     messages: {

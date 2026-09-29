@@ -96,6 +96,7 @@ export function buildTimestamp(date = new Date()) {
  *   provider: string,
  *   repoIdentifier: string,
  *   commitSha: string,
+ *   ref?: string|null,
  *   at?: Date,
  * }} params
  * @returns {{
@@ -107,7 +108,7 @@ export function buildTimestamp(date = new Date()) {
  *   baseName: string,
  * }}
  */
-export function planBackupPaths({ mountPath, pathPrefix, provider, repoIdentifier, commitSha, at = new Date() }) {
+export function planBackupPaths({ mountPath, pathPrefix, provider, repoIdentifier, commitSha, ref = null, at = new Date() }) {
   const normalizedMount = normalizeMountPath(mountPath);
   if (!normalizedMount) {
     throw new ValidationError("挂载点路径无效，无法规划备份路径");
@@ -117,7 +118,9 @@ export function planBackupPaths({ mountPath, pathPrefix, provider, repoIdentifie
   const folderName = buildRepoFolderName({ provider, repoIdentifier });
 
   const shortSha = String(commitSha || "").slice(0, 7) || "unknown";
-  const baseName = `${buildTimestamp(at)}__${shortSha}`;
+  // 修改点（多分支优化）：文件名里带上引用名，多分支共存时目录一眼可读
+  const refSegment = ref ? `${sanitizeSegment(ref)}__` : "";
+  const baseName = `${buildTimestamp(at)}__${refSegment}${shortSha}`;
 
   const archiveFileName = `${baseName}.tar.gz`;
   const manifestFileName = `${baseName}.manifest.json`;

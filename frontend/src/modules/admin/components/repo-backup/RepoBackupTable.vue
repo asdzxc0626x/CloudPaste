@@ -1,11 +1,16 @@
 <script setup>
 /**
- * 代码仓库列表表格（修改点：新增功能）
- * - 展示仓库、跟踪模式、备份目标、最近备份状态
+ * 代码仓库列表（修改点：新增功能）
+ * - 展示仓库、跟踪分支、备份目标、最近备份状态
  * - 行级操作：检查更新 / 立即备份 / 历史 / 编辑 / 启用禁用 / 删除
+ *
+ * 优化点（多分支 / 多备份目标 / 响应式）：
+ * - 跟踪列展示全部分支；目标列展示全部挂载点
+ * - 桌面端（md 以上）用表格；移动端改用卡片列表，
+ *   避免 5 列表格在窄屏上被迫横向滚动
  */
 import { computed } from "vue";
-import { IconRefresh, IconArchive, IconClock, IconDelete, IconRename } from "@/components/icons";
+import RepoBackupRowActions from "./RepoBackupRowActions.vue";
 
 const props = defineProps({
   repositories: { type: Array, default: () => [] },
@@ -19,11 +24,16 @@ const emit = defineEmits(["check", "backup", "history", "edit", "toggle", "delet
 
 const hasData = computed(() => props.repositories.length > 0);
 
+const showEmpty = computed(() => !hasData.value && !props.loading);
+const showLoading = computed(() => props.loading && !hasData.value);
+
 /** 备份状态对应的徽章样式 */
 const statusClass = (status) => {
   switch (status) {
     case "success":
       return "bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300";
+    case "partial":
+      return "bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300";
     case "failed":
       return "bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300";
     case "running":
@@ -58,208 +68,301 @@ const formatSize = (bytes) => {
   return `${value.toFixed(2)} ${units[i]}`;
 };
 
-/** 跟踪模式的展示文本 */
-const trackLabel = (repo) => {
-  if (repo.trackMode === "release") {
-    return repo.trackRef ? `Release: ${repo.trackRef}` : "Release: latest";
-  }
-  return `Branch: ${repo.trackRef || "-"}`;
+/** 仓库跟踪的分支/标签列表（修改点：多分支优化） */
+const trackRefs = (repo) => {
+  const refs = Array.isArray(repo.trackRefs) ? repo.trackRefs.filter((r) => r != null) : [];
+  if (refs.length > 0) return refs;
+  return repo.trackRef ? [repo.trackRef] : [];
 };
+
+/** 备份目标挂载点列表（修改点：多备份目标优化） */
+const targetMounts = (repo) => (Array.isArray(repo.targetMounts) ? repo.targetMounts.filter(Boolean) : []);
+
+const mountLabel = (mount) => mount.name || mount.mountPath;
+
+/** 逐分支的检查结果（若本次会话检查过） */
+const refCheckMap = (repo) => {
+  const result = props.checkResults[repo.id];
+  if (!result || !Array.isArray(result.refs)) return {};
+  const map = {};
+  for (const item of result.refs) {
+    if (item.ref) map[String(item.ref)] = item;
+  }
+  return map;
+};
+
+const checkSummary = (repo) => {
+  const result = props.checkResults[repo.id];
+  if (!result) return null;
+  return {
+    hasUpdate: result.hasUpdate,
+    failedCount: result.failedCount || 0,
+    allFailed: Boolean(result.allFailed),
+  };
+};
+
+const chipClass = computed(() =>
+  props.darkMode ? "bg-gray-700 text-gray-200" : "bg-gray-100 text-gray-700",
+);
 </script>
 
 <template>
-  <div class="overflow-x-auto rounded-lg border" :class="darkMode ? 'border-gray-700' : 'border-gray-200'">
-    <table class="min-w-full divide-y" :class="darkMode ? 'divide-gray-700' : 'divide-gray-200'">
-      <thead :class="darkMode ? 'bg-gray-800' : 'bg-gray-50'">
-        <tr>
-          <th scope="col" class="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider" :class="darkMode ? 'text-gray-300' : 'text-gray-500'">
-            {{ $t("admin.repoBackup.table.repository") }}
-          </th>
-          <th scope="col" class="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider" :class="darkMode ? 'text-gray-300' : 'text-gray-500'">
-            {{ $t("admin.repoBackup.table.track") }}
-          </th>
-          <th scope="col" class="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider" :class="darkMode ? 'text-gray-300' : 'text-gray-500'">
-            {{ $t("admin.repoBackup.table.target") }}
-          </th>
-          <th scope="col" class="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider" :class="darkMode ? 'text-gray-300' : 'text-gray-500'">
-            {{ $t("admin.repoBackup.table.lastBackup") }}
-          </th>
-          <th scope="col" class="px-4 py-3 text-right text-xs font-medium uppercase tracking-wider" :class="darkMode ? 'text-gray-300' : 'text-gray-500'">
-            {{ $t("admin.repoBackup.table.actions") }}
-          </th>
-        </tr>
-      </thead>
+  <!-- 空状态 -->
+  <div
+    v-if="showEmpty || showLoading"
+    class="rounded-lg border px-4 py-10 text-center text-sm"
+    :class="[darkMode ? 'border-gray-700 text-gray-400' : 'border-gray-200 text-gray-500']"
+  >
+    {{ showLoading ? $t("admin.repoBackup.table.loading") : $t("admin.repoBackup.table.empty") }}
+  </div>
 
-      <tbody :class="darkMode ? 'bg-gray-900 divide-gray-700' : 'bg-white divide-gray-200'" class="divide-y">
-        <!-- 空状态 -->
-        <tr v-if="!hasData && !loading">
-          <td colspan="5" class="px-4 py-10 text-center text-sm" :class="darkMode ? 'text-gray-400' : 'text-gray-500'">
-            {{ $t("admin.repoBackup.table.empty") }}
-          </td>
-        </tr>
+  <template v-else>
+    <!-- ==================== 桌面端：表格 ==================== -->
+    <div class="hidden md:block overflow-x-auto rounded-lg border" :class="darkMode ? 'border-gray-700' : 'border-gray-200'">
+      <table class="min-w-full divide-y" :class="darkMode ? 'divide-gray-700' : 'divide-gray-200'">
+        <thead :class="darkMode ? 'bg-gray-800' : 'bg-gray-50'">
+          <tr>
+            <th scope="col" class="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider" :class="darkMode ? 'text-gray-300' : 'text-gray-500'">
+              {{ $t("admin.repoBackup.table.repository") }}
+            </th>
+            <th scope="col" class="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider" :class="darkMode ? 'text-gray-300' : 'text-gray-500'">
+              {{ $t("admin.repoBackup.table.track") }}
+            </th>
+            <th scope="col" class="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider" :class="darkMode ? 'text-gray-300' : 'text-gray-500'">
+              {{ $t("admin.repoBackup.table.target") }}
+            </th>
+            <th scope="col" class="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider" :class="darkMode ? 'text-gray-300' : 'text-gray-500'">
+              {{ $t("admin.repoBackup.table.lastBackup") }}
+            </th>
+            <th scope="col" class="px-4 py-3 text-right text-xs font-medium uppercase tracking-wider" :class="darkMode ? 'text-gray-300' : 'text-gray-500'">
+              {{ $t("admin.repoBackup.table.actions") }}
+            </th>
+          </tr>
+        </thead>
 
-        <!-- 加载中 -->
-        <tr v-else-if="loading && !hasData">
-          <td colspan="5" class="px-4 py-10 text-center text-sm" :class="darkMode ? 'text-gray-400' : 'text-gray-500'">
-            {{ $t("admin.repoBackup.table.loading") }}
-          </td>
-        </tr>
-
-        <tr v-for="repo in repositories" :key="repo.id" :class="darkMode ? 'hover:bg-gray-800/60' : 'hover:bg-gray-50'">
-          <!-- 仓库 -->
-          <td class="px-4 py-3 align-top">
-            <div class="flex items-start gap-2">
-              <div class="min-w-0">
-                <div class="flex items-center gap-2">
-                  <span class="text-sm font-medium truncate" :class="darkMode ? 'text-white' : 'text-gray-900'">
-                    {{ repo.name }}
-                  </span>
-                  <span
-                    class="px-1.5 py-0.5 text-[10px] rounded font-medium"
-                    :class="darkMode ? 'bg-gray-700 text-gray-300' : 'bg-gray-100 text-gray-600'"
-                  >
-                    {{ repo.providerDisplayName }}
-                  </span>
-                  <span
-                    v-if="!repo.enabled"
-                    class="px-1.5 py-0.5 text-[10px] rounded font-medium bg-yellow-100 text-yellow-800 dark:bg-yellow-900/40 dark:text-yellow-300"
-                  >
-                    {{ $t("admin.repoBackup.status.disabled") }}
-                  </span>
-                </div>
-                <div class="text-xs mt-0.5 font-mono truncate" :class="darkMode ? 'text-gray-400' : 'text-gray-500'">
-                  {{ repo.repoIdentifier }}
-                </div>
-                <!-- 最近一次错误 -->
-                <div v-if="repo.lastError" class="text-xs mt-1 text-red-600 dark:text-red-400 break-all">
-                  {{ repo.lastError }}
-                </div>
-                <!-- 检查更新结果 -->
-                <div v-if="checkResults[repo.id]" class="text-xs mt-1" :class="checkResults[repo.id].hasUpdate ? 'text-blue-600 dark:text-blue-400' : 'text-green-600 dark:text-green-400'">
-                  {{
-                    checkResults[repo.id].hasUpdate
-                      ? $t("admin.repoBackup.check.hasUpdate", { version: checkResults[repo.id].latest.version })
-                      : $t("admin.repoBackup.check.upToDate", { version: checkResults[repo.id].latest.version })
-                  }}
-                </div>
-              </div>
-            </div>
-          </td>
-
-          <!-- 跟踪模式 -->
-          <td class="px-4 py-3 align-top">
-            <div class="text-sm" :class="darkMode ? 'text-gray-200' : 'text-gray-700'">
-              {{ trackLabel(repo) }}
-            </div>
-            <div v-if="repo.lastCheckedAt" class="text-xs mt-0.5" :class="darkMode ? 'text-gray-500' : 'text-gray-400'">
-              {{ $t("admin.repoBackup.table.checkedAt") }}: {{ formatTime(repo.lastCheckedAt) }}
-            </div>
-          </td>
-
-          <!-- 备份目标 -->
-          <td class="px-4 py-3 align-top">
-            <div v-if="repo.targetMount" class="text-sm truncate" :class="darkMode ? 'text-gray-200' : 'text-gray-700'">
-              {{ repo.targetMount.name || repo.targetMount.mountPath }}
-            </div>
-            <div v-else class="text-sm text-red-600 dark:text-red-400">
-              {{ $t("admin.repoBackup.table.mountMissing") }}
-            </div>
-            <div v-if="repo.backupFolder" class="text-xs mt-0.5 font-mono break-all" :class="darkMode ? 'text-gray-500' : 'text-gray-400'">
-              {{ repo.backupFolder }}
-            </div>
-          </td>
-
-          <!-- 最近备份 -->
-          <td class="px-4 py-3 align-top">
-            <template v-if="repo.latestBackup">
-              <div class="flex items-center gap-2">
-                <span class="px-1.5 py-0.5 text-[10px] rounded font-medium" :class="statusClass(repo.latestBackup.status)">
-                  {{ $t(`admin.repoBackup.backupStatus.${repo.latestBackup.status}`) }}
+        <tbody :class="darkMode ? 'bg-gray-900 divide-gray-700' : 'bg-white divide-gray-200'" class="divide-y">
+          <tr v-for="repo in repositories" :key="repo.id" :class="darkMode ? 'hover:bg-gray-800/60' : 'hover:bg-gray-50'">
+            <!-- 仓库 -->
+            <td class="px-4 py-3 align-top">
+              <div class="flex items-center gap-2 flex-wrap">
+                <span class="text-sm font-medium truncate" :class="darkMode ? 'text-white' : 'text-gray-900'">
+                  {{ repo.name }}
                 </span>
-                <span class="text-xs font-mono" :class="darkMode ? 'text-gray-300' : 'text-gray-600'">
-                  {{ repo.latestBackup.version || repo.latestBackup.shortCommitSha }}
+                <span class="px-1.5 py-0.5 text-[10px] rounded font-medium" :class="chipClass">
+                  {{ repo.providerDisplayName }}
+                </span>
+                <span
+                  v-if="!repo.enabled"
+                  class="px-1.5 py-0.5 text-[10px] rounded font-medium bg-yellow-100 text-yellow-800 dark:bg-yellow-900/40 dark:text-yellow-300"
+                >
+                  {{ $t("admin.repoBackup.status.disabled") }}
                 </span>
               </div>
-              <div class="text-xs mt-0.5" :class="darkMode ? 'text-gray-500' : 'text-gray-400'">
+              <div class="text-xs mt-0.5 font-mono truncate" :class="darkMode ? 'text-gray-400' : 'text-gray-500'">
+                {{ repo.repoIdentifier }}
+              </div>
+              <div v-if="repo.lastError" class="text-xs mt-1 text-red-600 dark:text-red-400 break-all">
+                {{ repo.lastError }}
+              </div>
+              <div v-if="checkSummary(repo)" class="text-xs mt-1">
+                <span v-if="checkSummary(repo).allFailed" class="text-red-600 dark:text-red-400">
+                  {{ $t("admin.repoBackup.check.allFailed") }}
+                </span>
+                <span v-else :class="checkSummary(repo).hasUpdate ? 'text-blue-600 dark:text-blue-400' : 'text-green-600 dark:text-green-400'">
+                  {{ checkSummary(repo).hasUpdate ? $t("admin.repoBackup.check.hasUpdate") : $t("admin.repoBackup.check.upToDate") }}
+                </span>
+                <span v-if="checkSummary(repo).failedCount > 0" class="text-amber-600 dark:text-amber-400 ml-1">
+                  {{ $t("admin.repoBackup.check.partialFailed", { count: checkSummary(repo).failedCount }) }}
+                </span>
+              </div>
+            </td>
+
+            <!-- 跟踪版本：多分支逐个展示（修改点：多分支优化） -->
+            <td class="px-4 py-3 align-top">
+              <div class="text-xs mb-1" :class="darkMode ? 'text-gray-400' : 'text-gray-500'">
+                {{ $t(`admin.repoBackup.trackMode.${repo.trackMode}`) }}
+              </div>
+              <div class="flex flex-wrap gap-1 max-w-[16rem]">
+                <span
+                  v-for="ref in trackRefs(repo)"
+                  :key="ref"
+                  class="inline-flex items-center gap-1 px-1.5 py-0.5 text-[11px] rounded font-mono"
+                  :class="chipClass"
+                >
+                  {{ ref }}
+                  <template v-if="refCheckMap(repo)[ref]">
+                    <span
+                      v-if="refCheckMap(repo)[ref].error"
+                      class="text-red-500"
+                      :title="refCheckMap(repo)[ref].error"
+                    >!</span>
+                    <span
+                      v-else
+                      :class="refCheckMap(repo)[ref].hasUpdate ? 'text-blue-500' : 'text-green-500'"
+                      :title="refCheckMap(repo)[ref].hasUpdate ? $t('admin.repoBackup.check.refHasUpdate') : $t('admin.repoBackup.check.refUpToDate')"
+                    >•</span>
+                  </template>
+                </span>
+                <span v-if="trackRefs(repo).length === 0" class="text-xs" :class="darkMode ? 'text-gray-500' : 'text-gray-400'">-</span>
+              </div>
+              <div v-if="repo.lastCheckedAt" class="text-[11px] mt-1" :class="darkMode ? 'text-gray-500' : 'text-gray-400'">
+                {{ $t("admin.repoBackup.table.checkedAt") }}: {{ formatTime(repo.lastCheckedAt) }}
+              </div>
+            </td>
+
+            <!-- 备份目标：多个挂载点（修改点：多备份目标优化） -->
+            <td class="px-4 py-3 align-top">
+              <div class="flex flex-wrap gap-1 max-w-[14rem]">
+                <span
+                  v-for="mount in targetMounts(repo)"
+                  :key="mount.id"
+                  class="px-1.5 py-0.5 text-[11px] rounded truncate max-w-full"
+                  :class="chipClass"
+                  :title="mount.mountPath"
+                >
+                  {{ mountLabel(mount) }}
+                </span>
+                <span
+                  v-if="(repo.missingMountIds || []).length > 0"
+                  class="px-1.5 py-0.5 text-[11px] rounded bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300"
+                >
+                  {{ $t("admin.repoBackup.table.mountMissing") }} {{ (repo.missingMountIds || []).length }}
+                </span>
+              </div>
+              <div v-if="repo.backupFolder" class="text-[11px] mt-1 font-mono break-all" :class="darkMode ? 'text-gray-500' : 'text-gray-400'">
+                {{ repo.backupFolder }}
+              </div>
+              <div class="text-[11px] mt-1" :class="darkMode ? 'text-gray-500' : 'text-gray-400'">
+                {{ $t("admin.repoBackup.table.retention", { count: repo.retentionCount }) }}
+              </div>
+            </td>
+
+            <!-- 最近备份 -->
+            <td class="px-4 py-3 align-top">
+              <template v-if="repo.latestBackup">
+                <div class="flex items-center gap-2 flex-wrap">
+                  <span class="px-1.5 py-0.5 text-[10px] rounded font-medium" :class="statusClass(repo.latestBackup.status)">
+                    {{ $t(`admin.repoBackup.backupStatus.${repo.latestBackup.status}`) }}
+                  </span>
+                  <span class="text-xs font-mono" :class="darkMode ? 'text-gray-300' : 'text-gray-600'">
+                    {{ repo.latestBackup.ref || repo.latestBackup.shortCommitSha }}
+                  </span>
+                </div>
+                <div class="text-xs mt-0.5" :class="darkMode ? 'text-gray-500' : 'text-gray-400'">
+                  {{ formatTime(repo.latestBackup.finishedAt || repo.latestBackup.createdAt) }}
+                  <span v-if="repo.latestBackup.sizeBytes"> · {{ formatSize(repo.latestBackup.sizeBytes) }}</span>
+                </div>
+                <!-- 各目标写入情况（修改点：多备份目标优化） -->
+                <div v-if="(repo.latestBackup.targets || []).length > 0" class="text-[11px] mt-0.5" :class="darkMode ? 'text-gray-500' : 'text-gray-400'">
+                  {{ $t("admin.repoBackup.table.targetsOk", { ok: (repo.latestBackup.targets || []).filter((t) => t.status === 'success').length, total: (repo.latestBackup.targets || []).length }) }}
+                </div>
+              </template>
+              <span v-else class="text-xs" :class="darkMode ? 'text-gray-500' : 'text-gray-400'">
+                {{ $t("admin.repoBackup.table.neverBackedUp") }}
+              </span>
+            </td>
+
+            <!-- 操作 -->
+            <td class="px-4 py-3 align-top">
+              <RepoBackupRowActions
+                :repo="repo"
+                :busy="isRepoBusy(repo.id)"
+                :dark-mode="darkMode"
+                icon-only
+                @check="emit('check', $event)"
+                @backup="emit('backup', $event)"
+                @history="emit('history', $event)"
+                @edit="emit('edit', $event)"
+                @toggle="emit('toggle', $event)"
+                @delete="emit('delete', $event)"
+              />
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <!-- ==================== 移动端：卡片列表 ==================== -->
+    <div class="md:hidden space-y-3">
+      <div
+        v-for="repo in repositories"
+        :key="repo.id"
+        class="rounded-lg border p-3"
+        :class="darkMode ? 'border-gray-700 bg-gray-900' : 'border-gray-200 bg-white'"
+      >
+        <!-- 标题行 -->
+        <div class="flex items-start justify-between gap-2">
+          <div class="min-w-0">
+            <div class="flex items-center gap-1.5 flex-wrap">
+              <span class="text-sm font-medium truncate" :class="darkMode ? 'text-white' : 'text-gray-900'">{{ repo.name }}</span>
+              <span class="px-1.5 py-0.5 text-[10px] rounded font-medium" :class="chipClass">{{ repo.providerDisplayName }}</span>
+              <span
+                v-if="!repo.enabled"
+                class="px-1.5 py-0.5 text-[10px] rounded font-medium bg-yellow-100 text-yellow-800 dark:bg-yellow-900/40 dark:text-yellow-300"
+              >
+                {{ $t("admin.repoBackup.status.disabled") }}
+              </span>
+            </div>
+            <div class="text-[11px] mt-0.5 font-mono break-all" :class="darkMode ? 'text-gray-400' : 'text-gray-500'">
+              {{ repo.repoIdentifier }}
+            </div>
+          </div>
+          <span
+            v-if="repo.latestBackup"
+            class="shrink-0 px-1.5 py-0.5 text-[10px] rounded font-medium"
+            :class="statusClass(repo.latestBackup.status)"
+          >
+            {{ $t(`admin.repoBackup.backupStatus.${repo.latestBackup.status}`) }}
+          </span>
+        </div>
+
+        <!-- 详情行：标签式，天然换行，不会横向溢出 -->
+        <dl class="mt-2 space-y-1.5 text-[11px]">
+          <div class="flex gap-2">
+            <dt class="shrink-0 w-14" :class="darkMode ? 'text-gray-500' : 'text-gray-400'">{{ $t("admin.repoBackup.table.track") }}</dt>
+            <dd class="min-w-0 flex flex-wrap gap-1">
+              <span v-for="ref in trackRefs(repo)" :key="ref" class="px-1.5 py-0.5 rounded font-mono" :class="chipClass">{{ ref }}</span>
+              <span v-if="trackRefs(repo).length === 0">-</span>
+            </dd>
+          </div>
+          <div class="flex gap-2">
+            <dt class="shrink-0 w-14" :class="darkMode ? 'text-gray-500' : 'text-gray-400'">{{ $t("admin.repoBackup.table.target") }}</dt>
+            <dd class="min-w-0 flex flex-wrap gap-1">
+              <span v-for="mount in targetMounts(repo)" :key="mount.id" class="px-1.5 py-0.5 rounded truncate max-w-[10rem]" :class="chipClass">
+                {{ mountLabel(mount) }}
+              </span>
+              <span v-if="targetMounts(repo).length === 0" class="text-red-600 dark:text-red-400">
+                {{ $t("admin.repoBackup.table.mountMissing") }}
+              </span>
+            </dd>
+          </div>
+          <div class="flex gap-2">
+            <dt class="shrink-0 w-14" :class="darkMode ? 'text-gray-500' : 'text-gray-400'">{{ $t("admin.repoBackup.table.lastBackup") }}</dt>
+            <dd class="min-w-0" :class="darkMode ? 'text-gray-300' : 'text-gray-600'">
+              <template v-if="repo.latestBackup">
                 {{ formatTime(repo.latestBackup.finishedAt || repo.latestBackup.createdAt) }}
                 <span v-if="repo.latestBackup.sizeBytes"> · {{ formatSize(repo.latestBackup.sizeBytes) }}</span>
-              </div>
-            </template>
-            <span v-else class="text-xs" :class="darkMode ? 'text-gray-500' : 'text-gray-400'">
-              {{ $t("admin.repoBackup.table.neverBackedUp") }}
-            </span>
-          </td>
+              </template>
+              <template v-else>{{ $t("admin.repoBackup.table.neverBackedUp") }}</template>
+            </dd>
+          </div>
+          <div v-if="repo.lastError" class="text-red-600 dark:text-red-400 break-all">{{ repo.lastError }}</div>
+        </dl>
 
-          <!-- 操作 -->
-          <td class="px-4 py-3 align-top">
-            <div class="flex items-center justify-end gap-1 flex-wrap">
-              <!-- 检查更新 -->
-              <button
-                class="inline-flex items-center px-2 py-1 text-xs rounded border transition-colors"
-                :class="darkMode ? 'border-gray-600 text-gray-200 hover:bg-gray-700' : 'border-gray-300 text-gray-700 hover:bg-gray-100'"
-                :disabled="isRepoBusy(repo.id)"
-                :title="$t('admin.repoBackup.actions.check')"
-                @click="emit('check', repo)"
-              >
-                <IconRefresh class="h-3 w-3 mr-1" :class="isRepoBusy(repo.id) ? 'animate-spin' : ''" />
-                {{ $t("admin.repoBackup.actions.check") }}
-              </button>
-
-              <!-- 立即备份 -->
-              <button
-                class="inline-flex items-center px-2 py-1 text-xs rounded text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-50"
-                :disabled="isRepoBusy(repo.id) || !repo.enabled"
-                :title="repo.enabled ? $t('admin.repoBackup.actions.backup') : $t('admin.repoBackup.actions.backupDisabledHint')"
-                @click="emit('backup', repo)"
-              >
-                <IconArchive class="h-3 w-3 mr-1" />
-                {{ $t("admin.repoBackup.actions.backup") }}
-              </button>
-
-              <!-- 备份历史 -->
-              <button
-                class="inline-flex items-center px-2 py-1 text-xs rounded border transition-colors"
-                :class="darkMode ? 'border-gray-600 text-gray-200 hover:bg-gray-700' : 'border-gray-300 text-gray-700 hover:bg-gray-100'"
-                :title="$t('admin.repoBackup.actions.history')"
-                @click="emit('history', repo)"
-              >
-                <IconClock class="h-3 w-3 mr-1" />
-                {{ $t("admin.repoBackup.actions.history") }}
-              </button>
-
-              <!-- 编辑 -->
-              <button
-                class="inline-flex items-center px-2 py-1 text-xs rounded border transition-colors"
-                :class="darkMode ? 'border-gray-600 text-gray-200 hover:bg-gray-700' : 'border-gray-300 text-gray-700 hover:bg-gray-100'"
-                :title="$t('admin.repoBackup.actions.edit')"
-                @click="emit('edit', repo)"
-              >
-                <IconRename class="h-3 w-3" />
-              </button>
-
-              <!-- 启用 / 禁用 -->
-              <button
-                class="inline-flex items-center px-2 py-1 text-xs rounded border transition-colors"
-                :class="darkMode ? 'border-gray-600 text-gray-200 hover:bg-gray-700' : 'border-gray-300 text-gray-700 hover:bg-gray-100'"
-                :disabled="isRepoBusy(repo.id)"
-                @click="emit('toggle', repo)"
-              >
-                {{ repo.enabled ? $t("admin.repoBackup.actions.disable") : $t("admin.repoBackup.actions.enable") }}
-              </button>
-
-              <!-- 删除 -->
-              <button
-                class="inline-flex items-center px-2 py-1 text-xs rounded border border-red-300 text-red-600 hover:bg-red-50 dark:border-red-800 dark:text-red-400 dark:hover:bg-red-900/30"
-                :disabled="isRepoBusy(repo.id)"
-                :title="$t('admin.repoBackup.actions.delete')"
-                @click="emit('delete', repo)"
-              >
-                <IconDelete class="h-3 w-3" />
-              </button>
-            </div>
-          </td>
-        </tr>
-      </tbody>
-    </table>
-  </div>
+        <div class="mt-2.5 pt-2.5 border-t" :class="darkMode ? 'border-gray-700' : 'border-gray-200'">
+          <RepoBackupRowActions
+            :repo="repo"
+            :busy="isRepoBusy(repo.id)"
+            :dark-mode="darkMode"
+            @check="emit('check', $event)"
+            @backup="emit('backup', $event)"
+            @history="emit('history', $event)"
+            @edit="emit('edit', $event)"
+            @toggle="emit('toggle', $event)"
+            @delete="emit('delete', $event)"
+          />
+        </div>
+      </div>
+    </div>
+  </template>
 </template>

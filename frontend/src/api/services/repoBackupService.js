@@ -18,7 +18,20 @@ import { get, post, put, del } from "../client";
  */
 
 /**
- * @typedef {'running' | 'success' | 'failed' | 'skipped'} BackupStatus
+ * @typedef {'running' | 'success' | 'partial' | 'failed' | 'skipped'} BackupStatus
+ * partial = 部分备份目标写入成功（多目标时可能出现）
+ */
+
+/**
+ * @typedef {Object} RepoTargetResult
+ * @property {string} id
+ * @property {string} mountId
+ * @property {string|null} mountPath
+ * @property {string|null} storagePath
+ * @property {string|null} manifestPath
+ * @property {number|null} sizeBytes
+ * @property {'success'|'failed'|'skipped'} status
+ * @property {string|null} errorMessage
  */
 
 /**
@@ -47,9 +60,12 @@ import { get, post, put, del } from "../client";
  * @property {string} name
  * @property {string} repoIdentifier - 'owner/repo'
  * @property {TrackMode} trackMode
- * @property {string|null} trackRef
- * @property {string} targetMountId
+ * @property {string[]} trackRefs - 跟踪引用列表（branch 模式=多个分支；release 模式=单元素）
+ * @property {string|null} trackRef - 主引用（兼容字段）
+ * @property {string[]} targetMountIds - 备份目标挂载点 ID 列表
+ * @property {string|null} targetMountId - 第一个目标（兼容字段）
  * @property {string} targetPathPrefix
+ * @property {number} retentionCount - 保留版本数
  * @property {boolean} enabled
  * @property {string|null} lastCheckedAt
  * @property {string|null} lastBackupAt
@@ -57,6 +73,8 @@ import { get, post, put, del } from "../client";
  * @property {string|null} lastError
  * @property {Object} [config] - provider 配置（敏感字段已掩码）
  * @property {RepoTargetMount|null} [targetMount]
+ * @property {RepoTargetMount[]} [targetMounts]
+ * @property {string[]} [missingMountIds] - 已被删除的挂载点 ID
  * @property {string|null} [backupFolder] - 备份文件所在目录（可跳转挂载浏览器）
  * @property {RepoBackup|null} [latestBackup]
  */
@@ -79,6 +97,7 @@ import { get, post, put, del } from "../client";
  * @property {string|null} startedAt
  * @property {string|null} finishedAt
  * @property {string} createdAt
+ * @property {RepoTargetResult[]} [targets] - 每个备份目标的落盘结果
  */
 
 /**
@@ -91,11 +110,28 @@ import { get, post, put, del } from "../client";
  */
 
 /**
+ * @typedef {Object} CheckRefResult
+ * @property {string|null} ref - 分支名或 tag
+ * @property {'branch'|'tag'} refType
+ * @property {string|null} commitSha
+ * @property {string|null} shortCommitSha
+ * @property {string|null} version
+ * @property {string|null} publishedAt
+ * @property {boolean} hasUpdate - 该分支是否有尚未备份的新版本
+ * @property {boolean} alreadyBackedUp
+ * @property {string|null} error - 该分支检查失败的原因
+ */
+
+/**
  * @typedef {Object} CheckResult
  * @property {string} repositoryId
- * @property {boolean} hasUpdate - 是否存在尚未备份的新版本
- * @property {boolean} alreadyBackedUp - 最新版本是否已备份
- * @property {RepoVersionInfo} latest
+ * @property {boolean} hasUpdate - 任一分支有更新即为 true
+ * @property {boolean} allFailed
+ * @property {number} checkedCount
+ * @property {number} successCount
+ * @property {number} failedCount
+ * @property {CheckRefResult[]} refs - 逐分支的检查结果
+ * @property {CheckRefResult|null} latest
  * @property {string|null} lastKnownCommitSha
  * @property {RepoBackup|null} lastBackup
  */
@@ -143,9 +179,11 @@ export function getRepository(id) {
  * @param {string} payload.provider
  * @param {string} payload.repoIdentifier
  * @param {TrackMode} payload.trackMode
- * @param {string|null} [payload.trackRef]
- * @param {string} payload.targetMountId
+ * @param {string[]} [payload.trackRefs] - branch 模式：要跟踪的分支列表
+ * @param {string|null} [payload.trackRef] - release 模式：指定 tag（空=最新）
+ * @param {string[]} payload.targetMountIds - 备份目标挂载点 ID 列表（至少一个）
  * @param {string} [payload.targetPathPrefix]
+ * @param {number} [payload.retentionCount] - 保留版本数，默认 10
  * @param {string} [payload.name]
  * @param {boolean} [payload.enabled]
  * @param {Object} [payload.config]
@@ -230,12 +268,17 @@ export function listBackups(id, paging = {}) {
 /**
  * 获取备份快照的下载链接
  * @param {string} backupId
- * @param {{manifest?: boolean}} [options] manifest=true 时返回 manifest.json 的链接
- * @returns {Promise<{success: boolean, data: {backupId: string, path: string, url: string, type: string}, message: string}>}
+ * @param {{manifest?: boolean, targetId?: string}} [options]
+ *   - manifest=true 时返回 manifest.json 的链接
+ *   - targetId 指定从哪个目标的副本下载（修改点：多备份目标优化）
+ * @returns {Promise<{success: boolean, data: {backupId: string, path: string, url: string, type: string, targetId: string|null, mountId: string|null}, message: string}>}
  */
 export function getBackupDownloadLink(backupId, options = {}) {
-  const query = options.manifest === true ? "?manifest=true" : "";
-  return get(`${BASE}/backups/${encodeURIComponent(backupId)}/link${query}`);
+  const params = new URLSearchParams();
+  if (options.manifest === true) params.set("manifest", "true");
+  if (options.targetId) params.set("targetId", String(options.targetId));
+  const query = params.toString();
+  return get(`${BASE}/backups/${encodeURIComponent(backupId)}/link${query ? `?${query}` : ""}`);
 }
 
 export default {

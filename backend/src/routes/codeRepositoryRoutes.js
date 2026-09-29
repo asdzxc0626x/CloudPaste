@@ -121,6 +121,7 @@ codeRepositoryRoutes.post("/api/admin/repo-backup/repositories/:id/enable", requ
 
 /**
  * 检查仓库是否有更新（同步执行，只查版本不下载）
+ * 修改点（多分支优化）：返回逐分支结果，部分分支失败也能拿到其余分支的状态
  */
 codeRepositoryRoutes.post("/api/admin/repo-backup/repositories/:id/check", requireAdmin, async (c) => {
   const { db, repositoryFactory, encryptionSecret, env } = resolveContext(c);
@@ -128,7 +129,16 @@ codeRepositoryRoutes.post("/api/admin/repo-backup/repositories/:id/check", requi
 
   const { id } = c.req.param();
   const result = await checkRepository(db, repositoryFactory, encryptionSecret, id, env);
-  return jsonOk(c, result, result.hasUpdate ? "检测到新版本" : "已是最新备份版本");
+
+  let message = result.hasUpdate ? "检测到新版本" : "已是最新备份版本";
+  if (result.failedCount > 0) {
+    message = result.hasUpdate
+      ? `检测到新版本，但有 ${result.failedCount} 个分支检查失败`
+      : `有 ${result.failedCount} 个分支检查失败`;
+  }
+  if (result.allFailed) message = "全部跟踪分支检查失败，请查看错误详情";
+
+  return jsonOk(c, result, message);
 });
 
 /**
@@ -179,6 +189,7 @@ codeRepositoryRoutes.get("/api/admin/repo-backup/repositories/:id/backups", requ
 /**
  * 获取备份快照（或 manifest）的下载链接
  * - ?manifest=true 时返回 manifest.json 的链接
+ * - ?targetId=<id> 时从指定目标的副本下载（修改点：多备份目标优化）
  */
 codeRepositoryRoutes.get("/api/admin/repo-backup/backups/:backupId/link", requireAdmin, async (c) => {
   const { db, repositoryFactory, encryptionSecret, env } = resolveContext(c);
@@ -186,6 +197,7 @@ codeRepositoryRoutes.get("/api/admin/repo-backup/backups/:backupId/link", requir
 
   const { backupId } = c.req.param();
   const wantManifest = c.req.query("manifest") === "true";
+  const targetId = c.req.query("targetId") || null;
 
   const mountManager = new MountManager(db, encryptionSecret, repositoryFactory, { env });
   const fileSystem = new FileSystem(mountManager, env);
@@ -195,7 +207,7 @@ codeRepositoryRoutes.get("/api/admin/repo-backup/backups/:backupId/link", requir
     repositoryFactory,
     fileSystem,
     backupId,
-    { manifest: wantManifest, userId: adminId, userType: UserType.ADMIN },
+    { manifest: wantManifest, targetId, userId: adminId, userType: UserType.ADMIN },
     env,
   );
 

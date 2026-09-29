@@ -12,6 +12,97 @@
 import { encryptValue, decryptIfNeeded, maskSecret } from "../utils/crypto.js";
 
 /**
+ * 多分支 / 多备份目标 / 版本保留的取值边界（修改点：仓库备份优化）
+ * - 上限存在的意义是防止一次作业跑太久、单表单提交过大
+ */
+export const MAX_TRACK_REFS = 20;
+export const MAX_TARGET_MOUNTS = 10;
+export const DEFAULT_RETENTION_COUNT = 10;
+export const MIN_RETENTION_COUNT = 1;
+export const MAX_RETENTION_COUNT = 100;
+
+/**
+ * 把 JSON 数组列解析为字符串数组
+ * - 解析失败/非数组一律按空数组处理，避免单条脏数据让整页接口 500
+ * @param {string|null|undefined} raw
+ * @param {{ allowNull?: boolean }} [options]
+ * @returns {Array<string|null>}
+ */
+export function parseStringArray(raw, options = {}) {
+  const { allowNull = false } = options;
+  let value = raw;
+  if (typeof value === "string") {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return [];
+    }
+  }
+  if (!Array.isArray(value)) return [];
+
+  const result = [];
+  for (const item of value) {
+    if (item === null || item === undefined) {
+      if (allowNull) result.push(null);
+      continue;
+    }
+    const text = String(item).trim();
+    if (!text) continue;
+    result.push(text);
+  }
+  return result;
+}
+
+/**
+ * 解析仓库记录中被跟踪的引用列表
+ *
+ * 修改点（多分支优化）：
+ * - branch 模式：返回分支名数组（来自 track_refs_json）
+ * - release 模式：返回单元素数组，元素可能为 null（表示“最新 Release”）
+ *
+ * @param {Object} row code_repositories 行
+ * @returns {Array<string|null>}
+ */
+export function resolveTrackRefs(row) {
+  const trackMode = String(row?.track_mode || "branch");
+  if (trackMode !== "branch") {
+    return [row?.track_ref ?? null];
+  }
+
+  const fromJson = parseStringArray(row?.track_refs_json);
+  if (fromJson.length > 0) return fromJson;
+
+  // 兼容 v35 及更早的数据：只有单个 track_ref
+  const legacy = row?.track_ref ? String(row.track_ref).trim() : "";
+  return legacy ? [legacy] : [];
+}
+
+/**
+ * 解析仓库记录的备份目标挂载点 ID 列表
+ *
+ * 修改点（多备份目标优化）：优先读数组列，缺失时回退到旧的单个 target_mount_id
+ * @param {Object} row code_repositories 行
+ * @returns {string[]}
+ */
+export function resolveTargetMountIds(row) {
+  const fromJson = parseStringArray(row?.target_mount_ids_json);
+  if (fromJson.length > 0) return fromJson;
+  const legacy = row?.target_mount_id ? String(row.target_mount_id).trim() : "";
+  return legacy ? [legacy] : [];
+}
+
+/**
+ * 解析仓库的版本保留数（带上下限约束）
+ * @param {Object} row
+ * @returns {number}
+ */
+export function resolveRetentionCount(row) {
+  const raw = Number(row?.retention_count);
+  if (!Number.isFinite(raw) || raw <= 0) return DEFAULT_RETENTION_COUNT;
+  return Math.min(MAX_RETENTION_COUNT, Math.max(MIN_RETENTION_COUNT, Math.trunc(raw)));
+}
+
+/**
  * 各 provider 的敏感字段
  * - 新增 provider 时在此登记，未登记的 provider 默认无敏感字段
  */

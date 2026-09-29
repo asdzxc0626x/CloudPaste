@@ -577,10 +577,16 @@ CREATE TABLE code_repositories (
   repo_identifier TEXT NOT NULL,                 -- 'owner/repo'
 
   track_mode TEXT NOT NULL DEFAULT 'branch',     -- 'branch' | 'release'
-  track_ref TEXT,                                -- branch 名；release 模式留空表示取最新
+  track_ref TEXT,                                -- 主跟踪引用：branch 模式为第一个分支名；release 模式为 tag（空=最新）
+  -- 修改点（多分支优化）：分支模式支持一次跟踪多个分支
+  track_refs_json TEXT NOT NULL DEFAULT '[]',    -- 例：["main","develop"]
 
-  target_mount_id TEXT NOT NULL,                 -- 备份目标挂载点（storage_mounts.id）
+  target_mount_id TEXT NOT NULL,                 -- 主备份目标挂载点（storage_mounts.id）
+  -- 修改点（多备份目标优化）：一次备份同步写入多个挂载点
+  target_mount_ids_json TEXT NOT NULL DEFAULT '[]',
   target_path_prefix TEXT NOT NULL DEFAULT '/',  -- 挂载点内路径前缀
+  -- 修改点（版本保留优化）：每个仓库最多保留多少个成功版本
+  retention_count INTEGER NOT NULL DEFAULT 10,
 
   enabled INTEGER NOT NULL DEFAULT 1,            -- 1=启用, 0=禁用
   config_json TEXT NOT NULL DEFAULT '{}',        -- provider 私有配置（token 等敏感字段加密存储）
@@ -594,9 +600,10 @@ CREATE TABLE code_repositories (
   updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
--- 同一 provider + 仓库 + 跟踪模式 + 跟踪引用只允许登记一次
-CREATE UNIQUE INDEX idx_code_repositories_identity
-  ON code_repositories (provider, repo_identifier, track_mode, COALESCE(track_ref, ''));
+-- 同一 provider + 仓库 + 跟踪模式只允许登记一次（分支集合记录在 track_refs_json 内）
+-- 修改点（多分支优化）：原唯一索引基于单个 track_ref，多分支下改为普通索引 + 服务层查重
+CREATE INDEX idx_code_repositories_identity
+  ON code_repositories (provider, repo_identifier, track_mode);
 CREATE INDEX idx_code_repositories_enabled ON code_repositories (enabled);
 CREATE INDEX idx_code_repositories_mount ON code_repositories (target_mount_id);
 
@@ -610,10 +617,12 @@ CREATE TABLE code_repository_backups (
   commit_sha TEXT NOT NULL,                      -- 去重键
   version TEXT,                                  -- 展示用版本串（main@282ea1c7 / v1.9.1）
 
-  status TEXT NOT NULL,                          -- 'running' | 'success' | 'failed' | 'skipped'
+  -- 'running' | 'success' | 'partial' | 'failed' | 'skipped'
+  -- partial = 部分目标写入成功（多备份目标时可能出现）
+  status TEXT NOT NULL,
 
-  storage_path TEXT,                             -- 快照在 FS 中的完整路径
-  manifest_path TEXT,                            -- manifest.json 的完整路径
+  storage_path TEXT,                             -- 主目标上的快照 FS 路径（便于列表直接展示）
+  manifest_path TEXT,                            -- 主目标上的 manifest 路径
   size_bytes INTEGER,                            -- 快照大小（字节，可能未知）
 
   job_id TEXT,                                   -- 对应 tasks.task_id
@@ -630,3 +639,26 @@ CREATE UNIQUE INDEX idx_code_repository_backups_repo_commit
 CREATE INDEX idx_code_repository_backups_repo_created
   ON code_repository_backups (repository_id, created_at DESC);
 CREATE INDEX idx_code_repository_backups_job ON code_repository_backups (job_id);
+
+-- 修改点（多备份目标优化）：一次备份写入多个挂载点，每个目标的落盘结果单独一行
+CREATE TABLE code_repository_backup_targets (
+  id TEXT PRIMARY KEY,
+  backup_id TEXT NOT NULL,                       -- 对应 code_repository_backups.id
+
+  mount_id TEXT NOT NULL,                        -- 目标挂载点（storage_mounts.id）
+  mount_path TEXT,                               -- 冗余挂载点路径，便于挂载点被删后仍可读
+
+  storage_path TEXT,                             -- 该目标上的快照完整路径
+  manifest_path TEXT,                            -- 该目标上的 manifest 完整路径
+  size_bytes INTEGER,                            -- 该目标上的快照大小
+
+  status TEXT NOT NULL,                          -- 'success' | 'failed' | 'skipped'
+  error_message TEXT,
+
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE UNIQUE INDEX idx_code_repository_backup_targets_unique
+  ON code_repository_backup_targets (backup_id, mount_id);
+CREATE INDEX idx_code_repository_backup_targets_backup
+  ON code_repository_backup_targets (backup_id);
