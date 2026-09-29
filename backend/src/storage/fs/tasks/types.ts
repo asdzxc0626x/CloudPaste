@@ -78,6 +78,14 @@ export interface CopyTaskPayload {
   };
 }
 
+/** 代码仓库备份任务载荷（修改点：新增功能） */
+export interface RepoBackupTaskPayload {
+  /** code_repositories.id */
+  repositoryId: string;
+  /** 为 true 时忽略 commitSha 去重，强制重新备份 */
+  force?: boolean;
+}
+
 /** 任务数据库记录 */
 export interface TaskRecord<TPayload = unknown> {
   task_id: string;

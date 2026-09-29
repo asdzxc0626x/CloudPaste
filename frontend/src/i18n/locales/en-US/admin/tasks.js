@@ -193,6 +193,7 @@ export default {
       copy: 'Copy',
       fs_index_rebuild: 'Index Rebuild',
       fs_index_apply_dirty: 'Apply Index Dirty',
+      repo_backup: 'Repository Backup',
       unknown: 'Unknown Task',
       unknownWithType: 'Unknown ({type})',
     },

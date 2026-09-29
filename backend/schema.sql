@@ -563,3 +563,70 @@ CREATE TABLE metrics_cache (
 
 -- 通用指标缓存索引：按作用域类型和ID查询
 CREATE INDEX idx_metrics_cache_scope ON metrics_cache(scope_type, scope_id);
+
+-- ============================================================
+-- 代码仓库备份（Repository Backup）
+-- ============================================================
+
+-- 代码仓库登记表：记录需要备份的外部代码仓库
+CREATE TABLE code_repositories (
+  id TEXT PRIMARY KEY,
+
+  provider TEXT NOT NULL,                        -- 'github'（预留 gitlab/gitea）
+  name TEXT,                                     -- 展示名（可选，默认取 repo_identifier）
+  repo_identifier TEXT NOT NULL,                 -- 'owner/repo'
+
+  track_mode TEXT NOT NULL DEFAULT 'branch',     -- 'branch' | 'release'
+  track_ref TEXT,                                -- branch 名；release 模式留空表示取最新
+
+  target_mount_id TEXT NOT NULL,                 -- 备份目标挂载点（storage_mounts.id）
+  target_path_prefix TEXT NOT NULL DEFAULT '/',  -- 挂载点内路径前缀
+
+  enabled INTEGER NOT NULL DEFAULT 1,            -- 1=启用, 0=禁用
+  config_json TEXT NOT NULL DEFAULT '{}',        -- provider 私有配置（token 等敏感字段加密存储）
+
+  last_checked_at DATETIME,                      -- 最近一次检查更新的时间
+  last_backup_at DATETIME,                       -- 最近一次成功备份的时间
+  last_known_commit_sha TEXT,                    -- 最近一次成功备份的 commit sha
+  last_error TEXT,                               -- 最近一次失败原因
+
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 同一 provider + 仓库 + 跟踪模式 + 跟踪引用只允许登记一次
+CREATE UNIQUE INDEX idx_code_repositories_identity
+  ON code_repositories (provider, repo_identifier, track_mode, COALESCE(track_ref, ''));
+CREATE INDEX idx_code_repositories_enabled ON code_repositories (enabled);
+CREATE INDEX idx_code_repositories_mount ON code_repositories (target_mount_id);
+
+-- 代码仓库备份记录表：每次备份产生一条记录
+CREATE TABLE code_repository_backups (
+  id TEXT PRIMARY KEY,
+  repository_id TEXT NOT NULL,                   -- 对应 code_repositories.id
+
+  ref_type TEXT,                                 -- 'branch' | 'tag'
+  ref TEXT,                                      -- 分支名或 tag 名
+  commit_sha TEXT NOT NULL,                      -- 去重键
+  version TEXT,                                  -- 展示用版本串（main@282ea1c7 / v1.9.1）
+
+  status TEXT NOT NULL,                          -- 'running' | 'success' | 'failed' | 'skipped'
+
+  storage_path TEXT,                             -- 快照在 FS 中的完整路径
+  manifest_path TEXT,                            -- manifest.json 的完整路径
+  size_bytes INTEGER,                            -- 快照大小（字节，可能未知）
+
+  job_id TEXT,                                   -- 对应 tasks.task_id
+  error_message TEXT,
+
+  started_at DATETIME,
+  finished_at DATETIME,
+  created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+-- 去重的硬保证：同一仓库同一 commit 只允许一条记录
+CREATE UNIQUE INDEX idx_code_repository_backups_repo_commit
+  ON code_repository_backups (repository_id, commit_sha);
+CREATE INDEX idx_code_repository_backups_repo_created
+  ON code_repository_backups (repository_id, created_at DESC);
+CREATE INDEX idx_code_repository_backups_job ON code_repository_backups (job_id);

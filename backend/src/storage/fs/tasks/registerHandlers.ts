@@ -2,6 +2,8 @@ import { taskRegistry } from './TaskRegistry.js';
 import { CopyTaskHandler } from './handlers/CopyTaskHandler.js';
 import { FsIndexRebuildTaskHandler } from './handlers/FsIndexRebuildTaskHandler.js';
 import { FsIndexApplyDirtyTaskHandler } from './handlers/FsIndexApplyDirtyTaskHandler.js';
+// 修改点（代码仓库备份功能）
+import { RepoBackupTaskHandler } from './handlers/RepoBackupTaskHandler.js';
 
 /**
  * 注册所有任务处理器
@@ -34,6 +36,9 @@ export function registerTaskHandlers(): void {
 
   // 注册 FS 索引增量应用任务处理器（消费 dirty 队列）
   taskRegistry.register(new FsIndexApplyDirtyTaskHandler());
+
+  // 修改点（代码仓库备份功能）：注册代码仓库备份任务处理器
+  taskRegistry.register(new RepoBackupTaskHandler());
 
   // 未来扩展 (零核心代码修改):
   // taskRegistry.register(new ScheduledSyncTaskHandler());

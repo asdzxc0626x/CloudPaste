@@ -715,6 +715,103 @@ export async function createUploadPartsTables(db) {
   console.log("upload_parts 表检查/创建完成");
 }
 
+/**
+ * 代码仓库备份相关表（修改点：新增功能）
+ * - code_repositories：登记的代码仓库（provider 中立，第一阶段仅 github）
+ * - code_repository_backups：每次备份的记录（按 commit_sha 去重）
+ */
+export async function createCodeRepositoryTables(db) {
+  console.log("创建代码仓库备份表(code_repositories/code_repository_backups)...");
+
+  await db
+    .prepare(
+      `
+      CREATE TABLE IF NOT EXISTS ${DbTables.CODE_REPOSITORIES} (
+        id TEXT PRIMARY KEY,
+
+        provider TEXT NOT NULL,                        -- 'github'（预留 gitlab/gitea）
+        name TEXT,                                     -- 展示名（可选，默认取 repo_identifier）
+        repo_identifier TEXT NOT NULL,                 -- 'owner/repo'
+
+        track_mode TEXT NOT NULL DEFAULT 'branch',     -- 'branch' | 'release'
+        track_ref TEXT,                                -- branch 名；release 模式留空表示取最新
+
+        target_mount_id TEXT NOT NULL,                 -- 备份目标挂载点（storage_mounts.id）
+        target_path_prefix TEXT NOT NULL DEFAULT '/',  -- 挂载点内路径前缀
+
+        enabled INTEGER NOT NULL DEFAULT 1,            -- 1=启用, 0=禁用
+        config_json TEXT NOT NULL DEFAULT '{}',        -- provider 私有配置（token 等敏感字段加密存储）
+
+        last_checked_at DATETIME,                      -- 最近一次检查更新的时间
+        last_backup_at DATETIME,                       -- 最近一次成功备份的时间
+        last_known_commit_sha TEXT,                    -- 最近一次成功备份的 commit sha（去重参考）
+        last_error TEXT,                               -- 最近一次失败原因
+
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `,
+    )
+    .run();
+
+  // 同一 provider + 仓库 + 跟踪模式 + 跟踪引用只允许登记一次
+  // 注：track_ref 允许为 NULL，SQLite 中 NULL 不参与 UNIQUE 比较，故用 COALESCE 表达式索引兜底
+  await db
+    .prepare(
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_code_repositories_identity
+       ON ${DbTables.CODE_REPOSITORIES}(provider, repo_identifier, track_mode, COALESCE(track_ref, ''))`,
+    )
+    .run();
+  await db.prepare(`CREATE INDEX IF NOT EXISTS idx_code_repositories_enabled ON ${DbTables.CODE_REPOSITORIES}(enabled)`).run();
+  await db.prepare(`CREATE INDEX IF NOT EXISTS idx_code_repositories_mount ON ${DbTables.CODE_REPOSITORIES}(target_mount_id)`).run();
+
+  await db
+    .prepare(
+      `
+      CREATE TABLE IF NOT EXISTS ${DbTables.CODE_REPOSITORY_BACKUPS} (
+        id TEXT PRIMARY KEY,
+        repository_id TEXT NOT NULL,                   -- 对应 code_repositories.id
+
+        ref_type TEXT,                                 -- 'branch' | 'tag'
+        ref TEXT,                                      -- 分支名或 tag 名
+        commit_sha TEXT NOT NULL,                      -- 去重键
+        version TEXT,                                  -- 展示用版本串（main@282ea1c7 / v1.9.1）
+
+        status TEXT NOT NULL,                          -- 'running' | 'success' | 'failed' | 'skipped'
+
+        storage_path TEXT,                             -- 快照在 FS 中的完整路径
+        manifest_path TEXT,                            -- manifest.json 的完整路径
+        size_bytes INTEGER,                            -- 快照大小（字节，可能未知）
+
+        job_id TEXT,                                   -- 对应 tasks.task_id
+        error_message TEXT,
+
+        started_at DATETIME,
+        finished_at DATETIME,
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `,
+    )
+    .run();
+
+  // 去重的硬保证：同一仓库同一 commit 只允许一条记录
+  await db
+    .prepare(
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_code_repository_backups_repo_commit
+       ON ${DbTables.CODE_REPOSITORY_BACKUPS}(repository_id, commit_sha)`,
+    )
+    .run();
+  await db
+    .prepare(
+      `CREATE INDEX IF NOT EXISTS idx_code_repository_backups_repo_created
+       ON ${DbTables.CODE_REPOSITORY_BACKUPS}(repository_id, created_at DESC)`,
+    )
+    .run();
+  await db.prepare(`CREATE INDEX IF NOT EXISTS idx_code_repository_backups_job ON ${DbTables.CODE_REPOSITORY_BACKUPS}(job_id)`).run();
+
+  console.log("code_repositories/code_repository_backups 表检查/创建完成");
+}
+
 export async function createIndexes(db) {
   console.log("创建数据库索引...");
 
@@ -758,5 +855,7 @@ export default {
   createUploadSessionsTables,
   createVfsTables,
   createUploadPartsTables,
+  // 修改点（代码仓库备份功能）：导出新增建表函数
+  createCodeRepositoryTables,
   createIndexes,
 };

@@ -16,6 +16,8 @@ export { FsMetaRepository } from "./FsMetaRepository.js";
 export { UploadPartsRepository } from "./UploadPartsRepository.js";
 export { VfsNodesRepository } from "./VfsNodesRepository.js";
 export { MetricsCacheRepository } from "./MetricsCacheRepository.js";
+// 修改点（代码仓库备份功能）：导出仓库备份数据访问层
+export { CodeRepositoryRepository } from "./CodeRepositoryRepository.js";
 
 // 导入所有Repository类用于工厂类
 import { BaseRepository } from "./BaseRepository.js";
@@ -31,6 +33,8 @@ import { FsMetaRepository } from "./FsMetaRepository.js";
 import { UploadPartsRepository } from "./UploadPartsRepository.js";
 import { VfsNodesRepository } from "./VfsNodesRepository.js";
 import { MetricsCacheRepository } from "./MetricsCacheRepository.js";
+// 修改点（代码仓库备份功能）：工厂类需要的实现类
+import { CodeRepositoryRepository } from "./CodeRepositoryRepository.js";
 import { createDbRuntime } from "../db/runtime.js";
 
 /**
@@ -174,6 +178,18 @@ export class RepositoryFactory {
   }
 
   /**
+   * 获取 CodeRepositoryRepository 实例
+   * 修改点（代码仓库备份功能）
+   * @returns {CodeRepositoryRepository}
+   */
+  getCodeRepositoryRepository() {
+    if (!this._repositories.has("codeRepository")) {
+      this._repositories.set("codeRepository", new CodeRepositoryRepository(this.db, this.dialect));
+    }
+    return this._repositories.get("codeRepository");
+  }
+
+  /**
    * 清理所有Repository实例缓存
    */
   clearCache() {
@@ -198,6 +214,8 @@ export class RepositoryFactory {
       uploadParts: this.getUploadPartsRepository(),
       vfsNodes: this.getVfsNodesRepository(),
       metricsCache: this.getMetricsCacheRepository(),
+      // 修改点（代码仓库备份功能）
+      codeRepository: this.getCodeRepositoryRepository(),
     };
   }
 

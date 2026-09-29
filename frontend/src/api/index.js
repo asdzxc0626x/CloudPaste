@@ -17,6 +17,8 @@ import * as systemService from "./services/systemService";
 import * as urlUploadService from "./services/urlUploadService";
 import * as fsService from "./services/fsService";
 import * as fsIndexService from "./services/fsIndexService";
+// 修改点（代码仓库备份功能）
+import * as repoBackupService from "./services/repoBackupService";
 
 // 统一服务导出 - 按功能模块重新组织
 export const api = {
@@ -118,6 +120,9 @@ export const api = {
 
     // 索引管理
     fsIndex: fsIndexService,
+
+    // 修改点（代码仓库备份功能）：代码仓库备份管理
+    repoBackup: repoBackupService,
   },
 
   test: {

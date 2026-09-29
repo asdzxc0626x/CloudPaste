@@ -15,6 +15,8 @@ import {
   createUploadSessionsTables,
   createUploadPartsTables,
   createVfsTables,
+  // 修改点（代码仓库备份功能）：新库直接建出仓库备份相关表
+  createCodeRepositoryTables,
 } from "./schema.js";
 import {
   addCustomContentSettings,
@@ -49,6 +51,8 @@ export async function initDatabase(db) {
   await createVfsTables(db);
   await createMetricsCacheTables(db);
   await createUploadPartsTables(db);
+  // 修改点（代码仓库备份功能）：创建仓库登记表与备份记录表
+  await createCodeRepositoryTables(db);
 
   await createIndexes(db);
 

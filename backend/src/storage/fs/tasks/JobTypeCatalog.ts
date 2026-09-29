@@ -182,5 +182,14 @@ export function buildBuiltinJobTypeDefinitions(): JobTypeDefinition[] {
       createPolicy: { policy: "admin.all", pathCheck: false },
       capabilities: { retry: "none" },
     },
+    // 修改点（代码仓库备份功能）：仅管理员可见与创建
+    {
+      taskType: "repo_backup",
+      i18nKey: "admin.tasks.taskType.repo_backup",
+      category: "repo",
+      visibility: { mode: "admin-only" },
+      createPolicy: { policy: "admin.all", pathCheck: false },
+      capabilities: { retry: "none" },
+    },
   ];
 }

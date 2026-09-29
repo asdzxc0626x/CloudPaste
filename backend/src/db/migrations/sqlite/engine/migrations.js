@@ -12,6 +12,8 @@ import {
   createUploadSessionsTables,
   createVfsTables,
   createMetricsCacheTables,
+  // 修改点（代码仓库备份功能）：v35 迁移用
+  createCodeRepositoryTables,
 } from "./schema.js";
 import {
   addCustomContentSettings,
@@ -826,6 +828,17 @@ export async function runLegacyMigrationByVersion(db, version) {
         console.warn("版本34：归一化 storage_configs 布尔字段失败（可忽略，将由后续保存配置逐步修复）：", e?.message || e);
       }
 
+      break;
+    }
+
+    // 修改点（代码仓库备份功能）：新增代码仓库备份相关表
+    case 35: {
+      console.log("版本35：新增 code_repositories / code_repository_backups（代码仓库备份）...");
+      try {
+        await createCodeRepositoryTables(db);
+      } catch (e) {
+        console.warn("版本35：创建代码仓库备份表失败（可忽略，后续会再次尝试）:", e?.message || e);
+      }
       break;
     }
 

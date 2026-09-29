@@ -28,6 +28,9 @@ export const DbTables = {
   UPLOAD_SESSIONS: "upload_sessions", // 通用上传会话表（前端分片/断点续传）
   UPLOAD_PARTS: "upload_parts", // 上传分片明细表（临时账本，一片一行）
   VFS_NODES: "vfs_nodes", // 虚拟目录树索引表（长期目录树/条目）
+  // 修改点（代码仓库备份功能）：新增仓库登记表与备份记录表
+  CODE_REPOSITORIES: "code_repositories", // 代码仓库备份 - 仓库登记表
+  CODE_REPOSITORY_BACKUPS: "code_repository_backups", // 代码仓库备份 - 备份记录表
 };
 
 // 默认的最大上传大小（MB）

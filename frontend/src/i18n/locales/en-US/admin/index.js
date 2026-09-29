@@ -11,6 +11,8 @@ import storage from "./storage.js";
 import scheduledJobs from "./scheduledJobs.js";
 import paste from "./paste.js";
 import fileshare from "./fileshare.js";
+// New feature: repository backup
+import repoBackup from "./repoBackup.js";
 
 export default {
   ...common,
@@ -26,4 +28,5 @@ export default {
   ...scheduledJobs,
   ...paste,
   ...fileshare,
+  ...repoBackup,
 };

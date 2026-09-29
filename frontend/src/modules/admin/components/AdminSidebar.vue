@@ -469,7 +469,7 @@ import { ref, computed, onMounted } from "vue";
 import { useLocalStorage } from "@vueuse/core";
 import { useI18n } from "vue-i18n";
 import { useSiteConfigStore } from "@/stores/siteConfigStore.js";
-import { IconBellAlert, IconBookOpen, IconChartBar, IconChevronDown, IconChevronLeft, IconChevronRight, IconCircleStack, IconCloud, IconClose, IconDocumentText, IconEye, IconFolder, IconGlobeAlt, IconHome, IconInformationCircle, IconKey, IconLink, IconLogout, IconMenu, IconSearch, IconServerStack, IconSettings, IconTaskList, IconUser, IconList } from "@/components/icons";
+import { IconBellAlert, IconBookOpen, IconChartBar, IconChevronDown, IconChevronLeft, IconChevronRight, IconCircleStack, IconCloud, IconClose, IconCode, IconDocumentText, IconEye, IconFolder, IconGlobeAlt, IconHome, IconInformationCircle, IconKey, IconLink, IconLogout, IconMenu, IconSearch, IconServerStack, IconSettings, IconTaskList, IconUser, IconList } from "@/components/icons";
 
 // 使用i18n和站点配置Store
 const { t } = useI18n();
@@ -542,6 +542,8 @@ const menuIconMap = {
   logout: IconLogout,
   'chevron-down': IconChevronDown,
   search: IconSearch,
+  // 修改点（代码仓库备份功能）：代码仓库备份菜单图标
+  code: IconCode,
 };
 
 const getMenuIconComponent = (iconName) => {
@@ -567,6 +569,8 @@ const visibleMenuItems = computed(() => {
         children: [
           { id: "scheduled-jobs", name: t("admin.sidebar.scheduledJobs"), icon: "bell-alert", type: "item", routeName: "AdminScheduledJobs" },
           { id: "tasks", name: t("admin.sidebar.tasks"), icon: "list-bullet", type: "item", routeName: "AdminTasks" },
+          // 修改点（代码仓库备份功能）：挂在任务管理分组下
+          { id: "repo-backup", name: t("admin.sidebar.repoBackup"), icon: "code", type: "item", routeName: "AdminRepoBackup" },
         ],
       },
       { id: "fs-index-management", name: t("admin.sidebar.fsIndexManagement"), icon: "search", type: "item", routeName: "AdminFsIndexManagement" },

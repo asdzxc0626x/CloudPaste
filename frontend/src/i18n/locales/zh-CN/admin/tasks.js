@@ -193,6 +193,7 @@ export default {
       copy: '复制',
       fs_index_rebuild: '索引重建',
       fs_index_apply_dirty: '索引增量应用',
+      repo_backup: '代码仓库备份',
       unknown: '未知任务',
       unknownWithType: '未知任务（{type}）',
     },
