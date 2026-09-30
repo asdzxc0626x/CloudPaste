@@ -10,10 +10,12 @@
  * - 真正的「下载源码 + 上传到挂载点」由 RepoBackupTaskHandler 在任务里执行，
  *   本服务只负责创建任务，避免在 HTTP 请求生命周期里做重活
  *
- * 优化点（多分支 / 多备份目标 / 版本保留）：
+ * 优化点（多分支 / 多备份目标 / 版本保留 / 独立备份计划）：
  * - 分支模式下一个仓库记录承载一组分支，落库为 track_refs_json
  * - 备份目标可多选，落库为 target_mount_ids_json，全部要求具备 WriterCapable
  * - retention_count 控制每个仓库保留多少个成功版本
+ * - 备份计划不存在仓库表里：每个仓库对应一行 scheduled_jobs，
+ *   由 repobackup/schedule.js 在创建/更新/删除仓库时同步维护（详见该文件头注释）
  */
 
 import { UserType } from "../constants/index.js";
@@ -37,6 +39,13 @@ import {
   MAX_TARGET_MOUNTS,
 } from "../repobackup/config.js";
 import { normalizePathPrefix, buildRepoFolderName } from "../repobackup/paths.js";
+import {
+  resolveScheduleInput,
+  syncRepositoryScheduleJob,
+  removeRepositoryScheduleJob,
+  loadRepositorySchedule,
+  loadAllRepositorySchedules,
+} from "../repobackup/schedule.js";
 
 /**
  * 生成主键
@@ -282,6 +291,9 @@ export async function listRepositories(db, repositoryFactory, encryptionSecret, 
   const mounts = await mountRepository.findAll(true);
   const mountMap = new Map(mounts.map((m) => [String(m.id), m]));
 
+  // 修改点（独立备份计划优化）：一次性取出全部备份计划，避免逐仓库查 scheduled_jobs
+  const scheduleMap = await loadAllRepositorySchedules(db);
+
   const result = [];
   for (const row of rows) {
     const targetMountIds = resolveTargetMountIds(row);
@@ -306,6 +318,8 @@ export async function listRepositories(db, repositoryFactory, encryptionSecret, 
         targetMounts,
         missingMountIds: targetMountIds.filter((id) => !mountMap.has(String(id))),
         backupFolder,
+        // 修改点（独立备份计划优化）：未配置计划时为 null，前端显示「未启用」
+        schedule: scheduleMap.get(String(row.id)) || null,
         latestBackup: latestBackup ? toBackupDto(latestBackup, { targets: latestBackupTargets }) : null,
       }),
     );
@@ -341,6 +355,8 @@ export async function getRepository(db, repositoryFactory, encryptionSecret, id,
     targetMount: targetMounts[0] || null,
     targetMounts,
     missingMountIds: targetMountIds.filter((_, index) => !targetMounts[index]),
+    // 修改点（独立备份计划优化）
+    schedule: await loadRepositorySchedule(db, row.id),
     latestBackup: latestBackup ? toBackupDto(latestBackup, { targets: latestBackupTargets }) : null,
   });
 }
@@ -489,6 +505,10 @@ export async function createRepository(db, repositoryFactory, encryptionSecret, 
 
   const retentionCount = resolveRetentionInput(body, null);
 
+  // 修改点（独立备份计划优化）：先校验计划参数再建仓库，
+  // 避免仓库建好了却因为间隔非法而报错（留下一个没有计划的仓库）
+  const schedule = resolveScheduleInput(body, null);
+
   // 前缀规范化同时承担校验职责（禁止 . 与 ..）
   const targetPathPrefix = normalizePathPrefix(body?.targetPathPrefix ?? body?.target_path_prefix ?? "/") || "/";
 
@@ -514,6 +534,14 @@ export async function createRepository(db, repositoryFactory, encryptionSecret, 
     retention_count: retentionCount,
     enabled: body?.enabled === undefined ? 1 : body.enabled ? 1 : 0,
     config_json: await serializeProviderConfig(provider, incomingConfig, encryptionSecret),
+  });
+
+  // 修改点（独立备份计划优化）：建立该仓库自己的 scheduled_jobs 行
+  await syncRepositoryScheduleJob(db, {
+    repoRow: { id, name: body?.name ? String(body.name).trim() : null, repo_identifier: repoIdentifier },
+    enabled: schedule.enabled,
+    intervalSec: schedule.intervalSec,
+    existing: null,
   });
 
   return await getRepository(db, factory, encryptionSecret, id, env);
@@ -597,7 +625,24 @@ export async function updateRepository(db, repositoryFactory, encryptionSecret, 
     updates.enabled = body.enabled ? 1 : 0;
   }
 
+  // 修改点（独立备份计划优化）：先校验计划参数，再写仓库，再同步计划行
+  const existingSchedule = await loadRepositorySchedule(db, id);
+  const schedule = resolveScheduleInput(body, existingSchedule);
+
   await codeRepo.updateRepository(id, updates);
+
+  await syncRepositoryScheduleJob(db, {
+    repoRow: {
+      id,
+      // 名字用于「定时任务」页的展示，取本次更新后的值
+      name: updates.name !== undefined ? updates.name : existing.name,
+      repo_identifier: repoIdentifier,
+    },
+    enabled: schedule.enabled,
+    intervalSec: schedule.intervalSec,
+    existing: existingSchedule,
+  });
+
   return await getRepository(db, factory, encryptionSecret, id, env);
 }
 
@@ -618,7 +663,7 @@ export async function setRepositoryEnabled(db, repositoryFactory, id, enabled, e
 }
 
 /**
- * 删除仓库（同时清理备份记录与各目标结果，但不删除已上传的快照文件）
+ * 删除仓库（同时清理备份记录、各目标结果与备份计划，但不删除已上传的快照文件）
  */
 export async function deleteRepository(db, repositoryFactory, id, env = {}) {
   const factory = ensureRepositoryFactory(db, repositoryFactory, env);
@@ -630,6 +675,9 @@ export async function deleteRepository(db, repositoryFactory, id, env = {}) {
   }
 
   await codeRepo.deleteRepository(id);
+  // 修改点（独立备份计划优化）：连带清理该仓库的 scheduled_jobs 行与其运行历史，
+  // 否则会留下一个永远找不到仓库的调度作业
+  await removeRepositoryScheduleJob(db, id);
   return { id };
 }
 

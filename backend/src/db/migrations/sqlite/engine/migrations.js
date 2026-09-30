@@ -189,6 +189,63 @@ export async function migrateCodeRepositoryMultiTrackAndTargets(db) {
   return { ok: true };
 }
 
+/**
+ * 为存量代码仓库回填备份计划（修改点：独立备份计划优化）
+ *
+ * 背景：备份计划不是 code_repositories 的列，而是一行 scheduled_jobs
+ * （task_id = `repo_backup_<仓库ID>`，handler_id = 'repo_backup_schedule'，
+ *  config_json = {"repositoryId": "..."}），由仓库管理页在保存时同步维护。
+ * v36 及更早创建的仓库没有这一行，升级后就不会自动备份，所以这里补一次。
+ *
+ * 说明：
+ * - 纯数据迁移，不改表结构，因此 engine/schema.js 与 backend/schema.sql 无需变更
+ *   （新库里没有任何仓库记录，天然不需要回填）
+ * - 幂等：NOT EXISTS 保证已有计划的仓库不会被重复插入，也不会覆盖管理员改过的间隔
+ * - config_json 用字符串拼接而不是 json_object()，避免依赖 SQLite 的 JSON1 扩展；
+ *   仓库 ID 形如 repo_<uuid>，不含引号或反斜杠，拼进 JSON 是安全的
+ */
+export async function migrateRepoBackupSchedules(db) {
+  const DEFAULT_INTERVAL_SEC = 6 * 60 * 60; // 默认每 6 小时
+  // 首次执行时间错开一个间隔，避免升级瞬间所有仓库一起拉 GitHub
+  const firstRunAt = new Date(Date.now() + DEFAULT_INTERVAL_SEC * 1000).toISOString();
+
+  const result = await db
+    .prepare(
+      `
+      INSERT INTO ${DbTables.SCHEDULED_JOBS} (
+        task_id, handler_id, name, description, enabled,
+        schedule_type, interval_sec, cron_expression,
+        run_count, failure_count,
+        last_run_status, last_run_started_at, last_run_finished_at,
+        next_run_after, lock_until, config_json
+      )
+      SELECT
+        'repo_backup_' || r.id,
+        'repo_backup_schedule',
+        '仓库备份 - ' || COALESCE(NULLIF(r.name, ''), r.repo_identifier),
+        '按该仓库的备份计划自动创建代码仓库备份作业（在「仓库管理」中配置）',
+        1,
+        'interval',
+        ?,
+        NULL,
+        0, 0,
+        NULL, NULL, NULL,
+        ?, NULL,
+        '{"repositoryId":"' || r.id || '"}'
+      FROM ${DbTables.CODE_REPOSITORIES} r
+      WHERE NOT EXISTS (
+        SELECT 1 FROM ${DbTables.SCHEDULED_JOBS} s WHERE s.task_id = 'repo_backup_' || r.id
+      )
+    `,
+    )
+    .bind(DEFAULT_INTERVAL_SEC, firstRunAt)
+    .run();
+
+  const changes = result?.meta?.changes ?? result?.changes ?? 0;
+  console.log(`版本37：为 ${changes} 个存量代码仓库回填了备份计划（默认每 6 小时）`);
+  return { ok: true, created: changes };
+}
+
 export async function addTableField(db, tableName, fieldName, fieldDefinition) {
   try {
     const columnInfo = await db.prepare(`PRAGMA table_info(${tableName})`).all();
@@ -921,6 +978,17 @@ export async function runLegacyMigrationByVersion(db, version) {
       break;
     }
 
+    // 修改点（仓库备份优化：每个仓库独立的备份计划）
+    case 37: {
+      console.log("版本37：为存量代码仓库回填独立备份计划（scheduled_jobs）...");
+      try {
+        await migrateRepoBackupSchedules(db);
+      } catch (e) {
+        console.warn("版本37：回填仓库备份计划失败（可忽略，保存仓库时会自动补建）:", e?.message || e);
+      }
+      break;
+    }
+
     default:
       console.log(`未知的迁移版本: ${version}`);
       break;
@@ -931,6 +999,7 @@ export default {
   addTableField,
   removeTableField,
   migrateCodeRepositoryMultiTrackAndTargets,
+  migrateRepoBackupSchedules,
   migrateFilesTableToMultiStorage,
   rebuildFilesTable,
   migrateToBitFlagPermissions,

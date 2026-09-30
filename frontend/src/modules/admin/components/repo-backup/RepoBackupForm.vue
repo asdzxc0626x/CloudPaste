@@ -11,10 +11,11 @@
  * - 未复用 DynamicFormField：它不支持 secret 类型（token 需要密码框 + 显示切换）；
  *   也未复用 ConfigForm：它与 storage_configs 的 reveal 接口强耦合
  *
- * 优化点（多分支 / 多备份目标 / 版本保留 / 窗口高度 / 响应式）：
+ * 优化点（多分支 / 多备份目标 / 版本保留 / 独立备份计划 / 窗口高度 / 响应式）：
  * - 分支模式支持录入多个分支（回车或逗号添加，chip 展示，可单个删除）
  * - 备份目标改为「同一个下拉框内直接多选」，选中项在最左侧显示绿色 √
  * - 新增保留版本数输入
+ * - 新增备份计划（开关 + 间隔预设/自定义小时数），复用后端 scheduled_jobs
  * - 弹窗改为 flex 三段式（标题 / 可滚动正文 / 固定底部按钮），
  *   正文独立滚动，底部按钮始终可见，不再出现"整窗滚动、按钮跑出屏幕"
  * - 高级配置默认折叠，仓库表单的主要字段因此能在一屏内看完
@@ -45,6 +46,14 @@ const MIN_RETENTION = 1;
 const MAX_RETENTION = 100;
 const DEFAULT_RETENTION = 10;
 
+/** 备份计划间隔上下限与默认值（与后端 repobackup/schedule.js 的常量保持一致） */
+const MIN_INTERVAL_SEC = 15 * 60;
+const MAX_INTERVAL_SEC = 30 * 24 * 3600;
+const DEFAULT_INTERVAL_SEC = 6 * 3600;
+
+/** 间隔预设：覆盖常见节奏，其余走「自定义小时数」 */
+const INTERVAL_PRESETS = [3600, 3 * 3600, 6 * 3600, 12 * 3600, 24 * 3600, 3 * 24 * 3600, 7 * 24 * 3600];
+
 /** 本地表单状态 */
 const formData = reactive({
   provider: "github",
@@ -59,9 +68,50 @@ const formData = reactive({
   targetMountIds: [],
   targetPathPrefix: "/",
   retentionCount: DEFAULT_RETENTION,
+  /** 备份计划开关（修改点：独立备份计划）；间隔由 intervalSelect/customHours 推导 */
+  scheduleEnabled: true,
   enabled: true,
   config: {},
 });
+
+/**
+ * 间隔选择器状态（修改点：独立备份计划）
+ * - intervalSelect 为数字表示选中预设，为 "custom" 表示用 customHours 自定义
+ * - 真正提交的秒数由 resolvedIntervalSec 推导，避免维护两份状态导致不同步
+ */
+const intervalSelect = ref(DEFAULT_INTERVAL_SEC);
+const customHours = ref(DEFAULT_INTERVAL_SEC / 3600);
+
+const resolvedIntervalSec = computed(() => {
+  if (intervalSelect.value === "custom") {
+    const hours = Number(customHours.value);
+    if (!Number.isFinite(hours)) return NaN;
+    return Math.round(hours * 3600);
+  }
+  return Number(intervalSelect.value);
+});
+
+/** 把秒数还原成选择器状态：能对上预设就选预设，否则切到自定义 */
+const applyIntervalSec = (seconds) => {
+  const value = Number(seconds);
+  const safe = Number.isFinite(value) && value > 0 ? value : DEFAULT_INTERVAL_SEC;
+  if (INTERVAL_PRESETS.includes(safe)) {
+    intervalSelect.value = safe;
+    customHours.value = Math.round((safe / 3600) * 100) / 100;
+    return;
+  }
+  intervalSelect.value = "custom";
+  customHours.value = Math.round((safe / 3600) * 100) / 100;
+};
+
+/** 人类可读的间隔文案（用于预设下拉） */
+const formatInterval = (seconds) => {
+  const value = Number(seconds);
+  if (!Number.isFinite(value) || value <= 0) return "-";
+  if (value % 86400 === 0) return t("admin.repoBackup.form.intervalDays", { count: value / 86400 });
+  if (value % 3600 === 0) return t("admin.repoBackup.form.intervalHours", { count: value / 3600 });
+  return t("admin.repoBackup.form.intervalMinutes", { count: Math.round(value / 60) });
+};
 
 /** 表单内的本地校验错误 */
 const localError = ref("");
@@ -109,10 +159,13 @@ const resetForm = () => {
       targetMountIds: mountIds,
       targetPathPrefix: props.repo.targetPathPrefix || "/",
       retentionCount: Number(props.repo.retentionCount) || DEFAULT_RETENTION,
+      // 修改点（独立备份计划）：计划缺失（v36 及更早的存量仓库）时按默认开启处理
+      scheduleEnabled: props.repo.schedule ? props.repo.schedule.enabled !== false : true,
       enabled: props.repo.enabled !== false,
       // 配置中的敏感字段是掩码值，原样提交回后端会被识别并保留原密钥
       config: { ...(props.repo.config || {}) },
     });
+    applyIntervalSec(props.repo.schedule?.intervalSec ?? DEFAULT_INTERVAL_SEC);
     return;
   }
 
@@ -127,9 +180,11 @@ const resetForm = () => {
     targetMountIds: props.writableMounts[0]?.id ? [String(props.writableMounts[0].id)] : [],
     targetPathPrefix: "/",
     retentionCount: DEFAULT_RETENTION,
+    scheduleEnabled: true,
     enabled: true,
     config: {},
   });
+  applyIntervalSec(DEFAULT_INTERVAL_SEC);
 };
 
 watch(() => props.repo, resetForm, { immediate: true });
@@ -281,6 +336,18 @@ const handleSubmit = () => {
     return;
   }
 
+  // 修改点（独立备份计划）：只有启用了定时备份才校验间隔，关闭时间隔值无意义
+  const intervalSec = resolvedIntervalSec.value;
+  if (formData.scheduleEnabled) {
+    if (!Number.isFinite(intervalSec) || intervalSec < MIN_INTERVAL_SEC || intervalSec > MAX_INTERVAL_SEC) {
+      localError.value = t("admin.repoBackup.validation.intervalRange", {
+        min: MIN_INTERVAL_SEC / 60,
+        max: MAX_INTERVAL_SEC / 86400,
+      });
+      return;
+    }
+  }
+
   emit("submit", {
     id: props.repo?.id || null,
     provider: formData.provider,
@@ -295,6 +362,9 @@ const handleSubmit = () => {
     targetPathPrefix: formData.targetPathPrefix?.trim() || "/",
     // 修改点（版本保留优化）
     retentionCount: Math.trunc(retention),
+    // 修改点（独立备份计划优化）：关闭时也提交当前间隔，重新开启后沿用同一节奏
+    scheduleEnabled: formData.scheduleEnabled,
+    scheduleIntervalSec: Number.isFinite(intervalSec) ? intervalSec : DEFAULT_INTERVAL_SEC,
     enabled: formData.enabled,
     config: { ...formData.config },
   });
@@ -545,6 +615,50 @@ onBeforeUnmount(() => document.removeEventListener("keydown", onEscClose));
               <p :class="hintClass">{{ $t("admin.repoBackup.form.retentionCountHint", { count: DEFAULT_RETENTION }) }}</p>
             </div>
           </div>
+        </div>
+
+        <!-- 备份计划（修改点：独立备份计划优化） -->
+        <div class="pt-2 border-t space-y-2.5" :class="darkMode ? 'border-gray-700' : 'border-gray-200'">
+          <div class="flex items-center justify-between gap-2">
+            <h4 :class="sectionTitleClass">{{ $t("admin.repoBackup.form.scheduleSection") }}</h4>
+            <label class="inline-flex items-center gap-1.5 shrink-0">
+              <input v-model="formData.scheduleEnabled" type="checkbox" class="rounded border-gray-300" />
+              <span class="text-xs" :class="darkMode ? 'text-gray-300' : 'text-gray-700'">
+                {{ $t("admin.repoBackup.form.scheduleEnabled") }}
+              </span>
+            </label>
+          </div>
+
+          <div v-if="formData.scheduleEnabled" class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <label :class="labelClass">{{ $t("admin.repoBackup.form.scheduleInterval") }}</label>
+              <select v-model="intervalSelect" :class="inputClass">
+                <option v-for="preset in INTERVAL_PRESETS" :key="preset" :value="preset">
+                  {{ formatInterval(preset) }}
+                </option>
+                <option value="custom">{{ $t("admin.repoBackup.form.intervalCustom") }}</option>
+              </select>
+              <p :class="hintClass">{{ $t("admin.repoBackup.form.scheduleIntervalHint") }}</p>
+            </div>
+
+            <!-- 自定义小时数 -->
+            <div v-if="intervalSelect === 'custom'">
+              <label :class="labelClass">{{ $t("admin.repoBackup.form.intervalCustomHours") }}</label>
+              <input
+                v-model.number="customHours"
+                type="number"
+                :min="MIN_INTERVAL_SEC / 3600"
+                :max="MAX_INTERVAL_SEC / 3600"
+                step="0.25"
+                :class="inputClass"
+              />
+              <p :class="hintClass">
+                {{ $t("admin.repoBackup.form.intervalCustomHint", { min: MIN_INTERVAL_SEC / 60, max: MAX_INTERVAL_SEC / 86400 }) }}
+              </p>
+            </div>
+          </div>
+
+          <p v-else :class="hintClass">{{ $t("admin.repoBackup.form.scheduleDisabledHint") }}</p>
         </div>
 
         <!-- provider 私有配置（schema 驱动，默认折叠以减少窗口高度） -->

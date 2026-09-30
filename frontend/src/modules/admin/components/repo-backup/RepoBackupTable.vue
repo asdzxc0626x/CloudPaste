@@ -4,12 +4,14 @@
  * - 展示仓库、跟踪分支、备份目标、最近备份状态
  * - 行级操作：检查更新 / 立即备份 / 历史 / 编辑 / 启用禁用 / 删除
  *
- * 优化点（多分支 / 多备份目标 / 响应式）：
+ * 优化点（多分支 / 多备份目标 / 独立备份计划 / 响应式）：
  * - 跟踪列展示全部分支；目标列展示全部挂载点
+ * - 最近备份列附带该仓库的备份计划（间隔 + 下次执行时间）
  * - 桌面端（md 以上）用表格；移动端改用卡片列表，
  *   避免 5 列表格在窄屏上被迫横向滚动
  */
 import { computed } from "vue";
+import { useI18n } from "vue-i18n";
 import RepoBackupRowActions from "./RepoBackupRowActions.vue";
 
 const props = defineProps({
@@ -21,6 +23,8 @@ const props = defineProps({
 });
 
 const emit = defineEmits(["check", "backup", "history", "edit", "toggle", "delete"]);
+
+const { t } = useI18n();
 
 const hasData = computed(() => props.repositories.length > 0);
 
@@ -104,6 +108,34 @@ const checkSummary = (repo) => {
 const chipClass = computed(() =>
   props.darkMode ? "bg-gray-700 text-gray-200" : "bg-gray-100 text-gray-700",
 );
+
+// ==================== 备份计划（修改点：独立备份计划优化） ====================
+
+/** 把间隔秒数格式化成人类可读文案 */
+const formatInterval = (seconds) => {
+  const value = Number(seconds);
+  if (!Number.isFinite(value) || value <= 0) return "-";
+  if (value % 86400 === 0) return t("admin.repoBackup.form.intervalDays", { count: value / 86400 });
+  if (value % 3600 === 0) return t("admin.repoBackup.form.intervalHours", { count: value / 3600 });
+  return t("admin.repoBackup.form.intervalMinutes", { count: Math.round(value / 60) });
+};
+
+/** 计划摘要：未启用 / 每 N 小时 */
+const scheduleLabel = (repo) => {
+  const schedule = repo.schedule;
+  if (!schedule || !schedule.enabled) return t("admin.repoBackup.table.scheduleOff");
+  return t("admin.repoBackup.table.scheduleEvery", { interval: formatInterval(schedule.intervalSec) });
+};
+
+/** 计划已启用时才展示下次执行时间 */
+const scheduleNextRun = (repo) => {
+  const schedule = repo.schedule;
+  if (!schedule || !schedule.enabled || !schedule.nextRunAfter) return "";
+  return formatTime(schedule.nextRunAfter);
+};
+
+/** 上一次调度执行失败时给出提示（例如仓库被禁用、计划配置失效） */
+const scheduleFailed = (repo) => repo.schedule?.enabled === true && repo.schedule?.lastRunStatus === "failure";
 </script>
 
 <template>
@@ -260,6 +292,24 @@ const chipClass = computed(() =>
               <span v-else class="text-xs" :class="darkMode ? 'text-gray-500' : 'text-gray-400'">
                 {{ $t("admin.repoBackup.table.neverBackedUp") }}
               </span>
+
+              <!-- 备份计划（修改点：独立备份计划优化） -->
+              <div class="mt-1.5 flex items-center gap-1 flex-wrap text-[11px]">
+                <span
+                  class="px-1.5 py-0.5 rounded"
+                  :class="repo.schedule?.enabled
+                    ? 'bg-indigo-100 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300'
+                    : (darkMode ? 'bg-gray-700 text-gray-400' : 'bg-gray-100 text-gray-500')"
+                >
+                  {{ scheduleLabel(repo) }}
+                </span>
+                <span v-if="scheduleNextRun(repo)" :class="darkMode ? 'text-gray-500' : 'text-gray-400'">
+                  {{ $t("admin.repoBackup.table.scheduleNext") }} {{ scheduleNextRun(repo) }}
+                </span>
+                <span v-if="scheduleFailed(repo)" class="text-amber-600 dark:text-amber-400">
+                  {{ $t("admin.repoBackup.table.scheduleLastFailed") }}
+                </span>
+              </div>
             </td>
 
             <!-- 操作 -->
@@ -347,6 +397,27 @@ const chipClass = computed(() =>
             </dd>
           </div>
           <div v-if="repo.lastError" class="text-red-600 dark:text-red-400 break-all">{{ repo.lastError }}</div>
+
+          <!-- 备份计划（修改点：独立备份计划优化） -->
+          <div class="flex gap-2">
+            <dt class="shrink-0 w-14" :class="darkMode ? 'text-gray-500' : 'text-gray-400'">{{ $t("admin.repoBackup.table.schedule") }}</dt>
+            <dd class="min-w-0 flex flex-wrap items-center gap-1">
+              <span
+                class="px-1.5 py-0.5 rounded"
+                :class="repo.schedule?.enabled
+                  ? 'bg-indigo-100 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300'
+                  : (darkMode ? 'bg-gray-700 text-gray-400' : 'bg-gray-100 text-gray-500')"
+              >
+                {{ scheduleLabel(repo) }}
+              </span>
+              <span v-if="scheduleNextRun(repo)" :class="darkMode ? 'text-gray-500' : 'text-gray-400'">
+                {{ $t("admin.repoBackup.table.scheduleNext") }} {{ scheduleNextRun(repo) }}
+              </span>
+              <span v-if="scheduleFailed(repo)" class="text-amber-600 dark:text-amber-400">
+                {{ $t("admin.repoBackup.table.scheduleLastFailed") }}
+              </span>
+            </dd>
+          </div>
         </dl>
 
         <div class="mt-2.5 pt-2.5 border-t" :class="darkMode ? 'border-gray-700' : 'border-gray-200'">

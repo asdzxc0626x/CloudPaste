@@ -3,7 +3,7 @@ export default {
   repoBackup: {
     title: "Repositories",
     subtitle:
-      "Register external code repositories, watch them by branch or release, and back up source snapshots to one or more storage mounts",
+      "Register external code repositories, check branches or releases on each repository's own schedule, and back up source snapshots to one or more storage mounts",
 
     toolbar: {
       create: "Add Repository",
@@ -24,6 +24,12 @@ export default {
       mountMissing: "Mount missing",
       retention: "Keep {count} versions",
       targetsOk: "{ok}/{total} targets written",
+      // Per-repository backup schedule
+      schedule: "Schedule",
+      scheduleOff: "Schedule off",
+      scheduleEvery: "Every {interval}",
+      scheduleNext: "next",
+      scheduleLastFailed: "last run failed",
     },
 
     status: {
@@ -110,6 +116,20 @@ export default {
       retentionCount: "Versions to keep",
       retentionCountHint: "Older versions are deleted automatically beyond this count; default {count}",
 
+      // Per-repository backup schedule, backed by the existing scheduled-jobs mechanism
+      scheduleSection: "Backup schedule",
+      scheduleEnabled: "Back up on a schedule",
+      scheduleInterval: "Interval",
+      scheduleIntervalHint:
+        "Checks every 6 hours by default; runs with no new version are skipped, so nothing is backed up twice",
+      scheduleDisabledHint: "Scheduled backups are off; use \"Back up now\" instead",
+      intervalMinutes: "{count} minutes",
+      intervalHours: "{count} hours",
+      intervalDays: "{count} days",
+      intervalCustom: "Custom...",
+      intervalCustomHours: "Custom interval (hours)",
+      intervalCustomHint: "Between {min} minutes and {max} days; decimals allowed (0.5 = 30 minutes)",
+
       advancedSection: "Advanced options",
       enabled: "Enable this repository (disabled repositories cannot be backed up)",
       saving: "Saving...",
@@ -172,6 +192,7 @@ export default {
       branchRequired: "Add at least one branch in branch mode",
       mountRequired: "Select at least one backup target mount",
       retentionRange: "Versions to keep must be between {min} and {max}",
+      intervalRange: "The backup interval must be between {min} minutes and {max} days",
     },
 
     messages: {

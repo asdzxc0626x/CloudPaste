@@ -53,6 +53,20 @@ import { get, post, put, del } from "../client";
  */
 
 /**
+ * @typedef {Object} RepoSchedule
+ * 仓库的独立备份计划（后端落在 scheduled_jobs 表，一个仓库一行）
+ * @property {string} taskId - 调度作业 ID（`repo_backup_<仓库ID>`）
+ * @property {boolean} enabled - 是否启用定时备份
+ * @property {number} intervalSec - 备份间隔（秒），默认 21600（6 小时）
+ * @property {string|null} nextRunAfter - 下次执行时间
+ * @property {string|null} lastRunStatus - 'success' | 'failure' | 'skipped' | null
+ * @property {string|null} lastRunFinishedAt
+ * @property {number} runCount
+ * @property {number} failureCount
+ * @property {string} runtimeState - 'disabled'|'scheduled'|'pending'|'running'|'idle'
+ */
+
+/**
  * @typedef {Object} CodeRepository
  * @property {string} id
  * @property {string} provider
@@ -76,6 +90,7 @@ import { get, post, put, del } from "../client";
  * @property {RepoTargetMount[]} [targetMounts]
  * @property {string[]} [missingMountIds] - 已被删除的挂载点 ID
  * @property {string|null} [backupFolder] - 备份文件所在目录（可跳转挂载浏览器）
+ * @property {RepoSchedule|null} [schedule] - 独立备份计划，null 表示未配置
  * @property {RepoBackup|null} [latestBackup]
  */
 
@@ -184,6 +199,8 @@ export function getRepository(id) {
  * @param {string[]} payload.targetMountIds - 备份目标挂载点 ID 列表（至少一个）
  * @param {string} [payload.targetPathPrefix]
  * @param {number} [payload.retentionCount] - 保留版本数，默认 10
+ * @param {boolean} [payload.scheduleEnabled] - 是否启用定时备份，默认 true
+ * @param {number} [payload.scheduleIntervalSec] - 备份间隔（秒），默认 21600（6 小时）
  * @param {string} [payload.name]
  * @param {boolean} [payload.enabled]
  * @param {Object} [payload.config]

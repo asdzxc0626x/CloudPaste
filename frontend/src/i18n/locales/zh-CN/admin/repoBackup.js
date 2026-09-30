@@ -2,7 +2,7 @@
 export default {
   repoBackup: {
     title: "仓库管理",
-    subtitle: "登记外部代码仓库，按分支或 Release 自动检查更新，并将源码快照备份到一个或多个存储挂载点",
+    subtitle: "登记外部代码仓库，按各自的备份计划定时检查分支或 Release 更新，并将源码快照备份到一个或多个存储挂载点",
 
     toolbar: {
       create: "添加仓库",
@@ -23,6 +23,12 @@ export default {
       mountMissing: "挂载点已丢失",
       retention: "保留 {count} 个版本",
       targetsOk: "目标 {ok}/{total} 写入成功",
+      // 修改点（独立备份计划优化）
+      schedule: "备份计划",
+      scheduleOff: "未启用定时备份",
+      scheduleEvery: "每 {interval}",
+      scheduleNext: "下次",
+      scheduleLastFailed: "上次调度失败",
     },
 
     status: {
@@ -107,6 +113,19 @@ export default {
       retentionCount: "保留版本数",
       retentionCountHint: "超过该数量后自动删除最旧的版本，默认 {count} 个",
 
+      // 修改点（独立备份计划优化）：每个仓库单独的备份计划，复用后端定时任务机制
+      scheduleSection: "备份计划",
+      scheduleEnabled: "启用定时备份",
+      scheduleInterval: "备份间隔",
+      scheduleIntervalHint: "默认每 6 小时检查一次；没有新版本时会自动跳过，不会重复备份",
+      scheduleDisabledHint: "已关闭定时备份，只能手动点击「立即备份」",
+      intervalMinutes: "{count} 分钟",
+      intervalHours: "{count} 小时",
+      intervalDays: "{count} 天",
+      intervalCustom: "自定义…",
+      intervalCustomHours: "自定义间隔（小时）",
+      intervalCustomHint: "范围 {min} 分钟 ~ {max} 天，支持小数（如 0.5 = 30 分钟）",
+
       advancedSection: "高级配置（可选）",
       enabled: "启用该仓库（禁用后不可备份）",
       saving: "保存中...",
@@ -168,6 +187,7 @@ export default {
       branchRequired: "分支模式下至少需要添加一个分支",
       mountRequired: "请至少选择一个备份目标挂载点",
       retentionRange: "保留版本数必须在 {min} ~ {max} 之间",
+      intervalRange: "备份间隔必须在 {min} 分钟 ~ {max} 天之间",
     },
 
     messages: {

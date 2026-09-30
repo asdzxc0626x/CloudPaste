@@ -241,4 +241,24 @@ export function registerScheduledHandlers() {
         err,
       );
     });
+
+  // 6) 仓库定时备份（修改点：独立备份计划优化）
+  //    每个代码仓库一行 scheduled_jobs，由「仓库管理」页在保存仓库时同步维护
+  import("./tasks/ScheduledRepoBackupTask.js")
+    .then((mod) => {
+      const TaskCtor = mod.ScheduledRepoBackupTask;
+      if (TaskCtor) {
+        const taskInstance = new TaskCtor();
+        scheduledTaskRegistry.register(taskInstance);
+        console.log(
+          `[ScheduledTaskRegistry] 成功注册调度任务: ${taskInstance.id}`,
+        );
+      }
+    })
+    .catch((err) => {
+      console.warn(
+        "[ScheduledTaskRegistry] 注册 ScheduledRepoBackupTask 失败:",
+        err,
+      );
+    });
 }

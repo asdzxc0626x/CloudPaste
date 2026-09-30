@@ -311,6 +311,30 @@ export class CodeRepositoryRepository extends BaseRepository {
   }
 
   /**
+   * 统计某仓库「仍在进行中」的备份数量（修改点：独立备份计划优化）
+   *
+   * - 供定时备份 handler 判断「上一次还没跑完就别再排一次」使用
+   * - 只统计 started_at（缺失时退回 created_at）晚于 sinceIso 的记录：
+   *   任务进程被杀、Workers 超时等场景会留下永久 running 的脏记录，
+   *   如果不加时间窗口，一条脏记录就能让该仓库永远不再自动备份
+   *
+   * @param {string} repositoryId
+   * @param {string} sinceIso 判定窗口起点（ISO 字符串）
+   * @returns {Promise<number>}
+   */
+  async countRunningBackupsSince(repositoryId, sinceIso) {
+    if (!repositoryId) return 0;
+    const sql = `
+      SELECT COUNT(*) AS count FROM ${DbTables.CODE_REPOSITORY_BACKUPS}
+      WHERE repository_id = ?
+        AND status = 'running'
+        AND COALESCE(started_at, created_at) >= ?
+    `;
+    const row = await this.queryFirst(sql, [repositoryId, sinceIso]);
+    return Number(row?.count) || 0;
+  }
+
+  /**
    * 找出超出保留数量、需要清理的最旧成功备份
    *
    * 修改点（版本保留优化）
