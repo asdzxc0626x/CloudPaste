@@ -162,7 +162,10 @@ onMounted(() => {
     />
 
     <!-- 删除确认：手机端按钮全宽堆叠，仓库名可能很长故允许换行 -->
-    <div v-if="showDeleteConfirm" class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50" @click.self="cancelDelete">
+    <!-- 修改点（弹窗顶部被控制栏遮挡）：Teleport 到 body，脱离 AdminLayout main 容器的
+         `md:fixed z-40` 层叠上下文，否则会被 App.vue 的站点头部（sticky z-50）压住 -->
+    <Teleport to="body">
+    <div v-if="showDeleteConfirm" class="fixed inset-0 z-[60] flex items-center justify-center p-4 bg-black/50" @click.self="cancelDelete">
       <div class="w-full max-w-md rounded-lg shadow-xl p-4 sm:p-5 max-h-[85vh] overflow-y-auto" :class="darkMode ? 'bg-gray-900' : 'bg-white'">
         <h3 class="text-base font-medium mb-2" :class="darkMode ? 'text-white' : 'text-gray-900'">
           {{ $t("admin.repoBackup.delete.title") }}
@@ -188,5 +191,6 @@ onMounted(() => {
         </div>
       </div>
     </div>
+    </Teleport>
   </div>
 </template>

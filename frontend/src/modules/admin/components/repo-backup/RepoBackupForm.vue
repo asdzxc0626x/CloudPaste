@@ -432,8 +432,19 @@ onBeforeUnmount(() => document.removeEventListener("keydown", onEscClose));
     修改点（编辑窗口高度 / 响应式优化）：
     - 手机端：底部弹出式（items-end + 上圆角），占满宽度
     - 平板及以上：居中；lg 起放宽到 4xl，让分区能两列并排从而压低整体高度
+
+    修改点（弹窗顶部被控制栏遮挡）：
+    - 必须 Teleport 到 body。AdminLayout 的 main 容器在 md 断点是 `fixed z-40`，
+      它本身就是一个层叠上下文，弹窗写在它内部时 z-50 只是「40 层内部的 50」，
+      整体仍低于 App.vue 里 `sticky top-0 z-50` 的站点头部，于是顶部标题栏被压住。
+      88vh 居中时上边缘约在 6vh，笔记本高度下正好落进 64px 的头部区域。
+    - 逃出层叠上下文后再用 z-[60] 盖住头部，不依赖 DOM 顺序
   -->
-  <div class="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4 bg-black/50" @click.self="emit('cancel')">
+  <Teleport to="body">
+  <div
+    class="fixed inset-0 z-[60] flex items-end sm:items-center justify-center p-0 sm:p-4 bg-black/50"
+    @click.self="emit('cancel')"
+  >
     <div
       class="w-full sm:max-w-3xl lg:max-w-5xl flex flex-col rounded-t-xl sm:rounded-lg shadow-xl overflow-hidden max-h-[92vh] sm:max-h-[88vh]"
       :class="darkMode ? 'bg-gray-900' : 'bg-white'"
@@ -795,4 +806,5 @@ onBeforeUnmount(() => document.removeEventListener("keydown", onEscClose));
       </div>
     </div>
   </div>
+  </Teleport>
 </template>

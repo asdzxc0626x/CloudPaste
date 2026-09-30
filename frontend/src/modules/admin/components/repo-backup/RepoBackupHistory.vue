@@ -71,7 +71,14 @@ const showTargetList = (item) => Array.isArray(item.targets) && item.targets.len
 </script>
 
 <template>
-  <div class="fixed inset-0 z-50 flex justify-end bg-black/50" @click.self="emit('close')">
+  <!--
+    修改点（弹窗顶部被控制栏遮挡）：必须 Teleport 到 body。
+    AdminLayout 的 main 容器是 `md:fixed z-40`，本身构成层叠上下文，
+    写在它内部的 z-50 只是「40 层内的 50」，整体低于 App.vue 的站点头部
+    （sticky top-0 z-50），抽屉的标题栏会被头部压住。
+  -->
+  <Teleport to="body">
+    <div class="fixed inset-0 z-[60] flex justify-end bg-black/50" @click.self="emit('close')">
     <div class="w-full sm:max-w-2xl h-full flex flex-col shadow-xl" :class="darkMode ? 'bg-gray-900' : 'bg-white'">
       <!-- 标题栏 -->
       <div
@@ -250,4 +257,5 @@ const showTargetList = (item) => Array.isArray(item.targets) && item.targets.len
       </div>
     </div>
   </div>
+  </Teleport>
 </template>
