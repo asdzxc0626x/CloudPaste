@@ -102,7 +102,8 @@ export class ScheduledRepoBackupTask {
     const job = await fileSystem.createJob(
       "repo_backup",
       // force=false：仍然按 commitSha 去重，没有新版本时任务内部会记 skipped
-      { repositoryId, force: false },
+      // 修改点（任务列表显示仓库名）：payload 带上 owner/repo，供任务列表直接显示
+      { repositoryId, repoIdentifier: repoRow.repo_identifier, force: false },
       systemUserId,
       UserType.ADMIN,
       { triggerType: "scheduled", triggerRef: ctx?.scheduledJobId || this.id },

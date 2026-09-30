@@ -163,7 +163,9 @@ codeRepositoryRoutes.post("/api/admin/repo-backup/repositories/:id/backup", requ
 
   const job = await fileSystem.createJob(
     "repo_backup",
-    { repositoryId: id, force },
+    // 修改点（任务列表显示仓库名）：payload 里带上 owner/repo，
+    // 让「任务管理」列表不必反查仓库表就能显示具体仓库
+    { repositoryId: id, repoIdentifier: repo.repoIdentifier, force },
     adminId,
     UserType.ADMIN,
     { triggerType: "manual", triggerRef: "admin/repo-backup/backup" },

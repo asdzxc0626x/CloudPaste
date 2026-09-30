@@ -197,8 +197,11 @@
                       <component :is="getTaskIcon(task.taskType)" class="w-4 h-4" />
                     </div>
                     <div class="min-w-0 flex-1">
-                      <h3 class="font-medium text-sm truncate text-gray-900 dark:text-gray-100 capitalize">
-                        {{ formatTaskType(task.taskType) }}
+                      <h3
+                        class="font-medium text-sm truncate text-gray-900 dark:text-gray-100"
+                        :class="taskTitleCaseClass(task.taskType)"
+                      >
+                        {{ formatTaskTitle(task) }}
                       </h3>
                       <p class="text-xs truncate mt-0.5 text-gray-400 dark:text-gray-500 font-mono">{{ task.jobId }}</p>
                     </div>
@@ -529,8 +532,8 @@ const taskColumns = computed(() => [
         ]),
         h('div', {}, [
           h('div', {
-            class: 'font-semibold text-gray-900 dark:text-gray-100 capitalize'
-          }, formatTaskType(task.taskType)),
+            class: ['font-semibold text-gray-900 dark:text-gray-100', taskTitleCaseClass(task.taskType)]
+          }, formatTaskTitle(task)),
           h('div', {
             class: 'text-xs text-gray-400 dark:text-gray-500 mt-1 font-mono'
           }, task.jobId)
@@ -734,10 +737,31 @@ const formatTaskType = (type) => {
   const typeMap = {
     copy: t('admin.tasks.taskType.copy'),
     fs_index_rebuild: t('admin.tasks.taskType.fs_index_rebuild'),
-    fs_index_apply_dirty: t('admin.tasks.taskType.fs_index_apply_dirty')
+    fs_index_apply_dirty: t('admin.tasks.taskType.fs_index_apply_dirty'),
+    // 修改点（任务列表显示仓库名）：补上仓库备份类型，否则会落到"未知任务（repo_backup）"
+    repo_backup: t('admin.tasks.taskType.repo_backup')
   }
   return typeMap[type] || t('admin.tasks.taskType.unknownWithType', { type })
 }
+
+/**
+ * 任务行标题（修改点：任务列表显示仓库名）
+ * - 仓库备份任务直接显示 owner/repo，而不是任务类型名
+ * - payload.repoIdentifier 由后端建作业时写入；老作业没有该字段，
+ *   退回执行明细里的 `owner/repo@分支` 取前半段，再退回类型名
+ */
+const formatTaskTitle = (task) => {
+  if (task?.taskType === 'repo_backup') {
+    const fromPayload = task?.payload?.repoIdentifier
+    if (fromPayload) return String(fromPayload)
+    const label = task?.stats?.itemResults?.[0]?.label
+    if (label) return String(label).split('@')[0]
+  }
+  return formatTaskType(task?.taskType)
+}
+
+/** 仓库名大小写敏感，不能被 capitalize 改写成 Owner/Repo */
+const taskTitleCaseClass = (type) => (type === 'repo_backup' ? '' : 'capitalize')
 
 const formatDateTime = (dateStr) => {
   if (!dateStr) return '-'

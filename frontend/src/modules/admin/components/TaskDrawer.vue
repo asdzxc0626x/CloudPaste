@@ -55,8 +55,11 @@
             <!-- 任务名称 + ID -->
             <div class="min-w-0 flex-1">
               <div class="flex items-center gap-2">
-                <h2 class="text-base font-bold text-gray-900 dark:text-gray-100 capitalize truncate">
-                  {{ formatTaskType(task?.taskType) }}
+                <h2
+                  class="text-base font-bold text-gray-900 dark:text-gray-100 truncate"
+                  :class="taskTitleCaseClass(task?.taskType)"
+                >
+                  {{ formatTaskTitle(task) }}
                 </h2>
                 <StatusBadge v-if="task?.status" :status="task.status" size="sm" />
               </div>
@@ -287,10 +290,29 @@ const formatTaskType = (type) => {
   const typeMap = {
     copy: t('admin.tasks.taskType.copy'),
     fs_index_rebuild: t('admin.tasks.taskType.fs_index_rebuild'),
-    fs_index_apply_dirty: t('admin.tasks.taskType.fs_index_apply_dirty')
+    fs_index_apply_dirty: t('admin.tasks.taskType.fs_index_apply_dirty'),
+    // 修改点（任务列表显示仓库名）：补上仓库备份类型，否则会落到"未知任务（repo_backup）"
+    repo_backup: t('admin.tasks.taskType.repo_backup')
   }
   return typeMap[type] || t('admin.tasks.taskType.unknownWithType', { type })
 }
+
+/**
+ * 抽屉标题（修改点：任务列表显示仓库名）
+ * - 与任务列表保持一致：仓库备份任务显示 owner/repo
+ */
+const formatTaskTitle = (task) => {
+  if (task?.taskType === 'repo_backup') {
+    const fromPayload = task?.payload?.repoIdentifier
+    if (fromPayload) return String(fromPayload)
+    const label = task?.stats?.itemResults?.[0]?.label
+    if (label) return String(label).split('@')[0]
+  }
+  return formatTaskType(task?.taskType)
+}
+
+/** 仓库名大小写敏感，不能被 capitalize 改写成 Owner/Repo */
+const taskTitleCaseClass = (type) => (type === 'repo_backup' ? '' : 'capitalize')
 
 const getTaskIcon = (type) => {
   if (!type) return SyncIcon
