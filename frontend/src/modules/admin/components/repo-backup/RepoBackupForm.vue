@@ -23,7 +23,7 @@
  */
 import { computed, reactive, ref, watch, onMounted, onBeforeUnmount } from "vue";
 import { useI18n } from "vue-i18n";
-import { IconClose, IconChevronDown, IconCheck, IconPlus } from "@/components/icons";
+import { IconClose, IconChevronDown, IconCheck } from "@/components/icons";
 
 const props = defineProps({
   /** 编辑的仓库对象；为 null 表示新建 */
@@ -403,6 +403,16 @@ const sectionTitleClass = computed(() =>
   props.darkMode ? "text-xs font-semibold text-gray-300 uppercase tracking-wide" : "text-xs font-semibold text-gray-500 uppercase tracking-wide",
 );
 
+/**
+ * 分区卡片样式（修改点：编辑窗口高度 / 响应式优化）
+ * - 原来各分区是「上边框 + 竖向堆叠」，在宽屏上只用到中间一条，
+ *   高度被迫堆到 700px 以上，1080p 笔记本必然出现滚动
+ * - 改成卡片后可以在 lg 断点两列并排，主要字段一屏看完
+ */
+const cardClass = computed(() =>
+  props.darkMode ? "rounded-lg border border-gray-700 bg-gray-800/30 p-3 space-y-2.5" : "rounded-lg border border-gray-200 bg-gray-50/60 p-3 space-y-2.5",
+);
+
 /** Esc 关闭（下拉展开时优先收起下拉，符合"高层先关"的直觉） */
 function onEscClose(event) {
   if (event.key !== "Escape") return;
@@ -418,15 +428,19 @@ onBeforeUnmount(() => document.removeEventListener("keydown", onEscClose));
 </script>
 
 <template>
-  <!-- 修改点（响应式优化）：手机端用小内边距 + 占满高度，桌面端居中 -->
+  <!--
+    修改点（编辑窗口高度 / 响应式优化）：
+    - 手机端：底部弹出式（items-end + 上圆角），占满宽度
+    - 平板及以上：居中；lg 起放宽到 4xl，让分区能两列并排从而压低整体高度
+  -->
   <div class="fixed inset-0 z-50 flex items-end sm:items-center justify-center p-0 sm:p-4 bg-black/50" @click.self="emit('cancel')">
     <div
-      class="w-full sm:max-w-3xl flex flex-col rounded-t-xl sm:rounded-lg shadow-xl overflow-hidden max-h-[92vh] sm:max-h-[88vh]"
+      class="w-full sm:max-w-3xl lg:max-w-5xl flex flex-col rounded-t-xl sm:rounded-lg shadow-xl overflow-hidden max-h-[92vh] sm:max-h-[88vh]"
       :class="darkMode ? 'bg-gray-900' : 'bg-white'"
     >
       <!-- 标题栏（不随正文滚动） -->
       <div
-        class="flex items-center justify-between gap-2 px-4 sm:px-5 py-3 border-b shrink-0"
+        class="flex items-center justify-between gap-2 px-4 sm:px-5 py-2.5 border-b shrink-0"
         :class="darkMode ? 'border-gray-700' : 'border-gray-200'"
       >
         <h3 class="text-sm sm:text-base font-medium truncate" :class="darkMode ? 'text-white' : 'text-gray-900'">
@@ -438,46 +452,51 @@ onBeforeUnmount(() => document.removeEventListener("keydown", onEscClose));
       </div>
 
       <!-- 正文：独立滚动区 -->
-      <form class="flex-1 min-h-0 overflow-y-auto px-4 sm:px-5 py-3 space-y-3" @submit.prevent="handleSubmit">
+      <form class="flex-1 min-h-0 overflow-y-auto px-4 sm:px-5 py-3" @submit.prevent="handleSubmit">
         <!-- 错误提示 -->
-        <div v-if="displayError" class="px-3 py-2 rounded text-xs bg-red-50 text-red-700 dark:bg-red-900/30 dark:text-red-300">
+        <div v-if="displayError" class="mb-3 px-3 py-2 rounded text-xs bg-red-50 text-red-700 dark:bg-red-900/30 dark:text-red-300">
           {{ displayError }}
         </div>
 
-        <!-- 基础信息：手机单列、桌面两列 -->
-        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
-          <div>
-            <label :class="labelClass">{{ $t("admin.repoBackup.form.provider") }}</label>
-            <select v-model="formData.provider" :class="inputClass" :disabled="isEditMode">
-              <option v-for="p in providers" :key="p.provider" :value="p.provider">{{ p.displayName }}</option>
-            </select>
-          </div>
+        <!-- 分区卡片：手机/平板单列，lg 起两列并排 -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 gap-3 items-start">
+          <!-- 基础信息 -->
+          <section :class="cardClass">
+            <h4 :class="sectionTitleClass">{{ $t("admin.repoBackup.form.basicSection") }}</h4>
 
-          <div>
-            <label :class="labelClass">{{ $t("admin.repoBackup.form.name") }}</label>
-            <input v-model="formData.name" type="text" :class="inputClass" :placeholder="$t('admin.repoBackup.form.namePlaceholder')" />
-          </div>
-        </div>
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+              <div>
+                <label :class="labelClass">{{ $t("admin.repoBackup.form.provider") }}</label>
+                <select v-model="formData.provider" :class="inputClass" :disabled="isEditMode">
+                  <option v-for="p in providers" :key="p.provider" :value="p.provider">{{ p.displayName }}</option>
+                </select>
+              </div>
 
-        <div>
-          <label :class="labelClass">
-            {{ $t("admin.repoBackup.form.repoIdentifier") }}
-            <span class="text-red-500">*</span>
-          </label>
-          <input
-            v-model="formData.repoIdentifier"
-            type="text"
-            :class="inputClass"
-            :placeholder="$t('admin.repoBackup.form.repoIdentifierPlaceholder')"
-          />
-          <p :class="hintClass">{{ $t("admin.repoBackup.form.repoIdentifierHint") }}</p>
-        </div>
+              <div>
+                <label :class="labelClass">{{ $t("admin.repoBackup.form.name") }}</label>
+                <input v-model="formData.name" type="text" :class="inputClass" :placeholder="$t('admin.repoBackup.form.namePlaceholder')" />
+              </div>
+            </div>
 
-        <!-- 跟踪设置 -->
-        <div class="pt-2 border-t space-y-3" :class="darkMode ? 'border-gray-700' : 'border-gray-200'">
-          <h4 :class="sectionTitleClass">{{ $t("admin.repoBackup.form.trackSection") }}</h4>
+            <div>
+              <label :class="labelClass">
+                {{ $t("admin.repoBackup.form.repoIdentifier") }}
+                <span class="text-red-500">*</span>
+              </label>
+              <input
+                v-model="formData.repoIdentifier"
+                type="text"
+                :class="inputClass"
+                :placeholder="$t('admin.repoBackup.form.repoIdentifierPlaceholder')"
+              />
+              <p :class="hintClass">{{ $t("admin.repoBackup.form.repoIdentifierHint") }}</p>
+            </div>
+          </section>
 
-          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <!-- 跟踪设置：卡片内单列，分支 chip 输入需要完整宽度 -->
+          <section :class="cardClass">
+            <h4 :class="sectionTitleClass">{{ $t("admin.repoBackup.form.trackSection") }}</h4>
+
             <div>
               <label :class="labelClass">{{ $t("admin.repoBackup.form.trackMode") }}</label>
               <select :value="formData.trackMode" :class="inputClass" @change="onTrackModeChange($event.target.value)">
@@ -496,14 +515,14 @@ onBeforeUnmount(() => document.removeEventListener("keydown", onEscClose));
             </div>
 
             <!-- branch 模式：多分支录入（修改点：多分支优化） -->
-            <div v-else class="sm:col-span-1">
+            <div v-else>
               <label :class="labelClass">
                 {{ $t("admin.repoBackup.form.branches") }}
                 <span class="text-red-500">*</span>
               </label>
               <div :class="borderedInputClass">
                 <span v-for="(ref, index) in formData.trackRefs" :key="ref" :class="chipClass">
-                  <span class="font-mono max-w-[10rem] truncate">{{ ref }}</span>
+                  <span class="font-mono max-w-[8rem] sm:max-w-[10rem] truncate">{{ ref }}</span>
                   <button
                     type="button"
                     class="text-gray-400 hover:text-red-500 leading-none"
@@ -525,228 +544,231 @@ onBeforeUnmount(() => document.removeEventListener("keydown", onEscClose));
               </div>
               <p :class="hintClass">{{ $t("admin.repoBackup.form.branchesHint") }}</p>
             </div>
-          </div>
-        </div>
+          </section>
 
-        <!-- 备份目标 -->
-        <div class="pt-2 border-t space-y-3" :class="darkMode ? 'border-gray-700' : 'border-gray-200'">
-          <h4 :class="sectionTitleClass">{{ $t("admin.repoBackup.form.targetSection") }}</h4>
+          <!-- 备份目标 -->
+          <section :class="cardClass">
+            <h4 :class="sectionTitleClass">{{ $t("admin.repoBackup.form.targetSection") }}</h4>
 
-          <div>
-            <label :class="labelClass">
-              {{ $t("admin.repoBackup.form.targetMount") }}
-              <span class="text-red-500">*</span>
-            </label>
+            <div>
+              <label :class="labelClass">
+                {{ $t("admin.repoBackup.form.targetMount") }}
+                <span class="text-red-500">*</span>
+              </label>
 
-            <!-- 多选下拉：选中的目标在最左侧显示绿色 √（修改点：多备份目标优化） -->
-            <div class="relative">
-              <button
-                type="button"
-                class="w-full flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-md border text-left"
-                :class="darkMode ? 'bg-gray-800 border-gray-600' : 'bg-white border-gray-300'"
-                :disabled="writableMounts.length === 0"
-                @click="targetOpen = !targetOpen"
-              >
-                <span class="flex-1 min-w-0 truncate" :class="targetSummary ? (darkMode ? 'text-gray-100' : 'text-gray-900') : 'text-gray-400'">
-                  {{ targetSummary || $t("admin.repoBackup.form.selectMount") }}
-                </span>
-                <span
-                  v-if="formData.targetMountIds.length > 0"
-                  class="shrink-0 text-[11px] px-1.5 py-0.5 rounded bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300"
-                >
-                  {{ $t("admin.repoBackup.form.selectedCount", { count: formData.targetMountIds.length }) }}
-                </span>
-                <IconChevronDown class="h-4 w-4 shrink-0 transition-transform" :class="[darkMode ? 'text-gray-400' : 'text-gray-500', targetOpen ? 'rotate-180' : '']" />
-              </button>
-
-              <!-- 点击遮罩关闭下拉（在移动端比 document 监听更可靠） -->
-              <div v-if="targetOpen" class="fixed inset-0 z-10" @click="targetOpen = false"></div>
-
-              <div
-                v-if="targetOpen"
-                class="absolute z-20 mt-1 w-full max-h-52 overflow-y-auto rounded-md border shadow-lg"
-                :class="darkMode ? 'bg-gray-800 border-gray-600' : 'bg-white border-gray-200'"
-              >
+              <!-- 多选下拉：选中的目标在最左侧显示绿色 √（修改点：多备份目标优化） -->
+              <div class="relative">
                 <button
-                  v-for="m in writableMounts"
-                  :key="m.id"
                   type="button"
-                  class="w-full flex items-center gap-2 px-2.5 py-1.5 text-left text-sm"
-                  :class="darkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-50'"
-                  @click="toggleMount(m)"
+                  class="w-full flex items-center gap-2 px-2.5 py-1.5 text-sm rounded-md border text-left"
+                  :class="darkMode ? 'bg-gray-800 border-gray-600' : 'bg-white border-gray-300'"
+                  :disabled="writableMounts.length === 0"
+                  @click="targetOpen = !targetOpen"
                 >
-                  <!-- 绿色 √ 固定在每一行最左侧 -->
-                  <span class="w-4 shrink-0 flex items-center justify-center">
-                    <IconCheck v-if="isMountSelected(m)" class="h-4 w-4 text-green-500" />
+                  <span class="flex-1 min-w-0 truncate" :class="targetSummary ? (darkMode ? 'text-gray-100' : 'text-gray-900') : 'text-gray-400'">
+                    {{ targetSummary || $t("admin.repoBackup.form.selectMount") }}
                   </span>
-                  <span class="flex-1 min-w-0 truncate" :class="darkMode ? 'text-gray-100' : 'text-gray-900'">
-                    {{ mountLabel(m) }}
+                  <span
+                    v-if="formData.targetMountIds.length > 0"
+                    class="shrink-0 text-[11px] px-1.5 py-0.5 rounded bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300"
+                  >
+                    {{ $t("admin.repoBackup.form.selectedCount", { count: formData.targetMountIds.length }) }}
                   </span>
-                  <span class="shrink-0 text-[11px] font-mono truncate max-w-[45%]" :class="darkMode ? 'text-gray-500' : 'text-gray-400'">
-                    {{ m.mount_path }}
-                  </span>
+                  <IconChevronDown class="h-4 w-4 shrink-0 transition-transform" :class="[darkMode ? 'text-gray-400' : 'text-gray-500', targetOpen ? 'rotate-180' : '']" />
                 </button>
+
+                <!-- 点击遮罩关闭下拉（在移动端比 document 监听更可靠） -->
+                <div v-if="targetOpen" class="fixed inset-0 z-10" @click="targetOpen = false"></div>
+
+                <div
+                  v-if="targetOpen"
+                  class="absolute z-20 mt-1 w-full max-h-44 sm:max-h-52 overflow-y-auto rounded-md border shadow-lg"
+                  :class="darkMode ? 'bg-gray-800 border-gray-600' : 'bg-white border-gray-200'"
+                >
+                  <button
+                    v-for="m in writableMounts"
+                    :key="m.id"
+                    type="button"
+                    class="w-full flex items-center gap-2 px-2.5 py-1.5 text-left text-sm"
+                    :class="darkMode ? 'hover:bg-gray-700' : 'hover:bg-gray-50'"
+                    @click="toggleMount(m)"
+                  >
+                    <!-- 绿色 √ 固定在每一行最左侧 -->
+                    <span class="w-4 shrink-0 flex items-center justify-center">
+                      <IconCheck v-if="isMountSelected(m)" class="h-4 w-4 text-green-500" />
+                    </span>
+                    <span class="flex-1 min-w-0 truncate" :class="darkMode ? 'text-gray-100' : 'text-gray-900'">
+                      {{ mountLabel(m) }}
+                    </span>
+                    <span class="shrink-0 text-[11px] font-mono truncate max-w-[45%]" :class="darkMode ? 'text-gray-500' : 'text-gray-400'">
+                      {{ m.mount_path }}
+                    </span>
+                  </button>
+                </div>
+              </div>
+
+              <p v-if="writableMounts.length === 0" class="mt-1 text-[11px] text-red-600 dark:text-red-400">
+                {{ $t("admin.repoBackup.form.noWritableMount") }}
+              </p>
+              <p v-else :class="hintClass">{{ $t("admin.repoBackup.form.targetMountHint") }}</p>
+            </div>
+
+            <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+              <div>
+                <label :class="labelClass">{{ $t("admin.repoBackup.form.pathPrefix") }}</label>
+                <input v-model="formData.targetPathPrefix" type="text" :class="inputClass" placeholder="/" />
+                <p :class="hintClass">{{ $t("admin.repoBackup.form.pathPrefixHint") }}</p>
+              </div>
+
+              <!-- 修改点（版本保留优化） -->
+              <div>
+                <label :class="labelClass">{{ $t("admin.repoBackup.form.retentionCount") }}</label>
+                <input
+                  v-model.number="formData.retentionCount"
+                  type="number"
+                  :min="MIN_RETENTION"
+                  :max="MAX_RETENTION"
+                  :class="inputClass"
+                  :placeholder="String(DEFAULT_RETENTION)"
+                />
+                <p :class="hintClass">{{ $t("admin.repoBackup.form.retentionCountHint", { count: DEFAULT_RETENTION }) }}</p>
+              </div>
+            </div>
+          </section>
+
+          <!-- 备份计划（修改点：独立备份计划优化） -->
+          <section :class="cardClass">
+            <div class="flex items-center justify-between gap-2 flex-wrap">
+              <h4 :class="sectionTitleClass">{{ $t("admin.repoBackup.form.scheduleSection") }}</h4>
+              <label class="inline-flex items-center gap-1.5 shrink-0">
+                <input v-model="formData.scheduleEnabled" type="checkbox" class="rounded border-gray-300" />
+                <span class="text-xs" :class="darkMode ? 'text-gray-300' : 'text-gray-700'">
+                  {{ $t("admin.repoBackup.form.scheduleEnabled") }}
+                </span>
+              </label>
+            </div>
+
+            <div v-if="formData.scheduleEnabled" class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+              <div>
+                <label :class="labelClass">{{ $t("admin.repoBackup.form.scheduleInterval") }}</label>
+                <select v-model="intervalSelect" :class="inputClass">
+                  <option v-for="preset in INTERVAL_PRESETS" :key="preset" :value="preset">
+                    {{ formatInterval(preset) }}
+                  </option>
+                  <option value="custom">{{ $t("admin.repoBackup.form.intervalCustom") }}</option>
+                </select>
+                <p :class="hintClass">{{ $t("admin.repoBackup.form.scheduleIntervalHint") }}</p>
+              </div>
+
+              <!-- 自定义小时数 -->
+              <div v-if="intervalSelect === 'custom'">
+                <label :class="labelClass">{{ $t("admin.repoBackup.form.intervalCustomHours") }}</label>
+                <input
+                  v-model.number="customHours"
+                  type="number"
+                  :min="MIN_INTERVAL_SEC / 3600"
+                  :max="MAX_INTERVAL_SEC / 3600"
+                  step="0.25"
+                  :class="inputClass"
+                />
+                <p :class="hintClass">
+                  {{ $t("admin.repoBackup.form.intervalCustomHint", { min: MIN_INTERVAL_SEC / 60, max: MAX_INTERVAL_SEC / 86400 }) }}
+                </p>
               </div>
             </div>
 
-            <p v-if="writableMounts.length === 0" class="mt-1 text-[11px] text-red-600 dark:text-red-400">
-              {{ $t("admin.repoBackup.form.noWritableMount") }}
-            </p>
-            <p v-else :class="hintClass">{{ $t("admin.repoBackup.form.targetMountHint") }}</p>
-          </div>
+            <p v-else :class="hintClass">{{ $t("admin.repoBackup.form.scheduleDisabledHint") }}</p>
+          </section>
 
-          <div class="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <div>
-              <label :class="labelClass">{{ $t("admin.repoBackup.form.pathPrefix") }}</label>
-              <input v-model="formData.targetPathPrefix" type="text" :class="inputClass" placeholder="/" />
-            </div>
-
-            <!-- 修改点（版本保留优化） -->
-            <div>
-              <label :class="labelClass">{{ $t("admin.repoBackup.form.retentionCount") }}</label>
-              <input
-                v-model.number="formData.retentionCount"
-                type="number"
-                :min="MIN_RETENTION"
-                :max="MAX_RETENTION"
-                :class="inputClass"
-                :placeholder="String(DEFAULT_RETENTION)"
+          <!-- provider 私有配置（schema 驱动，默认折叠以减少窗口高度；展开时占满两列） -->
+          <section v-if="configFields.length > 0" :class="[cardClass, 'lg:col-span-2']">
+            <button type="button" class="w-full flex items-center justify-between gap-2" @click="advancedOpen = !advancedOpen">
+              <span :class="sectionTitleClass">{{ $t("admin.repoBackup.form.advancedSection") }}</span>
+              <IconChevronDown
+                class="h-4 w-4 shrink-0 transition-transform"
+                :class="[darkMode ? 'text-gray-400' : 'text-gray-500', advancedOpen ? 'rotate-180' : '']"
               />
-              <p :class="hintClass">{{ $t("admin.repoBackup.form.retentionCountHint", { count: DEFAULT_RETENTION }) }}</p>
-            </div>
-          </div>
-        </div>
+            </button>
 
-        <!-- 备份计划（修改点：独立备份计划优化） -->
-        <div class="pt-2 border-t space-y-2.5" :class="darkMode ? 'border-gray-700' : 'border-gray-200'">
-          <div class="flex items-center justify-between gap-2">
-            <h4 :class="sectionTitleClass">{{ $t("admin.repoBackup.form.scheduleSection") }}</h4>
-            <label class="inline-flex items-center gap-1.5 shrink-0">
-              <input v-model="formData.scheduleEnabled" type="checkbox" class="rounded border-gray-300" />
-              <span class="text-xs" :class="darkMode ? 'text-gray-300' : 'text-gray-700'">
-                {{ $t("admin.repoBackup.form.scheduleEnabled") }}
-              </span>
-            </label>
-          </div>
+            <div v-if="advancedOpen" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5">
+              <div v-for="field in configFields" :key="field.name">
+                <label :class="labelClass">
+                  {{ fieldLabel(field) }}
+                  <span v-if="field.required" class="text-red-500">*</span>
+                </label>
 
-          <div v-if="formData.scheduleEnabled" class="grid grid-cols-1 sm:grid-cols-2 gap-3">
-            <div>
-              <label :class="labelClass">{{ $t("admin.repoBackup.form.scheduleInterval") }}</label>
-              <select v-model="intervalSelect" :class="inputClass">
-                <option v-for="preset in INTERVAL_PRESETS" :key="preset" :value="preset">
-                  {{ formatInterval(preset) }}
-                </option>
-                <option value="custom">{{ $t("admin.repoBackup.form.intervalCustom") }}</option>
-              </select>
-              <p :class="hintClass">{{ $t("admin.repoBackup.form.scheduleIntervalHint") }}</p>
-            </div>
+                <!-- secret 类型：密码框 + 显示切换 -->
+                <div v-if="field.type === 'secret'" class="relative">
+                  <input
+                    :type="secretVisible[field.name] ? 'text' : 'password'"
+                    :value="getConfigValue(field.name)"
+                    :class="inputClass"
+                    class="pr-12"
+                    :placeholder="fieldPlaceholder(field)"
+                    autocomplete="off"
+                    @input="setConfigValue(field.name, $event.target.value)"
+                  />
+                  <button
+                    type="button"
+                    class="absolute right-2 top-1/2 -translate-y-1/2 text-xs px-1.5 py-0.5 rounded"
+                    :class="darkMode ? 'text-gray-400 hover:text-gray-200' : 'text-gray-500 hover:text-gray-700'"
+                    @click="toggleSecret(field.name)"
+                  >
+                    {{ secretVisible[field.name] ? $t("admin.repoBackup.form.hide") : $t("admin.repoBackup.form.show") }}
+                  </button>
+                </div>
 
-            <!-- 自定义小时数 -->
-            <div v-if="intervalSelect === 'custom'">
-              <label :class="labelClass">{{ $t("admin.repoBackup.form.intervalCustomHours") }}</label>
-              <input
-                v-model.number="customHours"
-                type="number"
-                :min="MIN_INTERVAL_SEC / 3600"
-                :max="MAX_INTERVAL_SEC / 3600"
-                step="0.25"
-                :class="inputClass"
-              />
-              <p :class="hintClass">
-                {{ $t("admin.repoBackup.form.intervalCustomHint", { min: MIN_INTERVAL_SEC / 60, max: MAX_INTERVAL_SEC / 86400 }) }}
-              </p>
-            </div>
-          </div>
+                <!-- boolean 类型 -->
+                <label v-else-if="field.type === 'boolean'" class="inline-flex items-center gap-2">
+                  <input
+                    type="checkbox"
+                    :checked="Boolean(getConfigValue(field.name))"
+                    class="rounded border-gray-300"
+                    @change="setConfigValue(field.name, $event.target.checked)"
+                  />
+                  <span class="text-xs" :class="darkMode ? 'text-gray-300' : 'text-gray-700'">{{ fieldDescription(field) }}</span>
+                </label>
 
-          <p v-else :class="hintClass">{{ $t("admin.repoBackup.form.scheduleDisabledHint") }}</p>
-        </div>
-
-        <!-- provider 私有配置（schema 驱动，默认折叠以减少窗口高度） -->
-        <div v-if="configFields.length > 0" class="pt-2 border-t" :class="darkMode ? 'border-gray-700' : 'border-gray-200'">
-          <button type="button" class="w-full flex items-center justify-between gap-2 py-0.5" @click="advancedOpen = !advancedOpen">
-            <span :class="sectionTitleClass">{{ $t("admin.repoBackup.form.advancedSection") }}</span>
-            <IconChevronDown
-              class="h-4 w-4 shrink-0 transition-transform"
-              :class="[darkMode ? 'text-gray-400' : 'text-gray-500', advancedOpen ? 'rotate-180' : '']"
-            />
-          </button>
-
-          <div v-if="advancedOpen" class="mt-2 space-y-3">
-            <div v-for="field in configFields" :key="field.name">
-              <label :class="labelClass">
-                {{ fieldLabel(field) }}
-                <span v-if="field.required" class="text-red-500">*</span>
-              </label>
-
-              <!-- secret 类型：密码框 + 显示切换 -->
-              <div v-if="field.type === 'secret'" class="relative">
+                <!-- number 类型 -->
                 <input
-                  :type="secretVisible[field.name] ? 'text' : 'password'"
+                  v-else-if="field.type === 'number'"
+                  type="number"
                   :value="getConfigValue(field.name)"
                   :class="inputClass"
                   :placeholder="fieldPlaceholder(field)"
-                  autocomplete="off"
+                  @input="setConfigValue(field.name, $event.target.value === '' ? '' : Number($event.target.value))"
+                />
+
+                <!-- 其余按文本处理 -->
+                <input
+                  v-else
+                  type="text"
+                  :value="getConfigValue(field.name)"
+                  :class="inputClass"
+                  :placeholder="fieldPlaceholder(field)"
                   @input="setConfigValue(field.name, $event.target.value)"
                 />
-                <button
-                  type="button"
-                  class="absolute right-2 top-1/2 -translate-y-1/2 text-xs px-1.5 py-0.5 rounded"
-                  :class="darkMode ? 'text-gray-400 hover:text-gray-200' : 'text-gray-500 hover:text-gray-700'"
-                  @click="toggleSecret(field.name)"
-                >
-                  {{ secretVisible[field.name] ? $t("admin.repoBackup.form.hide") : $t("admin.repoBackup.form.show") }}
-                </button>
+
+                <p v-if="field.type !== 'boolean' && fieldDescription(field)" :class="hintClass">
+                  {{ fieldDescription(field) }}
+                </p>
               </div>
-
-              <!-- boolean 类型 -->
-              <label v-else-if="field.type === 'boolean'" class="inline-flex items-center gap-2">
-                <input
-                  type="checkbox"
-                  :checked="Boolean(getConfigValue(field.name))"
-                  class="rounded border-gray-300"
-                  @change="setConfigValue(field.name, $event.target.checked)"
-                />
-                <span class="text-xs" :class="darkMode ? 'text-gray-300' : 'text-gray-700'">{{ fieldDescription(field) }}</span>
-              </label>
-
-              <!-- number 类型 -->
-              <input
-                v-else-if="field.type === 'number'"
-                type="number"
-                :value="getConfigValue(field.name)"
-                :class="inputClass"
-                :placeholder="fieldPlaceholder(field)"
-                @input="setConfigValue(field.name, $event.target.value === '' ? '' : Number($event.target.value))"
-              />
-
-              <!-- 其余按文本处理 -->
-              <input
-                v-else
-                type="text"
-                :value="getConfigValue(field.name)"
-                :class="inputClass"
-                :placeholder="fieldPlaceholder(field)"
-                @input="setConfigValue(field.name, $event.target.value)"
-              />
-
-              <p v-if="field.type !== 'boolean' && fieldDescription(field)" :class="hintClass">
-                {{ fieldDescription(field) }}
-              </p>
             </div>
-          </div>
+          </section>
         </div>
 
-        <!-- 启用开关 -->
-        <div class="pt-2 border-t" :class="darkMode ? 'border-gray-700' : 'border-gray-200'">
+        <!-- 启用开关（与分区同级，不占一整张卡片） -->
+        <div class="mt-3 flex items-center justify-between gap-3 flex-wrap">
           <label class="inline-flex items-center gap-2">
             <input v-model="formData.enabled" type="checkbox" class="rounded border-gray-300" />
             <span class="text-xs" :class="darkMode ? 'text-gray-300' : 'text-gray-700'">
               {{ $t("admin.repoBackup.form.enabled") }}
             </span>
           </label>
+          <p v-if="isEditMode" class="text-[11px] leading-4" :class="darkMode ? 'text-gray-500' : 'text-gray-400'">
+            {{ $t("admin.repoBackup.form.providerLocked") }}
+          </p>
         </div>
-
-        <p v-if="isEditMode" :class="hintClass">{{ $t("admin.repoBackup.form.providerLocked") }}</p>
       </form>
 
       <!-- 底部按钮（固定可见，不随正文滚动） -->

@@ -79,6 +79,7 @@ export default {
     form: {
       createTitle: "Add Repository",
       editTitle: "Edit Repository",
+      basicSection: "Basics",
       provider: "Repository type",
       providerLocked: "Repository type cannot be changed after creation",
       repoIdentifier: "Repository",

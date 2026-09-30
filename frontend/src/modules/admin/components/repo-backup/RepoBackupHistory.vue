@@ -154,19 +154,20 @@ const showTargetList = (item) => Array.isArray(item.targets) && item.targets.len
                   <div
                     v-for="target in item.targets"
                     :key="target.id"
-                    class="flex items-center gap-1.5 text-[11px]"
+                    class="flex items-center gap-1.5 text-[11px] min-w-0"
                   >
                     <span
                       class="w-1.5 h-1.5 rounded-full shrink-0"
                       :class="target.status === 'success' ? 'bg-green-500' : 'bg-red-500'"
                     ></span>
-                    <span class="truncate font-mono" :class="darkMode ? 'text-gray-400' : 'text-gray-500'" :title="target.mountPath || ''">
+                    <!-- truncate 在 flex 子项上必须配 min-w-0，否则不会收缩而是把容器撑破 -->
+                    <span class="min-w-0 truncate font-mono" :class="darkMode ? 'text-gray-400' : 'text-gray-500'" :title="target.mountPath || ''">
                       {{ target.mountPath || target.mountId }}
                     </span>
-                    <span v-if="target.sizeBytes" :class="darkMode ? 'text-gray-500' : 'text-gray-400'">
+                    <span v-if="target.sizeBytes" class="shrink-0" :class="darkMode ? 'text-gray-500' : 'text-gray-400'">
                       · {{ formatSize(target.sizeBytes) }}
                     </span>
-                    <span v-if="target.errorMessage" class="text-red-500 truncate" :title="target.errorMessage">
+                    <span v-if="target.errorMessage" class="min-w-0 text-red-500 truncate" :title="target.errorMessage">
                       · {{ target.errorMessage }}
                     </span>
                   </div>

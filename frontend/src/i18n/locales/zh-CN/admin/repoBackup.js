@@ -79,6 +79,8 @@ export default {
     form: {
       createTitle: "添加代码仓库",
       editTitle: "编辑代码仓库",
+      // 修改点（编辑窗口 / 响应式优化）：分区卡片标题
+      basicSection: "基础信息",
       provider: "仓库类型",
       providerLocked: "仓库类型创建后不可修改",
       repoIdentifier: "仓库标识",
