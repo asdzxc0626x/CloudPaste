@@ -48,6 +48,12 @@ export interface JobDescriptor {
   finishedAt?: Date;
   /** 最后更新时间 */
   updatedAt?: Date;
+  /**
+   * 错误信息（修改点：任务失败原因不可见）
+   * - 原先只有 getJobStatus 返回，列表接口不带，导致失败任务在「任务管理」里
+   *   完全看不到原因（前端列表数据来自 listJobs，只有运行中的任务才会去轮询状态）
+   */
+  errorMessage?: string;
   /** 原始载荷 */
   payload?: any;
   /** 触发方式 */

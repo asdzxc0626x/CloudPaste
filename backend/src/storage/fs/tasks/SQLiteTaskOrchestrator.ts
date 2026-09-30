@@ -244,6 +244,9 @@ export class SQLiteTaskOrchestrator implements TaskOrchestratorAdapter {
       startedAt: row.started_at ? new Date(row.started_at) : undefined,
       finishedAt: row.finished_at ? new Date(row.finished_at) : undefined,
       updatedAt: new Date(row.updated_at),  // 新增: 最后更新时间
+      // 修改点（任务失败原因不可见）：列表也带上错误信息，
+      // 否则失败任务只能靠 getJobStatus 才看得到原因，而列表不会为终态任务轮询
+      errorMessage: row.error_message || undefined,
       payload: JSON.parse(row.payload),
       userId: row.user_id,
       keyName: row.key_name || null,  // API 密钥名称
@@ -295,25 +298,41 @@ export class SQLiteTaskOrchestrator implements TaskOrchestratorAdapter {
   /**
    * Worker 循环 (持续运行直到 orchestrator 停止)
    * 使用指数退避策略优化空闲轮询：初始 500ms，每次空闲翻倍，最大 8 秒
+   *
+   * 修改点（任务卡住排查）：整个循环体必须吞掉异常。
+   * 原实现里 getNextJob() 的 SQLITE_BUSY、或 processJob() 内部的意外异常都会让这个
+   * Promise 直接 reject —— 而它只在 shutdown 时才被 await，所以表现是「这个 worker
+   * 永久消失、没有任何日志」。Docker 镜像的 TASK_WORKER_POOL_SIZE 只有 2，
+   * 两次就足以让所有任务永远停在 pending，看起来就是「任务卡住」。
    */
   private async workerLoop(): Promise<void> {
     const MIN_POLL_INTERVAL = 500;   // 初始轮询间隔 500ms
     const MAX_POLL_INTERVAL = 8000; // 最大轮询间隔 8 秒
+    const ERROR_BACKOFF_INTERVAL = 2000; // 出错后的冷却，避免异常时空转刷屏
     let currentInterval = MIN_POLL_INTERVAL;
 
     while (this.running) {
-      // 原子获取下一个待执行作业
-      const job = this.getNextJob();
+      try {
+        // 原子获取下一个待执行作业
+        const job = this.getNextJob();
 
-      if (job) {
-        // 有作业时重置轮询间隔
-        currentInterval = MIN_POLL_INTERVAL;
-        await this.processJob(job);
-      } else {
-        // 无待处理作业，使用指数退避休眠
-        await new Promise(resolve => setTimeout(resolve, currentInterval));
-        // 指数增长，但不超过最大值
-        currentInterval = Math.min(currentInterval * 2, MAX_POLL_INTERVAL);
+        if (job) {
+          // 有作业时重置轮询间隔
+          currentInterval = MIN_POLL_INTERVAL;
+          await this.processJob(job);
+        } else {
+          // 无待处理作业，使用指数退避休眠
+          await new Promise(resolve => setTimeout(resolve, currentInterval));
+          // 指数增长，但不超过最大值
+          currentInterval = Math.min(currentInterval * 2, MAX_POLL_INTERVAL);
+        }
+      } catch (error: any) {
+        // 兜底：worker 不允许因为单次异常而退出，否则并发数会被静默吃掉
+        console.error(
+          '[SQLiteTaskOrchestrator] Worker 循环异常 (已捕获，继续运行):',
+          error?.message || error
+        );
+        await new Promise(resolve => setTimeout(resolve, ERROR_BACKOFF_INTERVAL));
       }
     }
   }
@@ -401,6 +420,13 @@ export class SQLiteTaskOrchestrator implements TaskOrchestratorAdapter {
             SELECT stats FROM ${DbTables.TASKS} WHERE task_id = ?
           `).get(jobId) as any;
 
+          // 修改点（任务卡住排查）：作业行可能已被删除，
+          // 与 Workers 侧 JobWorkflow.updateProgress 的处理保持一致，不要在这里抛
+          if (!currentRow) {
+            console.warn(`[SQLiteTaskOrchestrator] 作业 ${jobId} 未找到,无法更新进度`);
+            return;
+          }
+
           const currentStats = JSON.parse(currentRow.stats);
           const updatedStats = { ...currentStats, ...stats };
 
@@ -434,6 +460,15 @@ export class SQLiteTaskOrchestrator implements TaskOrchestratorAdapter {
       SELECT status, stats FROM ${DbTables.TASKS} WHERE task_id = ?
     `).get(job.jobId) as any;
 
+    // 修改点（任务卡住排查）：作业行可能已被删除，
+    // 原实现直接读 finalRow.status 会抛 TypeError 并把整个 worker 带走
+    if (!finalRow) {
+      console.warn(
+        `[SQLiteTaskOrchestrator] 作业 ${job.jobId} 记录已不存在，跳过状态回写`
+      );
+      return;
+    }
+
     if (finalRow.status === TaskStatus.CANCELLED) {
       console.log(
         `[SQLiteTaskOrchestrator] 作业 ${job.jobId} 已被用户取消,保持 cancelled 状态`
@@ -442,7 +477,14 @@ export class SQLiteTaskOrchestrator implements TaskOrchestratorAdapter {
     }
 
     // 根据统计结果确定最终状态
-    const finalStats = JSON.parse(finalRow.stats) as TaskStats;
+    let finalStats: TaskStats;
+    try {
+      finalStats = JSON.parse(finalRow.stats) as TaskStats;
+    } catch {
+      // stats 损坏时不能让整个回写失败，否则任务会永远停在 running
+      finalStats = { totalItems: 0, processedItems: 0, successCount: 0, failedCount: 0, skippedCount: 0 };
+    }
+
     const finalStatus: TaskStatus =
       errorMessage ? TaskStatus.FAILED :
       finalStats.failedCount === 0 ? TaskStatus.COMPLETED :

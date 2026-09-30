@@ -55,7 +55,9 @@ export class BaseRepoProvider {
 
   /**
    * 打开指定版本的源码归档流
-   * @param {{ repoIdentifier: string, refType: 'branch'|'tag', ref: string, commitSha: string }} _params
+   * @param {{ repoIdentifier: string, refType: 'branch'|'tag', ref: string, commitSha: string, signal?: AbortSignal|null }} _params
+   *        signal（修改点：备份任务卡住排查）可选，用于在传输停滞或任务取消时中止响应；
+   *        子类如果自己发请求，应当把它透传给 fetch，否则停滞时无法中断
    * @returns {Promise<RepoArchive>}
    */
   async openSourceArchive(_params) {

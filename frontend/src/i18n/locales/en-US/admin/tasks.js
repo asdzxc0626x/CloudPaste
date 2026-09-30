@@ -125,6 +125,29 @@ export default {
       scheduled: 'Scheduled',
     },
 
+    // Repository backup task details
+    repoBackup: {
+      repository: 'Repository',
+      stage: 'Stage',
+      transferred: 'Transferred',
+      targets: 'Targets',
+      currentRef: 'Current branch',
+      currentTarget: 'Current target',
+      version: 'Version',
+      noItems: 'No execution details yet',
+      stallHint:
+        'If "Transferred" stops growing the transfer has stalled; it is aborted automatically after 2 minutes and the reason is recorded',
+      stages: {
+        preparing: 'Preparing',
+        resolving: 'Resolving latest version',
+        transferring: 'Downloading and uploading',
+        manifest: 'Writing manifest',
+        pruning: 'Pruning old versions',
+        finished: 'Finished',
+        unknown: '-',
+      },
+    },
+
     fileStatus: {
       success: 'Done',
       processing: 'Transferring',

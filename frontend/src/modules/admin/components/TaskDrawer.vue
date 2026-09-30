@@ -112,13 +112,15 @@
             />
 
             <!-- === 错误信息（如果有） === -->
-            <div v-if="task.error" class="space-y-2">
+            <!-- 修改点（任务失败原因不可见）：后端字段是 errorMessage，
+                 原来只读 task.error，导致这一块从来没有渲染过；保留 task.error 做兼容 -->
+            <div v-if="taskErrorText" class="space-y-2">
               <label class="text-xs font-semibold text-red-500 dark:text-red-400 uppercase tracking-wider">
                 {{ t('admin.tasks.details.errorInfo') }}
               </label>
               <div class="bg-red-50 dark:bg-red-900/20 p-3 rounded-lg border border-red-200 dark:border-red-800">
                 <p class="text-sm text-red-700 dark:text-red-400 font-mono break-words">
-                  {{ task.error }}
+                  {{ taskErrorText }}
                 </p>
               </div>
             </div>
@@ -184,6 +186,7 @@ import StatusBadge from './StatusBadge.vue'
 import TaskDetailsCopy from './details/TaskDetailsCopy.vue'
 import TaskDetailsFsIndexRebuild from './details/TaskDetailsFsIndexRebuild.vue'
 import TaskDetailsFsIndexApplyDirty from './details/TaskDetailsFsIndexApplyDirty.vue'
+import TaskDetailsRepoBackup from './details/TaskDetailsRepoBackup.vue'
 
 const props = defineProps({
   task: {
@@ -333,10 +336,20 @@ const getTaskDetailsComponent = (taskType) => {
   const componentMap = {
     copy: TaskDetailsCopy,
     fs_index_rebuild: TaskDetailsFsIndexRebuild,
-    fs_index_apply_dirty: TaskDetailsFsIndexApplyDirty
+    fs_index_apply_dirty: TaskDetailsFsIndexApplyDirty,
+    // 修改点（任务详情完善）：仓库备份任务原本没有详情组件，
+    // 抽屉里只有时间线和 payload，看不到阶段/分支/目标/错误
+    repo_backup: TaskDetailsRepoBackup
   }
   return componentMap[taskType] || null
 }
+
+/**
+ * 任务级错误信息（修改点：任务失败原因不可见）
+ * - 后端 JobStatus/JobDescriptor 用的字段名是 errorMessage
+ * - 保留 task.error 兼容任何仍在用旧字段的调用方
+ */
+const taskErrorText = computed(() => props.task?.errorMessage || props.task?.error || '')
 
 const formatTimestamp = (timestamp) => {
   if (!timestamp) return '-'

@@ -125,6 +125,28 @@ export default {
       scheduled: '定时',
     },
 
+    // 代码仓库备份任务详情（修改点：任务卡住且无法查看原因）
+    repoBackup: {
+      repository: '仓库',
+      stage: '当前阶段',
+      transferred: '已传输',
+      targets: '备份目标',
+      currentRef: '当前分支',
+      currentTarget: '当前目标',
+      version: '版本',
+      noItems: '暂无执行明细',
+      stallHint: '「已传输」长时间不增长说明传输已停滞，超过 2 分钟会自动中止并记录失败原因',
+      stages: {
+        preparing: '准备中',
+        resolving: '解析最新版本',
+        transferring: '下载并上传中',
+        manifest: '写入 manifest',
+        pruning: '清理旧版本',
+        finished: '已完成',
+        unknown: '-',
+      },
+    },
+
     fileStatus: {
       success: '完成',
       processing: '传输中',

@@ -82,6 +82,8 @@ export interface CopyTaskPayload {
 export interface RepoBackupTaskPayload {
   /** code_repositories.id */
   repositoryId: string;
+  /** owner/repo（修改点：任务列表显示仓库名）—— 仅用于展示，执行时以 repositoryId 为准 */
+  repoIdentifier?: string;
   /** 为 true 时忽略 commitSha 去重，强制重新备份 */
   force?: boolean;
 }

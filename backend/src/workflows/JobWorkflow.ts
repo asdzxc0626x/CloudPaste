@@ -85,17 +85,27 @@ export class JobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams> {
     let taskSuccess = true;
     let taskError: Error | null = null;
 
-    await step.do(
-      'execute-task',
-      {
-        retries: {
-          limit: 3,
-          delay: 10000,
-          backoff: "exponential" as const,
+    /**
+     * 修改点（任务卡住排查）：execute-task 抛出时也必须走到最终化步骤。
+     *
+     * 这个 step 配了 timeout: 600000 + retries.limit: 3。handler 内部会自己捕获业务异常
+     * 并返回 {success:false}，所以 step 真正抛出的场景是「步骤超时」或运行时异常；
+     * 原实现里 await step.do(...) 一旦抛出，run() 直接结束，
+     * finalize-task-record 永远不执行 —— D1 里的 tasks 行就永久停在 running，
+     * 既没有 finished_at 也没有 error_message，前端表现就是「卡住且看不到原因」。
+     */
+    try {
+      await step.do(
+        'execute-task',
+        {
+          retries: {
+            limit: 3,
+            delay: 10000,
+            backoff: "exponential" as const,
+          },
+          timeout: 600000,
         },
-        timeout: 600000,
-      },
-      async () => {
+        async () => {
         try {
           console.log(`[JobWorkflow] 执行任务 ${jobId} (类型: ${taskType})`);
 
@@ -205,8 +215,17 @@ export class JobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams> {
             error: error.message || String(error),
           };
         }
-      }
-    );
+        }
+      );
+    } catch (stepError: any) {
+      // 步骤超时 / 重试耗尽 / 运行时异常：记下原因，继续走最终化，绝不让任务停在 running
+      taskSuccess = false;
+      taskError = stepError instanceof Error ? stepError : new Error(String(stepError));
+      console.error(
+        `[JobWorkflow] ✗ 任务 ${jobId} 的 execute-task 步骤异常退出（超时或重试耗尽）:`,
+        stepError
+      );
+    }
 
     // 最终化状态
     await step.do('finalize-task-record', async () => {

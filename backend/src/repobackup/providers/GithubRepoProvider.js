@@ -24,6 +24,31 @@ const RETRY_MAX_ATTEMPTS = 3;
 const RETRY_BASE_DELAY_MS = 1000;
 const RETRY_MAX_DELAY_MS = 8000;
 
+/**
+ * 超时与等待上限（修改点：备份任务卡住排查）
+ *
+ * 原实现的三个卡死点：
+ * 1. fetch 不带 signal —— 连接一旦停滞就永远不返回。Node 侧 undici 只有「完全无数据」
+ *    才会在 5 分钟后报错，而 gh_proxy 代理半死不活时常表现为长时间不返回响应头；
+ *    Workers 侧 fetch 更是没有客户端超时。任务就停在 running 且没有任何错误。
+ * 2. 限流退避直接按 x-ratelimit-reset 睡 —— 未配置 token 时 GitHub 只给 60 次/小时，
+ *    触顶后 reset 可能在一小时后，于是 _sleep 静默睡将近一小时（还会重试两次），
+ *    表现为「任务卡住、日志无输出」。这里给等待时间设上限，超过就立刻失败并说明原因。
+ * 3. 429/5xx 重试时不释放上一次的响应体 —— undici 连接池被未消费的 body 占住，
+ *    连续几次之后新请求排队等不到连接，同样表现为卡住。
+ */
+const API_TIMEOUT_MS = 30 * 1000;
+
+/**
+ * 归档请求的超时只覆盖「等待响应头」这一段。
+ * body 的读取耗时取决于仓库大小，绝不能用固定定时器掐断；
+ * 停滞检测由调用方（RepoBackupTaskHandler）通过 signal 负责。
+ */
+const ARCHIVE_HEADERS_TIMEOUT_MS = 60 * 1000;
+
+/** 单次限流等待上限，超过则不再等待，直接失败并提示配置 token */
+const RATE_LIMIT_MAX_WAIT_MS = 60 * 1000;
+
 // 说明：constants/index.js 的 ApiStatus 未定义 502/BAD_GATEWAY，
 // 为避免引用未定义常量（会静默退化成 undefined），上游失败统一使用 INTERNAL_ERROR，
 // 并通过 expose:true + 明确 message 让管理端看到真实原因。
@@ -116,10 +141,12 @@ export class GithubRepoProvider extends BaseRepoProvider {
 
   /**
    * 打开源码归档流（tar.gz）
-   * @param {{ repoIdentifier: string, refType: 'branch'|'tag', ref: string, commitSha: string }} params
+   * @param {{ repoIdentifier: string, refType: 'branch'|'tag', ref: string, commitSha: string, signal?: AbortSignal|null }} params
+   *        signal（修改点：备份任务卡住排查）由调用方持有，用于在传输停滞或任务取消时
+   *        中止整个响应（含 body）；不传则只有「等响应头」的超时保护
    * @returns {Promise<import("./BaseRepoProvider.js").RepoArchive>}
    */
-  async openSourceArchive({ repoIdentifier, refType, ref, commitSha }) {
+  async openSourceArchive({ repoIdentifier, refType, ref, commitSha, signal = null }) {
     const { owner, repo } = parseRepoIdentifier(repoIdentifier);
 
     // 直接用 commitSha 取归档，保证「解析到的版本」与「下载到的内容」严格一致
@@ -127,11 +154,15 @@ export class GithubRepoProvider extends BaseRepoProvider {
     const archiveRef = commitSha || ref;
     const url = this._applyGhProxy(`${this.apiBase}/repos/${owner}/${repo}/tarball/${encodeURIComponent(archiveRef)}`);
 
-    const resp = await this._fetchWithRetry(url, {
-      method: "GET",
-      // GitHub 会 302 到 codeload.github.com，交给 fetch 自动跟随
-      redirect: "follow",
-    });
+    const resp = await this._fetchWithRetry(
+      url,
+      {
+        method: "GET",
+        // GitHub 会 302 到 codeload.github.com，交给 fetch 自动跟随
+        redirect: "follow",
+      },
+      { timeoutMs: ARCHIVE_HEADERS_TIMEOUT_MS, signal },
+    );
 
     if (!resp.body) {
       throw new AppError("GitHub 归档响应没有可读流", {
@@ -361,32 +392,126 @@ export class GithubRepoProvider extends BaseRepoProvider {
   }
 
   /**
+   * 为单次请求构造 AbortSignal（修改点：备份任务卡住排查）
+   *
+   * 两种中止来源的生命周期不同，必须分开处理：
+   * - timeoutMs：只用于「等待响应头」。拿到 Response 后调用方必须立刻 clearTimer，
+   *   否则大仓库的 body 还没读完就会被这个定时器掐断
+   * - externalSignal：由调用方（备份任务的停滞看门狗 / 取消）持有，生命周期要覆盖
+   *   整个 body 读取过程，所以 clearTimer 只停定时器、不解绑它的转发
+   *
+   * @private
+   * @param {AbortSignal|null} externalSignal
+   * @param {number} timeoutMs
+   */
+  _linkAbort(externalSignal, timeoutMs) {
+    const controller = new AbortController();
+    const state = { timedOut: false };
+
+    if (externalSignal) {
+      if (externalSignal.aborted) {
+        controller.abort();
+      } else {
+        externalSignal.addEventListener("abort", () => controller.abort(), { once: true });
+      }
+    }
+
+    const timer =
+      Number.isFinite(timeoutMs) && timeoutMs > 0
+        ? setTimeout(() => {
+            state.timedOut = true;
+            controller.abort();
+          }, timeoutMs)
+        : null;
+
+    return {
+      signal: controller.signal,
+      state,
+      clearTimer: () => {
+        if (timer) clearTimeout(timer);
+      },
+    };
+  }
+
+  /**
+   * 丢弃不再使用的响应体（修改点：备份任务卡住排查）
+   * - 重试前必须释放，否则 undici 连接池会被未消费的 body 占住
+   * @private
+   */
+  async _discardBody(resp) {
+    try {
+      if (resp?.body && typeof resp.body.cancel === "function") {
+        await resp.body.cancel();
+      }
+    } catch {
+      // 释放失败不影响重试
+    }
+  }
+
+  /**
    * 带限流重试的 fetch（仅 GET 安全重试）
    * @private
+   * @param {string} url
+   * @param {Object} init
+   * @param {{ timeoutMs?: number, signal?: AbortSignal|null }} opts
+   *        timeoutMs 只约束「等到响应头」的时间；signal 覆盖整个响应（含 body）
    * @returns {Promise<Response>}
    */
-  async _fetchWithRetry(url, init = {}) {
+  async _fetchWithRetry(url, init = {}, opts = {}) {
     const method = String(init?.method || "GET").toUpperCase();
     const canRetryNetwork = method === "GET";
+    const timeoutMs = opts?.timeoutMs ?? API_TIMEOUT_MS;
+    const externalSignal = opts?.signal ?? null;
 
     for (let attempt = 1; attempt <= RETRY_MAX_ATTEMPTS; attempt += 1) {
+      const abort = this._linkAbort(externalSignal, timeoutMs);
       let resp = null;
       try {
-        resp = await fetch(url, { ...init, headers: this._buildHeaders(init.headers || {}, url) });
+        resp = await fetch(url, {
+          ...init,
+          headers: this._buildHeaders(init.headers || {}, url),
+          signal: abort.signal,
+        });
       } catch (e) {
+        abort.clearTimer();
+
+        // 调用方主动中止（任务取消 / 下载停滞看门狗）：重试没有意义，如实上报
+        if (externalSignal?.aborted) {
+          throw new AppError("GitHub 请求已中止（任务取消或传输停滞超时）", {
+            status: ApiStatus.INTERNAL_ERROR,
+            code: "REPO_BACKUP.GITHUB_REQUEST_ABORTED",
+            expose: true,
+            details: { url },
+          });
+        }
+
+        const timedOut = abort.state.timedOut;
         if (attempt < RETRY_MAX_ATTEMPTS && canRetryNetwork) {
+          console.warn(
+            `[GithubRepoProvider] 请求${timedOut ? "超时" : "失败"}，第 ${attempt} 次重试: ${url}`,
+          );
           await this._sleep(this._computeDelayMs({ attempt }));
           continue;
         }
-        throw new AppError("GitHub 请求失败: 网络错误", {
-          status: ApiStatus.INTERNAL_ERROR,
-          code: "REPO_BACKUP.GITHUB_REQUEST_FAILED",
-          expose: false,
-          details: { url, cause: e?.message || String(e) },
-        });
+
+        throw new AppError(
+          timedOut
+            ? `GitHub 请求超时：${timeoutMs}ms 内未返回响应头（已重试 ${RETRY_MAX_ATTEMPTS} 次）`
+            : "GitHub 请求失败: 网络错误",
+          {
+            status: ApiStatus.INTERNAL_ERROR,
+            code: timedOut ? "REPO_BACKUP.GITHUB_REQUEST_TIMEOUT" : "REPO_BACKUP.GITHUB_REQUEST_FAILED",
+            expose: true,
+            details: { url, cause: e?.message || String(e) },
+          },
+        );
       }
 
+      // 已拿到响应头：立刻停掉超时定时器，否则会在读 body 的过程中把连接掐断
+      abort.clearTimer();
+
       if (resp.status === 404) {
+        await this._discardBody(resp);
         throw new NotFoundError("GitHub 资源不存在（仓库、分支或版本不存在，或仓库为私有）", { url });
       }
 
@@ -399,7 +524,34 @@ export class GithubRepoProvider extends BaseRepoProvider {
       const retryable5xx = resp.status === 502 || resp.status === 503 || resp.status === 504;
 
       if (attempt < RETRY_MAX_ATTEMPTS && (rateLimited || (retryable5xx && canRetryNetwork))) {
-        await this._sleep(this._computeDelayMs({ attempt, retryAfterSeconds: retryAfter, resetEpochSeconds: reset }));
+        const delayMs = this._computeDelayMs({
+          attempt,
+          retryAfterSeconds: retryAfter,
+          resetEpochSeconds: reset,
+        });
+
+        // 限流恢复时间太远时不再静默等待：睡一小时看起来就是「任务卡住」
+        if (delayMs > RATE_LIMIT_MAX_WAIT_MS) {
+          await this._discardBody(resp);
+          const waitMinutes = Math.ceil(delayMs / 60000);
+          throw new AppError(
+            `GitHub API 速率受限，约 ${waitMinutes} 分钟后才恢复，已放弃等待` +
+              `（请在仓库配置里填写 GitHub Token 提高速率上限，或稍后重试）`,
+            {
+              status: ApiStatus.INTERNAL_ERROR,
+              code: "REPO_BACKUP.GITHUB_RATE_LIMITED",
+              expose: true,
+              details: { url, status: resp.status, waitMs: delayMs },
+            },
+          );
+        }
+
+        await this._discardBody(resp);
+        console.warn(
+          `[GithubRepoProvider] HTTP ${resp.status}${rateLimited ? "（限流）" : ""}，` +
+            `${delayMs}ms 后第 ${attempt} 次重试: ${url}`,
+        );
+        await this._sleep(delayMs);
         continue;
       }
 
@@ -421,7 +573,7 @@ export class GithubRepoProvider extends BaseRepoProvider {
 
     // 理论上不会到达（循环内必定 return 或 throw）
     throw new AppError("GitHub 请求失败: 超过最大重试次数", {
-      status: ApiStatus.BAD_GATEWAY,
+      status: ApiStatus.INTERNAL_ERROR,
       code: "REPO_BACKUP.GITHUB_REQUEST_FAILED",
       expose: false,
       details: { url },
@@ -430,14 +582,36 @@ export class GithubRepoProvider extends BaseRepoProvider {
 
   /**
    * 带限流重试的 JSON 请求
+   *
+   * 修改点（备份任务卡住排查）：_fetchWithRetry 的超时只覆盖到「拿到响应头」，
+   * 之后读 body 是没有保护的。JSON 响应虽小，但连接在响应头之后停滞同样会永久挂起，
+   * 所以这里给 resp.json() 再加一道截止时间。
    * @private
    */
-  async _fetchJson(url, init = {}) {
-    const resp = await this._fetchWithRetry(url, init);
+  async _fetchJson(url, init = {}, opts = {}) {
+    const resp = await this._fetchWithRetry(url, init, opts);
+    const timeoutMs = opts?.timeoutMs ?? API_TIMEOUT_MS;
+
+    let timer = null;
     try {
-      return await resp.json();
-    } catch {
-      return null;
+      return await Promise.race([
+        // 解析失败按「拿不到结构化数据」处理，由调用方给出具体报错
+        resp.json().catch(() => null),
+        new Promise((_resolve, reject) => {
+          timer = setTimeout(() => {
+            reject(
+              new AppError(`GitHub 响应体读取超时（${timeoutMs}ms）`, {
+                status: ApiStatus.INTERNAL_ERROR,
+                code: "REPO_BACKUP.GITHUB_REQUEST_TIMEOUT",
+                expose: true,
+                details: { url },
+              }),
+            );
+          }, timeoutMs);
+        }),
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
     }
   }
 }

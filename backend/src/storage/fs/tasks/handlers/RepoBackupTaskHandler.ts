@@ -43,6 +43,8 @@ import { pruneOldVersions, describePruneResult } from "../../../../repobackup/re
 
 type RepoBackupPayload = {
   repositoryId: string;
+  /** owner/repo，仅用于任务列表显示，执行时仍以 repositoryId 为准 */
+  repoIdentifier?: string;
   force?: boolean;
 };
 
@@ -54,6 +56,28 @@ type RefOutcome = {
   sizeBytes?: number | null;
   primaryPath?: string | null;
 };
+
+/**
+ * 执行阶段（修改点：任务卡住排查 / 详情完善）
+ *
+ * 之所以要上报阶段：原实现只写 processedItems/successCount 这类计数，
+ * 一个引用从开始到结束中间可能有十几分钟（解析 → 下载上传 → 写 manifest → 清理），
+ * 这期间前端看到的统计完全不动，无法区分「正在传大仓库」和「真的卡死了」。
+ */
+type BackupStage = "preparing" | "resolving" | "transferring" | "manifest" | "pruning" | "finished";
+
+/**
+ * 传输停滞超时（修改点：任务卡住排查）
+ *
+ * GitHub/加速代理的连接可能在中途停止吐数据而不断开，此时下载与上传都会无限期等待，
+ * 任务永远停在 running。这里在字节流上挂一个看门狗：超过该时长没有新分片就 abort 掉
+ * 整个响应，让这个目标以明确的错误失败（下次运行会自动补写）。
+ */
+const STALL_TIMEOUT_MS = 120 * 1000;
+
+/** 实时字节进度的上报节流：至少间隔 1.5s，或累计新增 8MB */
+const PROGRESS_FLUSH_INTERVAL_MS = 1500;
+const PROGRESS_FLUSH_BYTES = 8 * 1024 * 1024;
 
 /** 单次任务只处理一个仓库，统计模板按引用数量展开 */
 function buildStats(totalItems: number, overrides: Partial<TaskStats> = {}): TaskStats {
@@ -86,26 +110,99 @@ function generateId(prefix: string): string {
 }
 
 /**
- * 给流套一个字节计数器
- * - 返回的 counter.value 只有在流被完全消费后才是最终值
+ * 归档传输的护栏（修改点：任务卡住排查）
+ *
+ * 一次性解决三件事：
+ * - 字节计数：counter.value 在流被消费的过程中持续累加
+ * - 停滞检测：每收到一个分片就重置计时器，超时则 abort 整个响应
+ * - 实时进度：按节流回调 onProgress，让前端能看到字节在涨（不涨就是真卡住了）
+ *
+ * controller.signal 必须在发起请求前就交给 provider，所以本函数先于 openSourceArchive 调用，
+ * 拿到响应后再用 wrap() 套住 body。
  */
-function withByteCounter(stream: ReadableStream): { stream: ReadableStream; counter: { value: number } } {
+function createTransferGuard({
+  stallTimeoutMs = STALL_TIMEOUT_MS,
+  onProgress,
+}: {
+  stallTimeoutMs?: number;
+  onProgress?: (bytes: number) => void;
+} = {}) {
+  const controller = new AbortController();
   const counter = { value: 0 };
 
-  // TransformStream 在 Cloudflare Workers 与 Node 18+ 均为全局可用
-  const transform = new TransformStream({
-    transform(chunk: any, controller: any) {
-      try {
-        const size = chunk?.byteLength ?? chunk?.length ?? 0;
-        if (Number.isFinite(size)) counter.value += size;
-      } catch {
-        // 计数失败不应中断传输
-      }
-      controller.enqueue(chunk);
-    },
-  });
+  let timer: any = null;
+  let stalled = false;
+  let disposed = false;
+  let lastFlushMs = Date.now();
+  let lastFlushBytes = 0;
 
-  return { stream: stream.pipeThrough(transform), counter };
+  /** 重新武装停滞计时器 */
+  const arm = () => {
+    if (disposed) return;
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => {
+      stalled = true;
+      console.error(`[RepoBackupTaskHandler] 传输停滞超过 ${Math.round(stallTimeoutMs / 1000)}s，中止本次下载`);
+      try {
+        controller.abort();
+      } catch {
+        // ignore
+      }
+    }, stallTimeoutMs);
+  };
+
+  const dispose = () => {
+    disposed = true;
+    if (timer) clearTimeout(timer);
+    timer = null;
+  };
+
+  const flushProgress = (force = false) => {
+    if (!onProgress) return;
+    const nowMs = Date.now();
+    const grown = counter.value - lastFlushBytes;
+    if (!force && nowMs - lastFlushMs < PROGRESS_FLUSH_INTERVAL_MS && grown < PROGRESS_FLUSH_BYTES) {
+      return;
+    }
+    lastFlushMs = nowMs;
+    lastFlushBytes = counter.value;
+    try {
+      onProgress(counter.value);
+    } catch {
+      // 进度上报失败绝不能影响传输
+    }
+  };
+
+  /** 套在归档 body 外层：边转发边计数、重置看门狗、上报进度 */
+  const wrap = (stream: ReadableStream): ReadableStream => {
+    // TransformStream 在 Cloudflare Workers 与 Node 18+ 均为全局可用
+    const transform = new TransformStream({
+      transform(chunk: any, ctrl: any) {
+        arm();
+        try {
+          const size = chunk?.byteLength ?? chunk?.length ?? 0;
+          if (Number.isFinite(size)) counter.value += size;
+        } catch {
+          // 计数失败不应中断传输
+        }
+        flushProgress();
+        ctrl.enqueue(chunk);
+      },
+      flush() {
+        dispose();
+      },
+    });
+    return stream.pipeThrough(transform);
+  };
+
+  return {
+    signal: controller.signal,
+    counter,
+    arm,
+    dispose,
+    wrap,
+    isStalled: () => stalled,
+  };
 }
 
 export class RepoBackupTaskHandler implements TaskHandler {
@@ -190,6 +287,11 @@ export class RepoBackupTaskHandler implements TaskHandler {
     let totalBytes = 0;
     let bytesTransferred = 0;
 
+    // 修改点（任务卡住排查 / 详情完善）：当前执行阶段与目标，让「任务管理」能看出卡在哪一步
+    let currentStage: BackupStage = "preparing";
+    let currentRef: string | null = null;
+    let currentTarget: { name: string | null; mountPath: string | null } = { name: null, mountPath: null };
+
     const report = async (processedItems: number, extra: Partial<TaskStats> = {}) => {
       await context.updateProgress(
         job.jobId,
@@ -201,6 +303,19 @@ export class RepoBackupTaskHandler implements TaskHandler {
           itemResults,
           totalBytes,
           bytesTransferred,
+          // 阶段类字段（前端任务详情直接展示）
+          stage: currentStage,
+          currentRef,
+          currentTargetName: currentTarget.name,
+          currentTargetPath: currentTarget.mountPath,
+          repositoryId: repoRow.id,
+          repoIdentifier,
+          targetCount: mounts.length,
+          targetMounts: mounts.map((m) => ({
+            id: m.id,
+            name: m.name ?? null,
+            mountPath: m.mount_path ?? null,
+          })),
           ...extra,
         }),
       );
@@ -212,11 +327,15 @@ export class RepoBackupTaskHandler implements TaskHandler {
     const providerConfig = await parseProviderConfig(provider, repoRow.config_json, encryptionSecret);
     const providerInstance = RepoProviderFactory.createProvider(provider, providerConfig);
 
+    currentStage = "resolving";
+    await report(0);
+
     let processed = 0;
     let firstError: Error | null = null;
 
     // ---------- 3. 逐个引用（分支）备份 ----------
     for (const trackRef of trackRefs) {
+      currentRef = trackRef ?? null;
       const itemResult: ItemResult = {
         kind: "repo",
         label: trackRef ? `${repoIdentifier}@${trackRef}` : repoIdentifier,
@@ -234,17 +353,37 @@ export class RepoBackupTaskHandler implements TaskHandler {
         }
 
         // 3.1 解析该引用的最新版本
+        currentStage = "resolving";
+        await report(processed);
+
         const version = await providerInstance.resolveLatestVersion({
           repoIdentifier,
           trackMode,
           trackRef: trackRef ?? null,
         });
 
+        // 修改点（详情完善）：targets 记录每个目标的写入结果，供任务详情逐条展示
+        const targetSummaries: Array<{
+          mountId: string;
+          name: string | null;
+          mountPath: string | null;
+          status: "pending" | "processing" | "success" | "failed" | "skipped";
+          sizeBytes?: number | null;
+          error?: string | null;
+        }> = mounts.map((m) => ({
+          mountId: String(m.id),
+          name: m.name ?? null,
+          mountPath: m.mount_path ?? null,
+          status: "pending",
+        }));
+        const summaryOf = (mountId: any) => targetSummaries.find((t) => t.mountId === String(mountId));
+
         itemResult.meta = {
           refType: version.refType,
           ref: version.ref,
           commitSha: version.commitSha,
           version: version.version,
+          targets: targetSummaries,
         };
 
         // 3.2 去重：仅当「所有目标都已有该 commit 的成功副本」且非强制时才跳过
@@ -261,6 +400,12 @@ export class RepoBackupTaskHandler implements TaskHandler {
               existingTargets.filter((t: any) => t.status === "success").map((t: any) => String(t.mount_id)),
             );
             missingMounts = mounts.filter((m) => !doneMountIds.has(String(m.id)));
+
+            // 已有副本的目标在详情里标为「跳过」，与本次要补写的目标区分开
+            for (const mountId of doneMountIds) {
+              const summary = summaryOf(mountId);
+              if (summary) summary.status = "skipped";
+            }
 
             if (missingMounts.length === 0) {
               itemResult.status = "skipped";
@@ -332,6 +477,22 @@ export class RepoBackupTaskHandler implements TaskHandler {
             ref: version.ref,
           });
 
+          currentTarget = { name: mount.name ?? null, mountPath: mount.mount_path ?? null };
+          const targetSummary = summaryOf(mount.id);
+          if (targetSummary) targetSummary.status = "processing";
+
+          // 修改点（任务卡住排查）：传输护栏必须在发起请求前创建，
+          // 它的 signal 要交给 provider，才能在停滞时把整个响应中止掉
+          const guard = createTransferGuard({
+            onProgress: (bytes) => {
+              // 只补 bytesTransferred 这一个字段，避免与 report() 的完整快照互相覆盖；
+              // 失败不影响传输（updateProgress 在 Workers 下是异步 D1 写）
+              Promise.resolve(
+                context.updateProgress(job.jobId, { bytesTransferred: bytesTransferred + bytes }),
+              ).catch(() => {});
+            },
+          });
+
           try {
             // createDirectory 对已存在目录是幂等的（返回 alreadyExists）
             try {
@@ -348,28 +509,51 @@ export class RepoBackupTaskHandler implements TaskHandler {
               `[RepoBackupTaskHandler] 开始备份 ${repoIdentifier}@${version.ref || ""} ${version.version} -> ${paths.archivePath}`,
             );
 
+            currentStage = "transferring";
+            await report(processed);
+
             const archive = await providerInstance.openSourceArchive({
               repoIdentifier,
               refType: version.refType,
               ref: version.ref,
               commitSha: version.commitSha,
+              signal: guard.signal,
             });
 
-            const { stream: countedStream, counter } = withByteCounter(archive.stream);
+            // 拿到响应之后才启动停滞看门狗：
+            // 「等响应头」那一段由 provider 自己的超时 + 重试负责，两者职责不重叠，
+            // 报错信息也才对得上（超时 vs 传输停滞）
+            guard.arm();
+            const countedStream = guard.wrap(archive.stream);
+            const counter = guard.counter;
 
-            const uploadResult = await fileSystem.uploadFile(
-              paths.archivePath,
-              countedStream,
-              job.userId,
-              job.userType,
-              {
-                filename: paths.archiveFileName,
-                contentType: archive.contentType || "application/gzip",
-                // GitHub tarball 通常是 chunked 无 content-length，此时传 0 表示未知，
-                // 上游的配额守卫会跳过 best-effort 判断，S3 走 lib-storage 自动分片
-                contentLength: archive.contentLength || 0,
-              },
-            );
+            let uploadResult: any;
+            try {
+              uploadResult = await fileSystem.uploadFile(
+                paths.archivePath,
+                countedStream,
+                job.userId,
+                job.userType,
+                {
+                  filename: paths.archiveFileName,
+                  contentType: archive.contentType || "application/gzip",
+                  // GitHub tarball 通常是 chunked 无 content-length，此时传 0 表示未知，
+                  // 上游的配额守卫会跳过 best-effort 判断，S3 走 lib-storage 自动分片
+                  contentLength: archive.contentLength || 0,
+                },
+              );
+            } catch (uploadError: any) {
+              // 看门狗触发时底层报的是 abort/stream 错误，换成人看得懂的原因
+              if (guard.isStalled()) {
+                throw new Error(
+                  `传输停滞超过 ${Math.round(STALL_TIMEOUT_MS / 1000)} 秒（已传 ${counter.value} 字节）已中止，` +
+                    `可能是 GitHub 或加速代理无响应`,
+                );
+              }
+              throw uploadError;
+            } finally {
+              guard.dispose();
+            }
 
             const sizeBytes = counter.value > 0 ? counter.value : null;
             totalBytes += sizeBytes ?? 0;
@@ -380,6 +564,7 @@ export class RepoBackupTaskHandler implements TaskHandler {
             let manifestPath: string | null = null;
             let manifestWarning: string | null = null;
             try {
+              currentStage = "manifest";
               const manifest = this.buildManifest({
                 provider,
                 repoIdentifier,
@@ -423,6 +608,11 @@ export class RepoBackupTaskHandler implements TaskHandler {
             });
 
             successTargets += 1;
+            if (targetSummary) {
+              targetSummary.status = "success";
+              targetSummary.sizeBytes = sizeBytes;
+              targetSummary.error = manifestWarning;
+            }
             if (!primaryStoragePath) {
               primaryStoragePath = storagePath;
               primaryManifestPath = manifestPath;
@@ -431,10 +621,17 @@ export class RepoBackupTaskHandler implements TaskHandler {
             if (manifestWarning) targetErrors.push(`${mount.name || mount.mount_path}: ${manifestWarning}`);
 
             console.log(`[RepoBackupTaskHandler] 目标写入完成: ${storagePath}`);
+            await report(processed);
           } catch (targetError: any) {
+            guard.dispose();
             // 单个目标失败不影响其他目标；下次运行会自动补写
             const message = String(targetError?.message || targetError || "未知错误");
             targetErrors.push(`${mount.name || mount.mount_path}: ${message}`);
+
+            if (targetSummary) {
+              targetSummary.status = "failed";
+              targetSummary.error = message;
+            }
 
             await codeRepo
               .upsertBackupTarget({
@@ -453,9 +650,11 @@ export class RepoBackupTaskHandler implements TaskHandler {
               `[RepoBackupTaskHandler] 目标写入失败 (${mount.name || mount.mount_path}):`,
               message,
             );
+            await report(processed);
           }
         }
 
+        currentTarget = { name: null, mountPath: null };
         const finishedAt = nowIso();
 
         // 修改点（多备份目标优化）：按「该备份的全部目标行」重算状态，
@@ -505,6 +704,8 @@ export class RepoBackupTaskHandler implements TaskHandler {
         // 修改点（版本保留优化）：备份成功后清理超出保留数量的最旧版本
         let pruneMessage = "";
         try {
+          currentStage = "pruning";
+          await report(processed);
           const pruneSummary = await pruneOldVersions({
             codeRepo,
             fileSystem,
@@ -604,7 +805,10 @@ export class RepoBackupTaskHandler implements TaskHandler {
       }
     }
 
-    await report(processed);
+    currentStage = "finished";
+    currentRef = null;
+    currentTarget = { name: null, mountPath: null };
+    await report(processed, { durationMs: Date.now() - startedMs });
 
     // 全部引用都失败时向上抛出，让任务被标记为失败（部分失败按成功结束，便于重试单条）
     const failedCount = outcomes.filter((o) => o.status === "failed").length;

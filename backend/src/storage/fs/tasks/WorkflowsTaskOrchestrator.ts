@@ -335,6 +335,8 @@ export class WorkflowsTaskOrchestrator implements TaskOrchestratorAdapter {
       startedAt: row.started_at ? new Date(row.started_at) : undefined,
       finishedAt: row.finished_at ? new Date(row.finished_at) : undefined,
       updatedAt: new Date(row.updated_at),
+      // 修改点（任务失败原因不可见）：与 SQLite 编排器对齐，列表也返回错误信息
+      errorMessage: row.error_message || undefined,
       payload: JSON.parse(row.payload),
       userId: row.user_id,
       keyName: row.key_name || null,
