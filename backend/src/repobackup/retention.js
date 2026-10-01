@@ -11,7 +11,7 @@
  * - 复用 fileSystem.batchRemoveItems，不自己拼驱动调用
  */
 
-import { resolveRetentionCount } from "./config.js";
+import { resolveRetentionCount, NON_SUCCESS_HISTORY_KEEP } from "./config.js";
 
 /**
  * 按挂载点把待删路径分组
@@ -55,10 +55,10 @@ function groupPathsByMount(targets, legacyBackup) {
  * @param {Object} params.repositoryRow code_repositories 行
  * @param {string|number} params.userId 执行删除的身份（管理员或系统身份）
  * @param {string} params.userType
- * @returns {Promise<{removedCount: number, removedPaths: number, failedPaths: number, errors: string[]}>}
+ * @returns {Promise<{removedCount: number, removedAttempts: number, removedPaths: number, failedPaths: number, errors: string[]}>}
  */
 export async function pruneOldVersions({ codeRepo, fileSystem, repositoryRow, userId, userType }) {
-  const summary = { removedCount: 0, removedPaths: 0, failedPaths: 0, errors: [] };
+  const summary = { removedCount: 0, removedAttempts: 0, removedPaths: 0, failedPaths: 0, errors: [] };
   if (!codeRepo || !repositoryRow?.id) return summary;
 
   const keepCount = resolveRetentionCount(repositoryRow);
@@ -68,9 +68,9 @@ export async function pruneOldVersions({ codeRepo, fileSystem, repositoryRow, us
     staleBackups = await codeRepo.findSuccessBackupsBeyondLimit(repositoryRow.id, keepCount);
   } catch (error) {
     summary.errors.push(`查询待清理备份失败: ${error?.message || error}`);
-    return summary;
+    // 成功版本查不出来不代表失败留痕也不用清，继续往下走
+    staleBackups = [];
   }
-  if (staleBackups.length === 0) return summary;
 
   for (const backup of staleBackups) {
     // 1. 删文件（best-effort）
@@ -110,19 +110,47 @@ export async function pruneOldVersions({ codeRepo, fileSystem, repositoryRow, us
     }
   }
 
+  // 3. 顺带清理过多的失败/跳过留痕（修改点：历史记录需显示失败记录）
+  //    这些记录没有可用快照（failed = 没有任何目标写成功，skipped = 什么都没写），
+  //    所以不删文件、只删记录；它们也不占用「保留版本数」的额度
+  try {
+    const staleAttempts = await codeRepo.findNonSuccessBackupsBeyondLimit(
+      repositoryRow.id,
+      NON_SUCCESS_HISTORY_KEEP,
+    );
+    for (const attempt of staleAttempts) {
+      try {
+        await codeRepo.deleteBackupTargetsByBackup(attempt.id);
+        await codeRepo.deleteBackup(attempt.id);
+        summary.removedAttempts += 1;
+      } catch (error) {
+        summary.errors.push(`删除失败留痕记录出错（${attempt.id}）: ${error?.message || error}`);
+      }
+    }
+  } catch (error) {
+    summary.errors.push(`查询待清理的失败留痕出错: ${error?.message || error}`);
+  }
+
   return summary;
 }
 
 /**
  * 生成一句面向管理员的清理摘要（写入任务 itemResult.message）
- * @param {{removedCount: number, removedPaths: number, failedPaths: number, errors: string[]}|null} summary
+ * @param {{removedCount: number, removedAttempts?: number, removedPaths: number, failedPaths: number, errors: string[]}|null} summary
  * @returns {string}
  */
 export function describePruneResult(summary) {
-  if (!summary || summary.removedCount === 0) return "";
-  const parts = [`已清理 ${summary.removedCount} 个最旧版本`];
-  if (summary.failedPaths > 0) {
-    parts.push(`其中 ${summary.failedPaths} 个文件删除失败（记录已清理，文件可能残留）`);
+  if (!summary) return "";
+  const parts = [];
+  if (summary.removedCount > 0) {
+    parts.push(`已清理 ${summary.removedCount} 个最旧版本`);
+    if (summary.failedPaths > 0) {
+      parts.push(`其中 ${summary.failedPaths} 个文件删除失败（记录已清理，文件可能残留）`);
+    }
+  }
+  // 修改点（历史记录需显示失败记录）：失败留痕的清理也要说明，否则记录凭空变少
+  if (summary.removedAttempts > 0) {
+    parts.push(`已清理 ${summary.removedAttempts} 条过旧的失败记录`);
   }
   return parts.join("，");
 }

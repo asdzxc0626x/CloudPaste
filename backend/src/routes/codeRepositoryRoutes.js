@@ -184,7 +184,14 @@ codeRepositoryRoutes.get("/api/admin/repo-backup/repositories/:id/backups", requ
   const { db, repositoryFactory, env } = resolveContext(c);
   const { id } = c.req.param();
 
-  const result = await listBackups(db, repositoryFactory, id, parsePaging(c), env);
+  // 修改点（历史记录需显示失败记录）：?status=failed 或 ?status=failed,partial 按状态筛选
+  const statusRaw = c.req.query("status") || "";
+  const statuses = statusRaw
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+
+  const result = await listBackups(db, repositoryFactory, id, { ...parsePaging(c), statuses }, env);
   return jsonOk(c, result, "获取备份记录成功");
 });
 

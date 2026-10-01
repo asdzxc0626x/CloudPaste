@@ -171,6 +171,16 @@ export default {
       title: "备份历史",
       refresh: "刷新",
       empty: "该仓库还没有备份记录",
+      // 修改点（历史记录需显示失败记录）
+      emptyFiltered: "当前筛选条件下没有记录",
+      unresolved: "未解析到版本",
+      filter: {
+        all: "全部",
+        success: "成功",
+        failed: "失败",
+        running: "进行中",
+        skipped: "已跳过",
+      },
       downloadArchive: "下载快照",
       downloadTarget: "下载 #{index}",
       prev: "上一页",

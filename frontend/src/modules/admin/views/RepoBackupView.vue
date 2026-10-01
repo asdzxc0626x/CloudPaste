@@ -50,10 +50,13 @@ const {
   historyItems,
   historyTotal,
   historyPaging,
+  historyStatuses,
+  historyStatusCounts,
   openHistory,
   closeHistory,
   loadHistory,
   changeHistoryPage,
+  changeHistoryStatuses,
   downloadBackup,
 
   initialize,
@@ -155,9 +158,12 @@ onMounted(() => {
       :paging="historyPaging"
       :loading="historyLoading"
       :dark-mode="darkMode"
+      :statuses="historyStatuses"
+      :status-counts="historyStatusCounts"
       @close="closeHistory"
       @refresh="loadHistory"
       @page-change="changeHistoryPage"
+      @status-change="changeHistoryStatuses"
       @download="downloadBackup"
     />
 

@@ -270,14 +270,22 @@ export function triggerBackup(id, options = {}) {
 
 /**
  * 获取某仓库的备份记录（分页）
+ *
+ * 修改点（历史记录需显示失败记录）：
+ * - statuses 为空时返回全部状态（含 failed / running / skipped），不再只有成功记录
+ * - 返回值新增 statusCounts，用于在筛选器上显示每种状态的条数
+ *
  * @param {string} id
- * @param {{limit?: number, offset?: number}} [paging]
- * @returns {Promise<{success: boolean, data: {items: RepoBackup[], total: number, limit: number, offset: number}, message: string}>}
+ * @param {{limit?: number, offset?: number, statuses?: string[]}} [paging]
+ * @returns {Promise<{success: boolean, data: {items: RepoBackup[], total: number, statuses: string[], statusCounts: Record<string, number>, limit: number, offset: number}, message: string}>}
  */
 export function listBackups(id, paging = {}) {
   const params = new URLSearchParams();
   if (paging.limit != null) params.set("limit", String(paging.limit));
   if (paging.offset != null) params.set("offset", String(paging.offset));
+  if (Array.isArray(paging.statuses) && paging.statuses.length > 0) {
+    params.set("status", paging.statuses.join(","));
+  }
   const query = params.toString();
   return get(`${BASE}/repositories/${encodeURIComponent(id)}/backups${query ? `?${query}` : ""}`);
 }

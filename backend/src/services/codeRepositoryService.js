@@ -32,6 +32,8 @@ import {
   resolveTrackRefs,
   resolveTargetMountIds,
   resolveRetentionCount,
+  isUnresolvedCommitSha,
+  BACKUP_STATUSES,
   DEFAULT_RETENTION_COUNT,
   MIN_RETENTION_COUNT,
   MAX_RETENTION_COUNT,
@@ -239,13 +241,18 @@ function toTargetDto(row) {
  */
 function toBackupDto(row, extra = {}) {
   const targets = Array.isArray(extra.targets) ? extra.targets.map(toTargetDto) : [];
+  // 修改点（历史记录需显示失败记录）：解析版本前就失败的留痕用了占位 commit_sha，
+  // 对外还原为 null，避免前端把假 sha 当成真实版本展示
+  const unresolved = isUnresolvedCommitSha(row.commit_sha);
   return {
     id: row.id,
     repositoryId: row.repository_id,
     refType: row.ref_type ?? null,
     ref: row.ref ?? null,
-    commitSha: row.commit_sha,
-    shortCommitSha: String(row.commit_sha || "").slice(0, 7),
+    commitSha: unresolved ? null : row.commit_sha,
+    shortCommitSha: unresolved ? "" : String(row.commit_sha || "").slice(0, 7),
+    /** true 表示这条记录在解析到版本之前就失败了，没有对应的 commit */
+    unresolved,
     version: row.version ?? null,
     status: row.status,
     storagePath: row.storage_path ?? null,
@@ -788,6 +795,10 @@ export async function checkRepository(db, repositoryFactory, encryptionSecret, i
 
 /**
  * 分页查询某仓库的备份记录
+ *
+ * 修改点（历史记录需显示失败记录）：
+ * - 支持 options.statuses 按状态筛选（不传则返回全部状态，含 failed / running / skipped）
+ * - 额外返回 statusCounts，前端筛选器可直接显示每种状态的条数
  */
 export async function listBackups(db, repositoryFactory, repositoryId, options = {}, env = {}) {
   const factory = ensureRepositoryFactory(db, repositoryFactory, env);
@@ -798,13 +809,21 @@ export async function listBackups(db, repositoryFactory, repositoryId, options =
     throw new NotFoundError(`代码仓库不存在: ${repositoryId}`);
   }
 
-  const { backups, total } = await codeRepo.findBackupsByRepository(repositoryId, options);
+  // 只接受已知状态值，未知值直接忽略（而不是报错），避免前端传脏参数就 400
+  const statuses = (Array.isArray(options.statuses) ? options.statuses : [])
+    .map((item) => String(item || "").trim())
+    .filter((item) => BACKUP_STATUSES.includes(item));
+
+  const { backups, total } = await codeRepo.findBackupsByRepository(repositoryId, { ...options, statuses });
   // 修改点（多备份目标优化）：一次性取出所有目标结果，避免逐条查询
   const targetMap = await codeRepo.findTargetsByBackups(backups.map((row) => row.id));
+  const statusCounts = await codeRepo.countBackupsByStatus(repositoryId);
 
   return {
     items: backups.map((row) => toBackupDto(row, { targets: targetMap.get(String(row.id)) || [] })),
     total,
+    statuses,
+    statusCounts,
     limit: options.limit ?? 50,
     offset: options.offset ?? 0,
   };

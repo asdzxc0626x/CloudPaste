@@ -9,6 +9,7 @@ import {
   parseProviderConfig,
   resolveTrackRefs,
   resolveTargetMountIds,
+  buildUnresolvedCommitSha,
 } from "../../../../repobackup/config.js";
 import { planBackupPaths } from "../../../../repobackup/paths.js";
 import { pruneOldVersions, describePruneResult } from "../../../../repobackup/retention.js";
@@ -775,6 +776,26 @@ export class RepoBackupTaskHandler implements TaskHandler {
               finished_at: nowIso(),
             })
             .catch((e: any) => console.warn("[RepoBackupTaskHandler] 更新备份记录失败:", e?.message || e));
+        } else {
+          // 修改点（历史记录需显示失败记录）：
+          // 解析版本阶段就失败时（限流、网络不通、分支不存在）原本一条记录都不会写，
+          // 备份历史里因此永远只看到成功的版本。这里补一条失败留痕，
+          // commit_sha 用占位值绕过 NOT NULL + 唯一索引，DTO 读取时会还原为 null。
+          await codeRepo
+            .createBackup({
+              id: generateId("bk"),
+              repository_id: repoRow.id,
+              ref_type: trackMode === "branch" ? "branch" : "tag",
+              ref: trackRef ?? null,
+              commit_sha: buildUnresolvedCommitSha(),
+              version: null,
+              status: cancelled ? "skipped" : "failed",
+              job_id: job.jobId,
+              error_message: message,
+              started_at: new Date(refStartedMs).toISOString(),
+              finished_at: nowIso(),
+            })
+            .catch((e: any) => console.warn("[RepoBackupTaskHandler] 写入失败留痕记录出错:", e?.message || e));
         }
 
         await codeRepo

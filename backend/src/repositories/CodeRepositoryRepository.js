@@ -168,16 +168,82 @@ export class CodeRepositoryRepository extends BaseRepository {
     const limit = Number.isFinite(Number(options.limit)) ? Math.max(1, Math.min(200, Math.trunc(Number(options.limit)))) : 50;
     const offset = Number.isFinite(Number(options.offset)) ? Math.max(0, Math.trunc(Number(options.offset))) : 0;
 
-    const total = await this.count(DbTables.CODE_REPOSITORY_BACKUPS, { repository_id: repositoryId });
+    // 修改点（历史记录需显示失败记录）：支持按状态筛选
+    // - statuses 为空数组/未传时不加条件，返回全部状态（含 failed / running / skipped）
+    const statuses = Array.isArray(options.statuses) ? options.statuses.filter(Boolean).map(String) : [];
+
+    const where = ["repository_id = ?"];
+    const params = [repositoryId];
+    if (statuses.length > 0) {
+      where.push(`status IN (${statuses.map(() => "?").join(", ")})`);
+      params.push(...statuses);
+    }
+    const whereSql = where.join(" AND ");
+
+    // 带筛选条件时不能再用 count(table, {字段: 值}) 这种等值封装，改为原始计数
+    const countRow = await this.queryFirst(
+      `SELECT COUNT(*) AS count FROM ${DbTables.CODE_REPOSITORY_BACKUPS} WHERE ${whereSql}`,
+      params,
+    );
+    const total = Number(countRow?.count) || 0;
 
     const sql = `
       SELECT * FROM ${DbTables.CODE_REPOSITORY_BACKUPS}
-      WHERE repository_id = ?
+      WHERE ${whereSql}
       ORDER BY created_at DESC
       LIMIT ? OFFSET ?
     `;
-    const result = await this.query(sql, [repositoryId, limit, offset]);
+    const result = await this.query(sql, [...params, limit, offset]);
     return { backups: result.results || [], total };
+  }
+
+  /**
+   * 统计某仓库各状态的备份记录数（修改点：历史记录需显示失败记录）
+   * - 用于在筛选器上直接显示每种状态有多少条，避免切换后才发现是空的
+   * @param {string} repositoryId
+   * @returns {Promise<Record<string, number>>}
+   */
+  async countBackupsByStatus(repositoryId) {
+    if (!repositoryId) return {};
+    const sql = `
+      SELECT status, COUNT(*) AS count
+      FROM ${DbTables.CODE_REPOSITORY_BACKUPS}
+      WHERE repository_id = ?
+      GROUP BY status
+    `;
+    const result = await this.query(sql, [repositoryId]);
+    const counts = {};
+    for (const row of result.results || []) {
+      counts[String(row.status)] = Number(row.count) || 0;
+    }
+    return counts;
+  }
+
+  /**
+   * 查询超出保留条数的最旧「非成功」备份记录（修改点：历史记录需显示失败记录）
+   *
+   * 与 findSuccessBackupsBeyondLimit 的分工：
+   * - 成功/部分成功的记录对应真实快照文件，由「保留版本数」控制
+   * - failed / skipped 记录只是留痕，没有可用快照，单独用一个固定上限控制条数
+   *
+   * @param {string} repositoryId
+   * @param {number} keepCount 保留的最新条数
+   * @returns {Promise<Object[]>}
+   */
+  async findNonSuccessBackupsBeyondLimit(repositoryId, keepCount) {
+    if (!repositoryId) return [];
+    const keep = Number.isFinite(Number(keepCount)) ? Math.max(0, Math.trunc(Number(keepCount))) : 0;
+
+    // LIMIT -1 OFFSET n = 跳过最新的 n 条、取余下全部（SQLite / D1 均支持）
+    const sql = `
+      SELECT * FROM ${DbTables.CODE_REPOSITORY_BACKUPS}
+      WHERE repository_id = ?
+        AND status IN ('failed', 'skipped')
+      ORDER BY created_at DESC
+      LIMIT -1 OFFSET ?
+    `;
+    const result = await this.query(sql, [repositoryId, keep]);
+    return result.results || [];
   }
 
   /**

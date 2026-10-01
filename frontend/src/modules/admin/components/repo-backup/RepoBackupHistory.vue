@@ -18,12 +18,56 @@ const props = defineProps({
   paging: { type: Object, required: true },
   loading: { type: Boolean, default: false },
   darkMode: { type: Boolean, default: false },
+  /** 当前选中的状态筛选（空数组 = 全部）（修改点：历史记录需显示失败记录） */
+  statuses: { type: Array, default: () => [] },
+  /** 各状态的记录条数，用于在筛选器上显示数量 */
+  statusCounts: { type: Object, default: () => ({}) },
 });
 
-const emit = defineEmits(["close", "refresh", "page-change", "download"]);
+const emit = defineEmits(["close", "refresh", "page-change", "download", "status-change"]);
 
 const hasPrev = computed(() => props.paging.offset > 0);
 const hasNext = computed(() => props.paging.offset + props.paging.limit < props.total);
+
+/**
+ * 状态筛选项（修改点：历史记录需显示失败记录）
+ * - 「全部」对应空数组；「成功」把 success 与 partial 合并，
+ *   因为 partial 也是有可用快照的，用户视角里都算备份成功
+ */
+const STATUS_FILTERS = [
+  { key: "all", statuses: [] },
+  { key: "success", statuses: ["success", "partial"] },
+  { key: "failed", statuses: ["failed"] },
+  { key: "running", statuses: ["running"] },
+  { key: "skipped", statuses: ["skipped"] },
+];
+
+/** 当前选中的筛选项 key */
+const activeFilter = computed(() => {
+  const current = [...(props.statuses || [])].sort().join(",");
+  if (!current) return "all";
+  const matched = STATUS_FILTERS.find((item) => [...item.statuses].sort().join(",") === current);
+  return matched ? matched.key : "all";
+});
+
+/** 某个筛选项下有多少条记录（全部 = 各状态求和） */
+const filterCount = (filter) => {
+  const counts = props.statusCounts || {};
+  if (filter.statuses.length === 0) {
+    return Object.values(counts).reduce((sum, n) => sum + (Number(n) || 0), 0);
+  }
+  return filter.statuses.reduce((sum, status) => sum + (Number(counts[status]) || 0), 0);
+};
+
+const filterBtnClass = (filter) => {
+  const active = activeFilter.value === filter.key;
+  if (active) {
+    return props.darkMode ? "bg-blue-600 text-white border-blue-600" : "bg-blue-600 text-white border-blue-600";
+  }
+  return props.darkMode
+    ? "border-gray-600 text-gray-300 hover:bg-gray-700"
+    : "border-gray-300 text-gray-600 hover:bg-gray-100";
+};
 
 const statusClass = (status) => {
   switch (status) {
@@ -112,9 +156,24 @@ const showTargetList = (item) => Array.isArray(item.targets) && item.targets.len
 
       <!-- 正文：独立滚动区 -->
       <div class="flex-1 min-h-0 overflow-y-auto px-4 sm:px-5 py-3">
+        <!-- 状态筛选（修改点：历史记录需显示失败记录） -->
+        <div class="flex items-center gap-1.5 flex-wrap mb-3">
+          <button
+            v-for="filter in STATUS_FILTERS"
+            :key="filter.key"
+            type="button"
+            class="inline-flex items-center gap-1 px-2 py-1 text-[11px] rounded-full border transition-colors"
+            :class="filterBtnClass(filter)"
+            @click="emit('status-change', filter.statuses)"
+          >
+            {{ $t(`admin.repoBackup.history.filter.${filter.key}`) }}
+            <span class="opacity-70">{{ filterCount(filter) }}</span>
+          </button>
+        </div>
+
         <!-- 空状态 -->
         <div v-if="!loading && items.length === 0" class="py-10 text-center text-sm" :class="darkMode ? 'text-gray-400' : 'text-gray-500'">
-          {{ $t("admin.repoBackup.history.empty") }}
+          {{ activeFilter === "all" ? $t("admin.repoBackup.history.empty") : $t("admin.repoBackup.history.emptyFiltered") }}
         </div>
 
         <!-- 记录列表 -->
@@ -139,11 +198,12 @@ const showTargetList = (item) => Array.isArray(item.targets) && item.targets.len
                     {{ item.ref }}
                   </span>
                   <span class="text-sm font-medium" :class="darkMode ? 'text-white' : 'text-gray-900'">
-                    {{ item.version || item.shortCommitSha }}
+                    {{ item.version || item.shortCommitSha || $t("admin.repoBackup.history.unresolved") }}
                   </span>
                 </div>
 
-                <div class="mt-1 text-[11px] font-mono break-all" :class="darkMode ? 'text-gray-400' : 'text-gray-500'">
+                <!-- 解析版本前就失败的记录没有 commit，不渲染空行（修改点：历史记录需显示失败记录） -->
+                <div v-if="item.commitSha" class="mt-1 text-[11px] font-mono break-all" :class="darkMode ? 'text-gray-400' : 'text-gray-500'">
                   {{ item.commitSha }}
                 </div>
 

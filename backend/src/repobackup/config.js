@@ -22,6 +22,42 @@ export const MIN_RETENTION_COUNT = 1;
 export const MAX_RETENTION_COUNT = 100;
 
 /**
+ * 「版本未解析」的占位 commit_sha 前缀（修改点：历史记录需显示失败记录）
+ *
+ * 背景：备份记录原先只在 resolveLatestVersion 成功之后才创建，
+ * 所以「解析版本阶段就失败」（限流、网络不通、分支不存在）根本不会留下历史记录，
+ * 备份历史里看起来永远只有成功的版本。
+ *
+ * 但 code_repository_backups.commit_sha 是 NOT NULL，且 (repository_id, commit_sha)
+ * 上有唯一索引，没有真实 sha 时无法插入。这里用一个带前缀且天然唯一的占位值，
+ * 避免为此做一次表结构迁移：
+ * - 前缀可识别，DTO 读取时会把 commitSha 还原为 null，不会把假 sha 暴露给前端
+ * - 占位值不会与真实 sha 冲突（真实 sha 是 40 位十六进制）
+ * - 按 commit 去重只会用真实 sha 查询，不受这些行影响
+ */
+export const UNRESOLVED_COMMIT_PREFIX = "unresolved-";
+
+/** 生成一个唯一的占位 commit_sha */
+export function buildUnresolvedCommitSha() {
+  return `${UNRESOLVED_COMMIT_PREFIX}${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+/** 判断某个 commit_sha 是否为占位值 */
+export function isUnresolvedCommitSha(value) {
+  return typeof value === "string" && value.startsWith(UNRESOLVED_COMMIT_PREFIX);
+}
+
+/**
+ * 非成功备份记录的保留条数（修改点：历史记录需显示失败记录）
+ * - 失败/跳过记录不占用「保留版本数」额度（那是给成功快照用的），
+ *   但也不能无限增长，所以单独设一个上限，超出后删除最旧的
+ */
+export const NON_SUCCESS_HISTORY_KEEP = 20;
+
+/** 备份记录的合法状态，供列表筛选参数校验使用 */
+export const BACKUP_STATUSES = ["running", "success", "partial", "failed", "skipped"];
+
+/**
  * 把 JSON 数组列解析为字符串数组
  * - 解析失败/非数组一律按空数组处理，避免单条脏数据让整页接口 500
  * @param {string|null|undefined} raw

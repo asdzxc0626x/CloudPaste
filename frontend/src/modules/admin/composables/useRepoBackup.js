@@ -56,6 +56,13 @@ export function useRepoBackup() {
   const historyItems = ref([]);
   const historyTotal = ref(0);
   const historyPaging = reactive({ limit: 20, offset: 0 });
+  /**
+   * 历史记录状态筛选（修改点：历史记录需显示失败记录）
+   * - 空数组 = 全部状态；非空时按选中的状态过滤
+   * - statusCounts 由后端返回，用于在筛选器上显示每种状态的条数
+   */
+  const historyStatuses = ref([]);
+  const historyStatusCounts = ref({});
 
   // ==================== 检查更新结果 ====================
   const checkResults = ref({});
@@ -281,6 +288,8 @@ export function useRepoBackup() {
   const openHistory = async (repo) => {
     historyRepo.value = repo;
     historyPaging.offset = 0;
+    // 每次打开都回到「全部状态」，避免上次的筛选条件让人以为没有记录
+    historyStatuses.value = [];
     showHistory.value = true;
     await loadHistory();
   };
@@ -290,6 +299,7 @@ export function useRepoBackup() {
     historyRepo.value = null;
     historyItems.value = [];
     historyTotal.value = 0;
+    historyStatusCounts.value = {};
   };
 
   const loadHistory = async () => {
@@ -299,10 +309,12 @@ export function useRepoBackup() {
       const resp = await listBackups(historyRepo.value.id, {
         limit: historyPaging.limit,
         offset: historyPaging.offset,
+        statuses: historyStatuses.value,
       });
       if (resp?.success) {
         historyItems.value = resp.data?.items || [];
         historyTotal.value = resp.data?.total || 0;
+        historyStatusCounts.value = resp.data?.statusCounts || {};
       }
     } catch (e) {
       notifyError(e, "admin.repoBackup.messages.historyFailed");
@@ -313,6 +325,17 @@ export function useRepoBackup() {
 
   const changeHistoryPage = async (offset) => {
     historyPaging.offset = Math.max(0, offset);
+    await loadHistory();
+  };
+
+  /**
+   * 切换历史记录的状态筛选（修改点：历史记录需显示失败记录）
+   * - 传 null / 空数组表示「全部」
+   * - 筛选条件变化必须把 offset 归零，否则会停在超出范围的页上看到空列表
+   */
+  const changeHistoryStatuses = async (statuses) => {
+    historyStatuses.value = Array.isArray(statuses) ? statuses.filter(Boolean) : [];
+    historyPaging.offset = 0;
     await loadHistory();
   };
 
@@ -377,10 +400,13 @@ export function useRepoBackup() {
     historyItems,
     historyTotal,
     historyPaging,
+    historyStatuses,
+    historyStatusCounts,
     openHistory,
     closeHistory,
     loadHistory,
     changeHistoryPage,
+    changeHistoryStatuses,
     downloadBackup,
 
     // 加载
