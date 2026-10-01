@@ -2,7 +2,7 @@ name: Deploy SPA CF Workers[一体化部署]
 
 on:
   push:
-    branches: [main, master]
+    branches: [main, master,dev]
     paths:
       - "frontend/**"
       - "backend/**"
