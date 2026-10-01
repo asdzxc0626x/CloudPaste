@@ -54,6 +54,21 @@ const DEFAULT_INTERVAL_SEC = 6 * 3600;
 /** 间隔预设：覆盖常见节奏，其余走「自定义小时数」 */
 const INTERVAL_PRESETS = [3600, 3 * 3600, 6 * 3600, 12 * 3600, 24 * 3600, 3 * 24 * 3600, 7 * 24 * 3600];
 
+/**
+ * cron 预设（修改点：备份计划支持 cron）
+ * - 标准 5 段：分 时 日 月 周，最小粒度为分钟，与「定时任务」页一致
+ * - 只是快速填入的便利按钮，用户仍可手改
+ */
+const CRON_PRESETS = [
+  { key: "hourly", expression: "0 * * * *" },
+  { key: "everySixHours", expression: "0 */6 * * *" },
+  { key: "dailyEarly", expression: "30 3 * * *" },
+  { key: "weekly", expression: "0 4 * * 1" },
+];
+
+/** 默认 cron 表达式：每天 03:30，与默认 6 小时间隔同样属于「低峰执行」 */
+const DEFAULT_CRON = "30 3 * * *";
+
 /** 本地表单状态 */
 const formData = reactive({
   provider: "github",
@@ -70,6 +85,10 @@ const formData = reactive({
   retentionCount: DEFAULT_RETENTION,
   /** 备份计划开关（修改点：独立备份计划）；间隔由 intervalSelect/customHours 推导 */
   scheduleEnabled: true,
+  /** 调度方式（修改点：备份计划支持 cron）：'interval' | 'cron' */
+  scheduleType: "interval",
+  /** cron 表达式（scheduleType='cron' 时生效） */
+  scheduleCron: DEFAULT_CRON,
   enabled: true,
   config: {},
 });
@@ -161,6 +180,9 @@ const resetForm = () => {
       retentionCount: Number(props.repo.retentionCount) || DEFAULT_RETENTION,
       // 修改点（独立备份计划）：计划缺失（v36 及更早的存量仓库）时按默认开启处理
       scheduleEnabled: props.repo.schedule ? props.repo.schedule.enabled !== false : true,
+      // 修改点（备份计划支持 cron）
+      scheduleType: props.repo.schedule?.scheduleType === "cron" ? "cron" : "interval",
+      scheduleCron: props.repo.schedule?.cronExpression || DEFAULT_CRON,
       enabled: props.repo.enabled !== false,
       // 配置中的敏感字段是掩码值，原样提交回后端会被识别并保留原密钥
       config: { ...(props.repo.config || {}) },
@@ -181,6 +203,8 @@ const resetForm = () => {
     targetPathPrefix: "/",
     retentionCount: DEFAULT_RETENTION,
     scheduleEnabled: true,
+    scheduleType: "interval",
+    scheduleCron: DEFAULT_CRON,
     enabled: true,
     config: {},
   });
@@ -338,8 +362,18 @@ const handleSubmit = () => {
 
   // 修改点（独立备份计划）：只有启用了定时备份才校验间隔，关闭时间隔值无意义
   const intervalSec = resolvedIntervalSec.value;
+  const useCron = formData.scheduleType === "cron";
   if (formData.scheduleEnabled) {
-    if (!Number.isFinite(intervalSec) || intervalSec < MIN_INTERVAL_SEC || intervalSec > MAX_INTERVAL_SEC) {
+    if (useCron) {
+      // 修改点（备份计划支持 cron）：前端只校验「非空 + 5 段」，
+      // 表达式语义由后端用 cron-parser 真实解析，避免两边各写一套不一致的规则
+      const expression = String(formData.scheduleCron || "").trim();
+      const fields = expression.split(/\s+/).filter(Boolean);
+      if (fields.length !== 5) {
+        localError.value = t("admin.repoBackup.validation.cronInvalid");
+        return;
+      }
+    } else if (!Number.isFinite(intervalSec) || intervalSec < MIN_INTERVAL_SEC || intervalSec > MAX_INTERVAL_SEC) {
       localError.value = t("admin.repoBackup.validation.intervalRange", {
         min: MIN_INTERVAL_SEC / 60,
         max: MAX_INTERVAL_SEC / 86400,
@@ -364,7 +398,10 @@ const handleSubmit = () => {
     retentionCount: Math.trunc(retention),
     // 修改点（独立备份计划优化）：关闭时也提交当前间隔，重新开启后沿用同一节奏
     scheduleEnabled: formData.scheduleEnabled,
+    // 修改点（备份计划支持 cron）：两种模式的值都提交，切换回去时不丢原设置
+    scheduleType: useCron ? "cron" : "interval",
     scheduleIntervalSec: Number.isFinite(intervalSec) ? intervalSec : DEFAULT_INTERVAL_SEC,
+    scheduleCron: String(formData.scheduleCron || "").trim() || DEFAULT_CRON,
     enabled: formData.enabled,
     config: { ...formData.config },
   });
@@ -659,32 +696,80 @@ onBeforeUnmount(() => document.removeEventListener("keydown", onEscClose));
               </label>
             </div>
 
-            <div v-if="formData.scheduleEnabled" class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+            <div v-if="formData.scheduleEnabled" class="space-y-2.5">
+              <!-- 调度方式（修改点：备份计划支持 cron）：与「定时任务」页一致，固定间隔或 cron 表达式 -->
               <div>
-                <label :class="labelClass">{{ $t("admin.repoBackup.form.scheduleInterval") }}</label>
-                <select v-model="intervalSelect" :class="inputClass">
-                  <option v-for="preset in INTERVAL_PRESETS" :key="preset" :value="preset">
-                    {{ formatInterval(preset) }}
-                  </option>
-                  <option value="custom">{{ $t("admin.repoBackup.form.intervalCustom") }}</option>
-                </select>
-                <p :class="hintClass">{{ $t("admin.repoBackup.form.scheduleIntervalHint") }}</p>
+                <label :class="labelClass">{{ $t("admin.repoBackup.form.scheduleMode") }}</label>
+                <div class="flex items-center gap-3">
+                  <label class="inline-flex items-center gap-1.5">
+                    <input v-model="formData.scheduleType" type="radio" value="interval" class="border-gray-300" />
+                    <span class="text-xs" :class="darkMode ? 'text-gray-300' : 'text-gray-700'">
+                      {{ $t("admin.repoBackup.form.scheduleModeInterval") }}
+                    </span>
+                  </label>
+                  <label class="inline-flex items-center gap-1.5">
+                    <input v-model="formData.scheduleType" type="radio" value="cron" class="border-gray-300" />
+                    <span class="text-xs" :class="darkMode ? 'text-gray-300' : 'text-gray-700'">
+                      {{ $t("admin.repoBackup.form.scheduleModeCron") }}
+                    </span>
+                  </label>
+                </div>
               </div>
 
-              <!-- 自定义小时数 -->
-              <div v-if="intervalSelect === 'custom'">
-                <label :class="labelClass">{{ $t("admin.repoBackup.form.intervalCustomHours") }}</label>
+              <!-- 固定间隔 -->
+              <div v-if="formData.scheduleType !== 'cron'" class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                <div>
+                  <label :class="labelClass">{{ $t("admin.repoBackup.form.scheduleInterval") }}</label>
+                  <select v-model="intervalSelect" :class="inputClass">
+                    <option v-for="preset in INTERVAL_PRESETS" :key="preset" :value="preset">
+                      {{ formatInterval(preset) }}
+                    </option>
+                    <option value="custom">{{ $t("admin.repoBackup.form.intervalCustom") }}</option>
+                  </select>
+                  <p :class="hintClass">{{ $t("admin.repoBackup.form.scheduleIntervalHint") }}</p>
+                </div>
+
+                <!-- 自定义小时数 -->
+                <div v-if="intervalSelect === 'custom'">
+                  <label :class="labelClass">{{ $t("admin.repoBackup.form.intervalCustomHours") }}</label>
+                  <input
+                    v-model.number="customHours"
+                    type="number"
+                    :min="MIN_INTERVAL_SEC / 3600"
+                    :max="MAX_INTERVAL_SEC / 3600"
+                    step="0.25"
+                    :class="inputClass"
+                  />
+                  <p :class="hintClass">
+                    {{ $t("admin.repoBackup.form.intervalCustomHint", { min: MIN_INTERVAL_SEC / 60, max: MAX_INTERVAL_SEC / 86400 }) }}
+                  </p>
+                </div>
+              </div>
+
+              <!-- cron 表达式 -->
+              <div v-else>
+                <label :class="labelClass">{{ $t("admin.repoBackup.form.scheduleCron") }}</label>
                 <input
-                  v-model.number="customHours"
-                  type="number"
-                  :min="MIN_INTERVAL_SEC / 3600"
-                  :max="MAX_INTERVAL_SEC / 3600"
-                  step="0.25"
-                  :class="inputClass"
+                  v-model="formData.scheduleCron"
+                  type="text"
+                  spellcheck="false"
+                  placeholder="30 3 * * *"
+                  :class="[inputClass, 'font-mono']"
                 />
-                <p :class="hintClass">
-                  {{ $t("admin.repoBackup.form.intervalCustomHint", { min: MIN_INTERVAL_SEC / 60, max: MAX_INTERVAL_SEC / 86400 }) }}
-                </p>
+                <p :class="hintClass">{{ $t("admin.repoBackup.form.scheduleCronHint") }}</p>
+                <div class="mt-1.5 flex items-center gap-1.5 flex-wrap">
+                  <button
+                    v-for="preset in CRON_PRESETS"
+                    :key="preset.expression"
+                    type="button"
+                    class="px-1.5 py-0.5 text-[11px] rounded border font-mono"
+                    :class="darkMode ? 'border-gray-600 text-gray-300 hover:bg-gray-700' : 'border-gray-300 text-gray-600 hover:bg-gray-100'"
+                    :title="$t(`admin.repoBackup.form.cronPreset.${preset.key}`)"
+                    @click="formData.scheduleCron = preset.expression"
+                  >
+                    {{ preset.expression }}
+                  </button>
+                </div>
               </div>
             </div>
 

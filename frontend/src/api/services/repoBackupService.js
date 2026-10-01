@@ -57,7 +57,10 @@ import { get, post, put, del } from "../client";
  * 仓库的独立备份计划（后端落在 scheduled_jobs 表，一个仓库一行）
  * @property {string} taskId - 调度作业 ID（`repo_backup_<仓库ID>`）
  * @property {boolean} enabled - 是否启用定时备份
- * @property {number} intervalSec - 备份间隔（秒），默认 21600（6 小时）
+ * @property {'interval'|'cron'} scheduleType - 调度方式（修改点：备份计划支持 cron）
+ * @property {number} intervalSec - 备份间隔（秒），interval 模式有效，默认 21600（6 小时）
+ * @property {string|null} cronExpression - cron 表达式（5 段），cron 模式有效
+ * @property {number|null} estimatedIntervalSec - cron 模式下由表达式推导的相邻间隔，仅供展示
  * @property {string|null} nextRunAfter - 下次执行时间
  * @property {string|null} lastRunStatus - 'success' | 'failure' | 'skipped' | null
  * @property {string|null} lastRunFinishedAt
@@ -200,7 +203,9 @@ export function getRepository(id) {
  * @param {string} [payload.targetPathPrefix]
  * @param {number} [payload.retentionCount] - 保留版本数，默认 10
  * @param {boolean} [payload.scheduleEnabled] - 是否启用定时备份，默认 true
- * @param {number} [payload.scheduleIntervalSec] - 备份间隔（秒），默认 21600（6 小时）
+ * @param {'interval'|'cron'} [payload.scheduleType] - 调度方式，默认 interval
+ * @param {number} [payload.scheduleIntervalSec] - 备份间隔（秒），interval 模式用，默认 21600
+ * @param {string} [payload.scheduleCron] - cron 表达式（5 段），cron 模式用
  * @param {string} [payload.name]
  * @param {boolean} [payload.enabled]
  * @param {Object} [payload.config]

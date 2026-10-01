@@ -547,7 +547,10 @@ export async function createRepository(db, repositoryFactory, encryptionSecret, 
   await syncRepositoryScheduleJob(db, {
     repoRow: { id, name: body?.name ? String(body.name).trim() : null, repo_identifier: repoIdentifier },
     enabled: schedule.enabled,
+    // 修改点（备份计划支持 cron）
+    scheduleType: schedule.scheduleType,
     intervalSec: schedule.intervalSec,
+    cronExpression: schedule.cronExpression,
     existing: null,
   });
 
@@ -646,7 +649,10 @@ export async function updateRepository(db, repositoryFactory, encryptionSecret, 
       repo_identifier: repoIdentifier,
     },
     enabled: schedule.enabled,
+    // 修改点（备份计划支持 cron）
+    scheduleType: schedule.scheduleType,
     intervalSec: schedule.intervalSec,
+    cronExpression: schedule.cronExpression,
     existing: existingSchedule,
   });
 

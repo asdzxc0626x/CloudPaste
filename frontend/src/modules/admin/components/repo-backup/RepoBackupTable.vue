@@ -120,10 +120,14 @@ const formatInterval = (seconds) => {
   return t("admin.repoBackup.form.intervalMinutes", { count: Math.round(value / 60) });
 };
 
-/** 计划摘要：未启用 / 每 N 小时 */
+/** 计划摘要：未启用 / 每 N 小时 / cron 表达式 */
 const scheduleLabel = (repo) => {
   const schedule = repo.schedule;
   if (!schedule || !schedule.enabled) return t("admin.repoBackup.table.scheduleOff");
+  // 修改点（备份计划支持 cron）：cron 模式直接显示表达式，比换算成「每 N 小时」更准确
+  if (schedule.scheduleType === "cron" && schedule.cronExpression) {
+    return t("admin.repoBackup.table.scheduleCron", { cron: schedule.cronExpression });
+  }
   return t("admin.repoBackup.table.scheduleEvery", { interval: formatInterval(schedule.intervalSec) });
 };
 

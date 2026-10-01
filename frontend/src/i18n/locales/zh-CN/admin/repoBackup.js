@@ -27,6 +27,8 @@ export default {
       schedule: "备份计划",
       scheduleOff: "未启用定时备份",
       scheduleEvery: "每 {interval}",
+      // 修改点（备份计划支持 cron）
+      scheduleCron: "cron {cron}",
       scheduleNext: "下次",
       scheduleLastFailed: "上次调度失败",
     },
@@ -118,6 +120,18 @@ export default {
       // 修改点（独立备份计划优化）：每个仓库单独的备份计划，复用后端定时任务机制
       scheduleSection: "备份计划",
       scheduleEnabled: "启用定时备份",
+      // 修改点（备份计划支持 cron）：与「定时任务」页一致的两种调度方式
+      scheduleMode: "调度方式",
+      scheduleModeInterval: "固定间隔",
+      scheduleModeCron: "cron 表达式",
+      scheduleCron: "cron 表达式",
+      scheduleCronHint: "标准 5 段：分 时 日 月 周，最小粒度为分钟。例如 30 3 * * * 表示每天 03:30",
+      cronPreset: {
+        hourly: "每小时整点",
+        everySixHours: "每 6 小时",
+        dailyEarly: "每天 03:30",
+        weekly: "每周一 04:00",
+      },
       scheduleInterval: "备份间隔",
       scheduleIntervalHint: "默认每 6 小时检查一次；没有新版本时会自动跳过，不会重复备份",
       scheduleDisabledHint: "已关闭定时备份，只能手动点击「立即备份」",
@@ -200,6 +214,8 @@ export default {
       mountRequired: "请至少选择一个备份目标挂载点",
       retentionRange: "保留版本数必须在 {min} ~ {max} 之间",
       intervalRange: "备份间隔必须在 {min} 分钟 ~ {max} 天之间",
+      // 修改点（备份计划支持 cron）
+      cronInvalid: "cron 表达式必须是 5 段：分 时 日 月 周（例如 30 3 * * *）",
     },
 
     messages: {

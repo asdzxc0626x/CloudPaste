@@ -80,10 +80,21 @@ const SCHEDULE_DESCRIPTION = "按该仓库的备份计划自动创建代码仓�
  */
 function toScheduleDto(job) {
   if (!job) return null;
+  // 修改点（备份计划支持 cron）：scheduleType 决定 intervalSec / cronExpression 哪个有效
+  // 注意 scheduledJobService 在 cron 模式下会从表达式推导一个「代表性间隔」填进 intervalSec，
+  // 那只是给 UI 看的估算值，不能当成真实配置，所以这里按 scheduleType 分开暴露
+  const scheduleType = job.scheduleType === "cron" ? "cron" : "interval";
   return {
     taskId: job.taskId,
     enabled: job.enabled,
-    intervalSec: Number(job.intervalSec) || DEFAULT_SCHEDULE_INTERVAL_SEC,
+    scheduleType,
+    intervalSec:
+      scheduleType === "interval"
+        ? Number(job.intervalSec) || DEFAULT_SCHEDULE_INTERVAL_SEC
+        : DEFAULT_SCHEDULE_INTERVAL_SEC,
+    cronExpression: scheduleType === "cron" ? job.cronExpression ?? null : null,
+    /** cron 模式下由表达式推导出的相邻两次间隔（秒），仅用于展示 */
+    estimatedIntervalSec: scheduleType === "cron" ? Number(job.intervalSec) || 0 : null,
     nextRunAfter: job.nextRunAfter ?? null,
     lastRunStatus: job.lastRunStatus ?? null,
     lastRunFinishedAt: job.lastRunFinishedAt ?? null,
@@ -156,13 +167,21 @@ export async function loadRepositorySchedule(db, repositoryId) {
 /**
  * 解析请求体里的备份计划输入
  *
+ * 修改点（备份计划支持 cron）：
+ * - scheduleType = 'interval' 时用 scheduleIntervalSec（固定间隔）
+ * - scheduleType = 'cron' 时用 scheduleCron（标准 5 段表达式，精确到分钟）
+ * - 表达式的合法性校验交给 scheduledJobService（它用 cron-parser 做真实解析），
+ *   这里只做「必填 + 段数」的前置检查，好给出比解析器更易懂的报错
+ *
  * @param {object} body 请求体
  * @param {object|null} existing 现有的备份计划（loadRepositorySchedule 的返回值）
- * @returns {{ enabled: boolean, intervalSec: number }}
+ * @returns {{ enabled: boolean, scheduleType: 'interval'|'cron', intervalSec: number, cronExpression: string|null }}
  */
 export function resolveScheduleInput(body, existing = null) {
   const enabledRaw = body?.scheduleEnabled ?? body?.schedule_enabled;
   const intervalRaw = body?.scheduleIntervalSec ?? body?.schedule_interval_sec;
+  const typeRaw = body?.scheduleType ?? body?.schedule_type;
+  const cronRaw = body?.scheduleCron ?? body?.schedule_cron ?? body?.scheduleCronExpression;
 
   // 未提供时：更新沿用原值，创建用默认值（默认开启 + 每 6 小时）
   const enabled =
@@ -170,11 +189,31 @@ export function resolveScheduleInput(body, existing = null) {
       ? (existing ? existing.enabled : true)
       : Boolean(enabledRaw);
 
+  const normalizedType = String(typeRaw || "").trim().toLowerCase();
+  const scheduleType =
+    normalizedType === "cron" || normalizedType === "interval"
+      ? normalizedType
+      : (existing?.scheduleType === "cron" ? "cron" : "interval");
+
+  // 沿用原值的兜底（创建时回落到默认间隔）
+  const fallbackInterval = existing?.intervalSec ?? DEFAULT_SCHEDULE_INTERVAL_SEC;
+  const fallbackCron = existing?.cronExpression ?? null;
+
+  if (scheduleType === "cron") {
+    const expression = cronRaw === undefined || cronRaw === null ? fallbackCron : String(cronRaw).trim();
+    if (!expression) {
+      throw new ValidationError("选择 cron 模式时必须填写 cron 表达式");
+    }
+    // 标准 5 段：分 时 日 月 周（与「定时任务」页一致，最小粒度为分钟）
+    const fields = expression.split(/\s+/).filter(Boolean);
+    if (fields.length !== 5) {
+      throw new ValidationError("cron 表达式必须是 5 段：分 时 日 月 周（例如 30 3 * * *）");
+    }
+    return { enabled, scheduleType, intervalSec: fallbackInterval, cronExpression: expression };
+  }
+
   if (intervalRaw === undefined || intervalRaw === null || intervalRaw === "") {
-    return {
-      enabled,
-      intervalSec: existing ? existing.intervalSec : DEFAULT_SCHEDULE_INTERVAL_SEC,
-    };
+    return { enabled, scheduleType, intervalSec: fallbackInterval, cronExpression: null };
   }
 
   const num = Number(intervalRaw);
@@ -188,31 +227,38 @@ export function resolveScheduleInput(body, existing = null) {
     );
   }
 
-  return { enabled, intervalSec };
+  return { enabled, scheduleType, intervalSec, cronExpression: null };
 }
 
 /**
  * 创建或更新仓库的备份计划行（幂等）
  *
- * - 不存在则按 interval 模式创建，首次执行时间 = now + intervalSec
+ * - 不存在则创建，首次执行时间由 scheduledJobService 按调度类型计算
  * - 已存在则只提交「确实发生变化」的字段：
- *   updateScheduledJob 在 intervalSec / enabled 变化时会重置 next_run_after，
- *   若每次保存仓库都无条件提交 intervalSec，就会把下次备份时间一直往后推
+ *   updateScheduledJob 在 scheduleType / intervalSec / cronExpression / enabled
+ *   变化时会重置 next_run_after，若每次保存仓库都无条件提交这些字段，
+ *   就会把下次备份时间一直往后推
  *
  * @param {D1Database} db
  * @param {object} params
  * @param {object} params.repoRow code_repositories 行（取 id / name / repo_identifier）
  * @param {boolean} params.enabled 是否启用定时备份
- * @param {number} params.intervalSec 备份间隔（秒）
+ * @param {'interval'|'cron'} [params.scheduleType] 调度类型，默认 interval
+ * @param {number} params.intervalSec 备份间隔（秒，interval 模式用）
+ * @param {string|null} [params.cronExpression] cron 表达式（cron 模式用）
  * @param {object|null} [params.existing] 现有备份计划，省略时内部再读一次
  * @returns {Promise<object|null>} 同步后的备份计划
  */
-export async function syncRepositoryScheduleJob(db, { repoRow, enabled, intervalSec, existing = undefined }) {
+export async function syncRepositoryScheduleJob(
+  db,
+  { repoRow, enabled, intervalSec, scheduleType = "interval", cronExpression = null, existing = undefined },
+) {
   const repositoryId = repoRow?.id;
   if (!repositoryId) return null;
 
   const taskId = buildScheduleTaskId(repositoryId);
   const name = buildScheduleName(repoRow);
+  const useCron = scheduleType === "cron";
   const current = existing === undefined ? await loadRepositorySchedule(db, repositoryId) : existing;
 
   if (!current) {
@@ -221,8 +267,10 @@ export async function syncRepositoryScheduleJob(db, { repoRow, enabled, interval
       handlerId: REPO_BACKUP_SCHEDULE_HANDLER_ID,
       name,
       description: SCHEDULE_DESCRIPTION,
-      scheduleType: "interval",
+      scheduleType: useCron ? "cron" : "interval",
+      // createScheduledJob 会按 scheduleType 只取用对应的那一个
       intervalSec,
+      cronExpression: useCron ? cronExpression : null,
       enabled,
       config: { repositoryId },
     });
@@ -230,7 +278,20 @@ export async function syncRepositoryScheduleJob(db, { repoRow, enabled, interval
   }
 
   const patch = { config: { repositoryId } };
-  if (current.intervalSec !== intervalSec) patch.intervalSec = intervalSec;
+  // 调度类型变了必须提交，否则 interval/cron 互切不生效
+  if (current.scheduleType !== (useCron ? "cron" : "interval")) {
+    patch.scheduleType = useCron ? "cron" : "interval";
+  }
+  if (useCron) {
+    if (current.cronExpression !== cronExpression) patch.cronExpression = cronExpression;
+    // 切到 cron 时即使表达式没变，也要保证 cronExpression 一起提交，
+    // 否则 updateScheduledJob 在 cron 模式下会因为 cron_expression 为空而报错
+    if (patch.scheduleType === "cron" && patch.cronExpression === undefined) {
+      patch.cronExpression = cronExpression;
+    }
+  } else if (current.intervalSec !== intervalSec || patch.scheduleType === "interval") {
+    patch.intervalSec = intervalSec;
+  }
   if (current.enabled !== enabled) patch.enabled = enabled;
   // 仓库改名后，「定时任务」页里的名字要跟着变
   patch.name = name;

@@ -28,6 +28,7 @@ export default {
       schedule: "Schedule",
       scheduleOff: "Schedule off",
       scheduleEvery: "Every {interval}",
+      scheduleCron: "cron {cron}",
       scheduleNext: "next",
       scheduleLastFailed: "last run failed",
     },
@@ -120,6 +121,18 @@ export default {
       // Per-repository backup schedule, backed by the existing scheduled-jobs mechanism
       scheduleSection: "Backup schedule",
       scheduleEnabled: "Back up on a schedule",
+      scheduleMode: "Schedule mode",
+      scheduleModeInterval: "Fixed interval",
+      scheduleModeCron: "Cron expression",
+      scheduleCron: "Cron expression",
+      scheduleCronHint:
+        "Standard 5 fields: minute hour day month weekday, minute precision. For example 30 3 * * * runs daily at 03:30",
+      cronPreset: {
+        hourly: "Every hour on the hour",
+        everySixHours: "Every 6 hours",
+        dailyEarly: "Daily at 03:30",
+        weekly: "Mondays at 04:00",
+      },
       scheduleInterval: "Interval",
       scheduleIntervalHint:
         "Checks every 6 hours by default; runs with no new version are skipped, so nothing is backed up twice",
@@ -203,6 +216,7 @@ export default {
       mountRequired: "Select at least one backup target mount",
       retentionRange: "Versions to keep must be between {min} and {max}",
       intervalRange: "The backup interval must be between {min} minutes and {max} days",
+      cronInvalid: "A cron expression must have 5 fields: minute hour day month weekday (e.g. 30 3 * * *)",
     },
 
     messages: {
