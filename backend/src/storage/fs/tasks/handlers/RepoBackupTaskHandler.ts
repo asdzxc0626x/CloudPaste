@@ -361,6 +361,9 @@ export class RepoBackupTaskHandler implements TaskHandler {
           repoIdentifier,
           trackMode,
           trackRef: trackRef ?? null,
+          // 修改点（第 1 期请求数量优化）：把本轮要解析的引用总数告诉 provider，
+          // 多分支时它会改用 1 次 /branches 批量请求代替 N 次单分支请求
+          refCount: trackRefs.length,
         });
 
         // 修改点（详情完善）：targets 记录每个目标的写入结果，供任务详情逐条展示

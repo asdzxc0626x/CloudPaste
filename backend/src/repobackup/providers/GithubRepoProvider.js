@@ -12,6 +12,13 @@
  *   识别 429 / 403+retry-after / x-ratelimit-reset，仅对 GET 重试
  * - 公开仓库无需 token；token 仅用于提高速率上限（第一阶段不支持私有仓库）
  * - 请求头复用 MasqueradeClient，与现有 GitHub 驱动保持一致
+ *
+ * 修改点（第 1 期：GitHub 请求数量优化）：
+ * 1. 多分支检测：跟踪 N 个分支时，原先是 N 次 /commits/{ref}，现改为 1 次 /branches
+ *    列表接口批量取回「分支名 -> commit sha」映射后再匹配目标分支
+ * 2. 源码下载：改用 codeload.github.com 直连，绕开 api.github.com 的 tarball 302
+ *    （原路径每次下载都要先消耗一次 API 速率额度）
+ * 这两项都不改变对外语义：逐分支的结果结构、错误隔离、去重键仍是 commitSha
  */
 
 import { BaseRepoProvider } from "./BaseRepoProvider.js";
@@ -48,6 +55,28 @@ const ARCHIVE_HEADERS_TIMEOUT_MS = 60 * 1000;
 
 /** 单次限流等待上限，超过则不再等待，直接失败并提示配置 token */
 const RATE_LIMIT_MAX_WAIT_MS = 60 * 1000;
+
+/**
+ * 分支索引（批量取分支 SHA）相关常量（修改点：第 1 期请求数量优化）
+ */
+/** GitHub /branches 单页上限，也是官方允许的最大值 */
+const BRANCH_INDEX_PER_PAGE = 100;
+/**
+ * 最多翻多少页
+ * - 前 3 页覆盖 300 个分支，足以覆盖绝大多数仓库
+ * - 超过上限时不再继续翻页，回退到「单分支查询」，行为与改造前一致
+ */
+const BRANCH_INDEX_MAX_PAGES = 3;
+
+/**
+ * codeload 直连（修改点：第 1 期源码下载优化）
+ * - 默认 api.github.com 时，归档地址直接指向 codeload.github.com
+ * - 自定义 endpoint_url（GitHub Enterprise / 自建）无法可靠推导 codeload 地址，
+ *   继续沿用原 `${apiBase}/repos/.../tarball/...` 形式，endpoint_url 语义不变
+ */
+const DEFAULT_CODELOAD_BASE = "https://codeload.github.com";
+/** 默认 API 主机名，用于判断是否可以安全切到 codeload */
+const DEFAULT_API_BASE_HOST = "api.github.com";
 
 // 说明：constants/index.js 的 ApiStatus 未定义 502/BAD_GATEWAY，
 // 为避免引用未定义常量（会静默退化成 undefined），上游失败统一使用 INTERNAL_ERROR，
@@ -89,6 +118,22 @@ export class GithubRepoProvider extends BaseRepoProvider {
     this.apiBase = (config?.endpoint_url ? String(config.endpoint_url).trim() : DEFAULT_API_BASE).replace(/\/+$/, "");
 
     this._masqueradeClient = new MasqueradeClient({ rotateIP: true, rotateUA: false });
+
+    /**
+     * 分支索引缓存（修改点：第 1 期请求数量优化）
+     * key = `${owner}/${repo}`，value = 索引状态对象（见 _getBranchIndexState）
+     *
+     * 为什么要放在实例上：provider 实例的生命周期恰好是「一次 checkRepository」
+     * 或「一次备份任务」，也就是同一个仓库的一轮处理。索引因此只在该轮内复用，
+     * 不会跨仓库串味，也不需要任何外部失效机制。
+     */
+    this._branchIndexCache = new Map();
+
+    /**
+     * tag -> commit sha 的实例内缓存（修改点：第 1 期 Release 检测优化）
+     * 同一轮处理里重复解析同一个 tag 时不再发请求
+     */
+    this._tagShaCache = new Map();
   }
 
   /**
@@ -127,16 +172,22 @@ export class GithubRepoProvider extends BaseRepoProvider {
 
   /**
    * 解析最新版本
-   * @param {{ repoIdentifier: string, trackMode: 'branch'|'release', trackRef: (string|null) }} params
+   * @param {{ repoIdentifier: string, trackMode: 'branch'|'release', trackRef: (string|null), refCount?: number }} params
+   *        refCount（修改点：第 1 期请求数量优化）本仓库一共要解析多少个引用。
+   *        调用方（checkRepository / RepoBackupTaskHandler）本来就持有完整的
+   *        trackRefs 列表，把它传进来，provider 才能判断「走批量还是走单分支」：
+   *          - refCount >= 2：批量接口 1 次请求覆盖全部分支
+   *          - refCount <= 1：维持原单分支查询（响应更小，且能拿到提交时间）
+   *        不传时按 1 处理，行为与改造前完全一致。
    * @returns {Promise<import("./BaseRepoProvider.js").RepoVersionInfo>}
    */
-  async resolveLatestVersion({ repoIdentifier, trackMode = "branch", trackRef = null }) {
+  async resolveLatestVersion({ repoIdentifier, trackMode = "branch", trackRef = null, refCount = 1 }) {
     const { owner, repo } = parseRepoIdentifier(repoIdentifier);
 
     if (trackMode === "release") {
       return await this._resolveLatestRelease(owner, repo, trackRef);
     }
-    return await this._resolveLatestBranchCommit(owner, repo, trackRef);
+    return await this._resolveLatestBranchCommit(owner, repo, trackRef, refCount);
   }
 
   /**
@@ -151,8 +202,10 @@ export class GithubRepoProvider extends BaseRepoProvider {
 
     // 直接用 commitSha 取归档，保证「解析到的版本」与「下载到的内容」严格一致
     // （若期间分支有新提交，用分支名会下载到不一致的内容）
+    // 修改点（第 1 期源码下载优化）：归档地址改由 _buildArchiveUrl 构造，
+    // 默认走 codeload.github.com 直连，不再经过 api.github.com 的 tarball 302
     const archiveRef = commitSha || ref;
-    const url = this._applyGhProxy(`${this.apiBase}/repos/${owner}/${repo}/tarball/${encodeURIComponent(archiveRef)}`);
+    const url = this._applyGhProxy(this._buildArchiveUrl(owner, repo, archiveRef));
 
     const resp = await this._fetchWithRetry(
       url,
@@ -194,14 +247,48 @@ export class GithubRepoProvider extends BaseRepoProvider {
 
   /**
    * branch 模式：取分支最新 commit
+   *
+   * 修改点（第 1 期请求数量优化）：
+   * 跟踪多个分支时先用 /branches 列表接口批量建立索引，再从中匹配目标分支，
+   * 把「N 个分支 N 次请求」压成「1 次请求（必要时翻页）」。
+   * 索引里找不到该分支时（可能超出分页上限，也可能确实不存在）回退到
+   * _fetchBranchCommit，保证 404 等错误语义与改造前完全一致。
+   *
+   * @param {number} refCount 本仓库要解析的引用总数
    * @private
    */
-  async _resolveLatestBranchCommit(owner, repo, branch) {
+  async _resolveLatestBranchCommit(owner, repo, branch, refCount = 1) {
     const ref = String(branch || "").trim();
     if (!ref) {
       throw new ValidationError("branch 模式必须指定分支名");
     }
 
+    // 只在「确实要解析多个分支」时才走批量。
+    // 单分支仍走原来的 /commits/{ref}：请求数一样是 1 次，但响应体更小，
+    // 且能拿到提交时间（/branches 列表不返回该字段），单分支仓库零行为变化。
+    if (Number(refCount) >= 2) {
+      const hit = await this._lookupBranchInIndex(owner, repo, ref);
+      if (hit) {
+        return {
+          refType: "branch",
+          ref,
+          commitSha: hit.commitSha,
+          version: `${ref}@${hit.commitSha.slice(0, 7)}`,
+          // /branches 列表接口不返回提交时间，批量路径下该字段为 null
+          //（该字段仅用于 manifest 与检查结果展示，前端不渲染）
+          publishedAt: null,
+        };
+      }
+    }
+
+    return await this._fetchBranchCommit(owner, repo, ref);
+  }
+
+  /**
+   * 单分支查询：取指定分支的最新 commit（改造前的原始实现，原样保留）
+   * @private
+   */
+  async _fetchBranchCommit(owner, repo, ref) {
     const url = `${this.apiBase}/repos/${owner}/${repo}/commits/${encodeURIComponent(ref)}`;
     const data = await this._fetchJson(url);
 
@@ -224,6 +311,109 @@ export class GithubRepoProvider extends BaseRepoProvider {
       version: `${ref}@${commitSha.slice(0, 7)}`,
       publishedAt: committedAt ? new Date(committedAt).toISOString() : null,
     };
+  }
+
+  /**
+   * 取（或初始化）某仓库的分支索引状态（修改点：第 1 期请求数量优化）
+   * @private
+   */
+  _getBranchIndexState(owner, repo) {
+    const key = `${owner}/${repo}`;
+    let state = this._branchIndexCache.get(key);
+    if (!state) {
+      state = {
+        /** @type {Map<string, {commitSha: string}>} 分支名 -> commit 信息 */
+        entries: new Map(),
+        /** 已加载的页数 */
+        loadedPages: 0,
+        /** 已确认没有下一页 */
+        exhausted: false,
+        /** 索引构建失败，本实例内不再重试，直接走单分支查询 */
+        unavailable: false,
+      };
+      this._branchIndexCache.set(key, state);
+    }
+    return state;
+  }
+
+  /**
+   * 在分支索引里查找目标分支，必要时按需翻页
+   *
+   * 分页策略（修改点：第 1 期请求数量优化）：
+   * - 懒加载：只有当前页没命中且还有下一页时才继续请求下一页，
+   *   因此绝大多数仓库（<=100 个分支）固定只花 1 次请求
+   * - 翻页上限 BRANCH_INDEX_MAX_PAGES，超过则放弃并回退单分支查询，
+   *   避免在分支极多的仓库上为了 1 个分支翻十几页，反而比改造前更费请求
+   *
+   * @returns {Promise<{commitSha: string}|null>} null 表示索引无法回答，调用方应回退
+   * @private
+   */
+  async _lookupBranchInIndex(owner, repo, ref) {
+    const state = this._getBranchIndexState(owner, repo);
+    if (state.unavailable) return null;
+
+    const cached = state.entries.get(ref);
+    if (cached) return cached;
+
+    while (!state.exhausted && state.loadedPages < BRANCH_INDEX_MAX_PAGES) {
+      const ok = await this._loadNextBranchPage(owner, repo, state);
+      // 加载失败：标记索引不可用并回退单分支查询。
+      // 这里刻意不把错误直接抛给调用方，是为了保住原有的错误隔离语义——
+      // 每个分支应当各自拿到属于自己的错误，而不是共享一个索引级错误。
+      if (!ok) return null;
+
+      const hit = state.entries.get(ref);
+      if (hit) return hit;
+    }
+
+    return null;
+  }
+
+  /**
+   * 加载分支索引的下一页（修改点：第 1 期请求数量优化）
+   * @returns {Promise<boolean>} 是否成功加载（失败时把索引标记为不可用）
+   * @private
+   */
+  async _loadNextBranchPage(owner, repo, state) {
+    const page = state.loadedPages + 1;
+    const url =
+      `${this.apiBase}/repos/${owner}/${repo}/branches` +
+      `?per_page=${BRANCH_INDEX_PER_PAGE}&page=${page}`;
+
+    let list = null;
+    try {
+      list = await this._fetchJson(url);
+    } catch (error) {
+      state.unavailable = true;
+      console.warn(
+        `[GithubRepoProvider] 分支列表拉取失败，本次回退单分支查询: ${url} - ${error?.message || error}`,
+      );
+      return false;
+    }
+
+    if (!Array.isArray(list)) {
+      // 响应不是数组（异常响应体）时同样按不可用处理
+      state.unavailable = true;
+      return false;
+    }
+
+    state.loadedPages = page;
+    // 返回条数不足一页 => 已经是最后一页
+    if (list.length < BRANCH_INDEX_PER_PAGE) {
+      state.exhausted = true;
+    }
+
+    for (const item of list) {
+      const name = item?.name ? String(item.name) : null;
+      const sha = item?.commit?.sha ? String(item.commit.sha) : null;
+      if (!name || !sha) continue;
+      // 同名分支以先出现者为准
+      if (!state.entries.has(name)) {
+        state.entries.set(name, { commitSha: sha });
+      }
+    }
+
+    return true;
   }
 
   /**
@@ -310,9 +500,17 @@ export class GithubRepoProvider extends BaseRepoProvider {
   /**
    * 把 tag 名解析为 commit sha
    * - tag 可能是 lightweight tag（直接指向 commit）或 annotated tag（指向 tag 对象）
+   *
+   * 修改点（第 1 期 Release 检测优化）：同一轮处理内缓存解析结果。
+   * releases/latest 本身不返回 commit sha（只有 tag_name），必须再发一次请求解析；
+   * 当同一个 tag 在一轮里被解析多次时（重试、多目标补写等），直接复用缓存结果。
    * @private
    */
   async _resolveTagCommitSha(owner, repo, tagName) {
+    const cacheKey = `${owner}/${repo}#${tagName}`;
+    const cached = this._tagShaCache.get(cacheKey);
+    if (cached) return cached;
+
     const url = `${this.apiBase}/repos/${owner}/${repo}/commits/${encodeURIComponent(tagName)}`;
     const data = await this._fetchJson(url);
 
@@ -325,7 +523,46 @@ export class GithubRepoProvider extends BaseRepoProvider {
         details: { url },
       });
     }
+
+    this._tagShaCache.set(cacheKey, commitSha);
     return commitSha;
+  }
+
+  /**
+   * 构造源码归档地址（修改点：第 1 期源码下载优化）
+   *
+   * 原实现请求 `${apiBase}/repos/{owner}/{repo}/tarball/{ref}`：
+   * api.github.com 会先计一次速率额度再 302 跳到 codeload。
+   * 多备份目标时每个目标各下载一次，等于每次备份白烧 N 次 API 额度。
+   * 直连 codeload 可以完全绕开 API 额度，同时省掉一次 302 往返。
+   *
+   * endpoint_url 语义保持不变：
+   * - 默认（api.github.com）        -> https://codeload.github.com/{owner}/{repo}/tar.gz/{ref}
+   * - 自定义（GHE / 自建 / 反代）   -> 仍走原 `${apiBase}/repos/.../tarball/...`，
+   *   因为无法从 API 地址可靠推导出该实例的 codeload 地址，不能擅自猜测
+   *
+   * @private
+   */
+  _buildArchiveUrl(owner, repo, archiveRef) {
+    const encodedRef = encodeURIComponent(archiveRef);
+    if (this._isDefaultApiBase()) {
+      return `${DEFAULT_CODELOAD_BASE}/${owner}/${repo}/tar.gz/${encodedRef}`;
+    }
+    return `${this.apiBase}/repos/${owner}/${repo}/tarball/${encodedRef}`;
+  }
+
+  /**
+   * 判断当前 API 地址是否就是官方 api.github.com
+   * @private
+   */
+  _isDefaultApiBase() {
+    if (this.apiBase === DEFAULT_API_BASE) return true;
+    try {
+      return new URL(this.apiBase).host.toLowerCase() === DEFAULT_API_BASE_HOST;
+    } catch {
+      // 地址无法解析时按「非默认」处理，走原来的 tarball 路径更安全
+      return false;
+    }
   }
 
   /**

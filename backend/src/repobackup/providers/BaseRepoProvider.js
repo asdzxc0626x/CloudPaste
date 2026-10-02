@@ -46,7 +46,13 @@ export class BaseRepoProvider {
 
   /**
    * 解析仓库当前的最新版本
-   * @param {{ repoIdentifier: string, trackMode: 'branch'|'release', trackRef: (string|null) }} _params
+   *
+   * 修改点（第 1 期请求数量优化）：新增可选参数 refCount。
+   * 调用方本来就持有完整的 trackRefs 列表，把它传进来后，支持批量接口的 provider
+   * 可以用「一次请求覆盖多个引用」代替「每个引用一次请求」；
+   * 不传时按 1 处理，行为与改造前一致。
+   *
+   * @param {{ repoIdentifier: string, trackMode: 'branch'|'release', trackRef: (string|null), refCount?: number }} _params
    * @returns {Promise<RepoVersionInfo>}
    */
   async resolveLatestVersion(_params) {
