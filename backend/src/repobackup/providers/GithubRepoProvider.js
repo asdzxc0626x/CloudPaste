@@ -54,7 +54,6 @@ import {
   readScopeStates,
   resolveScopeState,
   isScopeBlocked,
-  scopeRecoverAtMs,
   markScopeCooldown,
   runCoalesced,
   ANONYMOUS_SCOPE_ID,
@@ -853,8 +852,8 @@ export class GithubRepoProvider extends BaseRepoProvider {
     for (let attempt = 1; attempt <= RETRY_MAX_ATTEMPTS; attempt += 1) {
       // 修改点（第 3 期 3-B）：每一次尝试都重新挑一次 Token / 代理。
       // 「动态组合」的意义就在这里：上一次把某个 Token 打到限流，下一次会自然换一个。
-      // 这一步可能直接抛 RateLimitedError（凭据池整体不可用），同样交给第 2 期的延迟重试流程。
-      const credential = await this._pickCredential({ strict: gated, url });
+      // 修改点（第 3 期 3-B 回退规则）：挑不到凭据时返回匿名，不再抛 RateLimitedError。
+      const credential = await this._pickCredential();
       const targetUrl = this._applyCredentialProxy(url, { proxy: credential.proxy, apiRequest: gated });
 
       // 修改点（第 3 期）：发起前先过调度器——
@@ -929,6 +928,19 @@ export class GithubRepoProvider extends BaseRepoProvider {
 
       if (resp.status === 404) {
         await this._discardBody(resp);
+
+        // 修改点（第 3 期 3-B 回退规则）：
+        // 本次是「配置了凭据但它们此刻全都不可用」而被迫降级成匿名发出去的。
+        // 这种情况下 404 极可能只是匿名看不见私有仓库，而不是仓库真的不存在 ——
+        // 按暂时性错误重试（等凭据恢复），避免第 2 期刚消除的
+        // 「私有仓库被记成永久失败」重新出现。
+        if (!credential.token && (hasConfiguredEntries(this._repoPool, POOL_TOKEN_KEY) || hasConfiguredEntries(this._globalPool, POOL_TOKEN_KEY))) {
+          throw new TransientError(
+            "GitHub 资源不可见（本次以匿名身份请求，配置的 Token 暂时都不可用，稍后重试）",
+            { retryAfterMs: RETRY_BASE_DELAY_MS, details: { url, reason: "anonymous-fallback" } },
+          );
+        }
+
         throw new NotFoundError("GitHub 资源不存在（仓库、分支或版本不存在，或仓库为私有）", { url });
       }
 
@@ -1075,18 +1087,22 @@ export class GithubRepoProvider extends BaseRepoProvider {
    *
    * 优先级（与需求一致）：
    *   仓库级 Token/代理  ->  全局池  ->  匿名
+   *
+   * 回退语义（修改点：第 3 期 3-B 回退规则确认）：
+   * - 仓库自己配了就**只用仓库级的**：只要仓库级还有一条可用，就一定选它，绝不掺入全局的
+   *   （由 _rotatePick 的 repository 优先保证）
+   * - 仓库级此刻全部不可用（限流 / 冷却 / 失效）才回退到全局池
+   * - 全局池也不可用就降级为匿名，**不再延迟等待**：匿名额度由调度器的账本单独把关，
+   *   真的没额度时 acquire 仍会抛 RateLimitedError，所以这里没必要再造一个「池全灭就停摆」的状态
+   *
    * Token 与代理**各自独立挑选**，不固定绑定，可以随时组合出不同的搭配。
    *
-   * 两种严格模式：
-   * - strict=true（API 请求）：仓库自己配了 Token 却全部暂时不可用时**延迟重试**，
-   *   而不是悄悄降级成匿名 —— 否则私有仓库会拿到 404 并被记成永久失败，
-   *   这正是第 2 期花力气消除的那类误判。
-   * - strict=false（源码下载）：挑得到就用、挑不到就直连。公开仓库不带 Token
-   *   也能下载，不该因为 Token 都被限流就把下载也卡住。
+   * 降级成匿名时如果打到私有仓库会拿到 404，那个误判由 _fetchWithRetry 里的
+   * 「被迫匿名」判断单独兜住，不在这里处理。
    *
    * @private
    */
-  async _pickCredential({ strict = true, url = "" } = {}) {
+  async _pickCredential() {
     await this._ensureCredentialPools();
 
     const nowMs = Date.now();
@@ -1118,31 +1134,10 @@ export class GithubRepoProvider extends BaseRepoProvider {
         token = picked.entry.value;
         tokenScopeId = picked.scopeId;
         tokenSource = picked.source;
-      } else if (strict && hasConfiguredEntries(this._repoPool, POOL_TOKEN_KEY)) {
-        // 仓库级配置了 Token，但仓库级与全局级此刻都不可用：
-        // 等到最早的一个恢复再试，而不是降级成匿名赌一把
-        const recoverAtMs = tokenCandidates.reduce(
-          (acc, candidate) =>
-            Math.max(acc, scopeRecoverAtMs(resolveScopeState(states, buildQuotaScopeId(candidate.entry.value)))),
-          0,
-        );
-        throw new RateLimitedError(
-          `GitHub 凭据池当前全部不可用（共 ${tokenCandidates.length} 个 Token，均在限流或冷却中），本次未发送请求，等待最早可用的那个恢复`,
-          {
-            retryAtMs: recoverAtMs > nowMs ? recoverAtMs + 5000 : nowMs + 60 * 1000,
-            retryAfterMs: recoverAtMs > nowMs ? recoverAtMs - nowMs + 5000 : 60 * 1000,
-            details: {
-              url,
-              source: "github-credential-pool",
-              candidateCount: tokenCandidates.length,
-              // 只报数量与恢复时间，绝不报是哪些凭据
-              recoverAtMs: recoverAtMs || null,
-            },
-          },
-        );
       }
-      // 其余情况（只配了全局池且全不可用）：退回匿名。
-      // 全局池的状态不应该让一个本来用匿名就能工作的公开仓库变成失败。
+      // 修改点（第 3 期 3-B 回退规则）：仓库级与全局级此刻都不可用时，
+      // 保持 token = null（匿名）继续发请求，而不是延迟重试。
+      // 匿名额度的把关交给调度器账本：真的用完了 acquire 会抛 RateLimitedError。
     }
 
     // ---------- 代理 ----------
