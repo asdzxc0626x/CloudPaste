@@ -13,6 +13,10 @@ import {
 } from "../../../../repobackup/config.js";
 import { planBackupPaths } from "../../../../repobackup/paths.js";
 import { pruneOldVersions, describePruneResult } from "../../../../repobackup/retention.js";
+// 修改点（第 2 期 错误分类 + 延迟重试）：
+// 限流/暂时性故障不记失败，而是算出「最早可重试时间」交给调度层
+import { planRetryForError, describeRetryAt, describeErrorKind } from "../../../../repobackup/errors.js";
+import { deferRepositoryBackupSchedule } from "../../../../repobackup/schedule.js";
 
 /**
  * 代码仓库备份任务（修改点：新增功能）
@@ -40,6 +44,14 @@ import { pruneOldVersions, describePruneResult } from "../../../../repobackup/re
  *   的复杂度很高，容易把"单目标失败"放大成"整次备份失败"。逐个拉取的代价是
  *   多目标时 GitHub 侧流量放大 N 倍，换来的是内存可控、目标间故障完全隔离，
  *   以及重跑时只补写缺失目标（已成功的目标不会重复拉取）。
+ *
+ * 修改点（第 2 期：限流错误分类 + 延迟重试）：
+ * - 上游错误先分类（repobackup/errors.js）：限流 / 暂时性 / 永久性
+ * - 限流与暂时性错误**不算失败**：不写失败历史、不累计失败数、不抛异常
+ *   （抛异常会让 Workflows 步骤与 Node 任务被判失败，还会触发无意义的重试）
+ * - 只记下「最早可重试时间」，收尾时把它写进该仓库既有 scheduled_jobs 行的
+ *   next_run_after，由调度层到点自动重跑
+ * - 永久性错误（仓库/分支不存在等）行为不变，照旧记 failed
  */
 
 type RepoBackupPayload = {
@@ -288,6 +300,34 @@ export class RepoBackupTaskHandler implements TaskHandler {
     let totalBytes = 0;
     let bytesTransferred = 0;
 
+    /**
+     * 本轮出现过的「可延迟重试」错误（修改点：第 2 期 限流 = 延迟，不是失败）
+     *
+     * 只保留最早的那个重试时间：一处限流就说明额度已经打满，整轮都该按
+     * 最早的时间重来，而不是每个分支各排一个时间。
+     *
+     * 注意：必须声明在 report() 之前 —— report 会在循环开始前就被调用一次，
+     * 而它引用了这几个变量。
+     */
+    let deferredRetryAtMs: number | null = null;
+    let deferredKind: string | null = null;
+    let deferredMessage: string | null = null;
+
+    /**
+     * 记录一次错误；若属于可延迟重试类别则返回延迟计划，否则返回 null
+     * （永久性错误仍然走原来的「记失败」路径）
+     */
+    const noteDeferral = (error: unknown) => {
+      const plan = planRetryForError(error);
+      if (!plan.deferrable || plan.retryAtMs === null) return null;
+      if (deferredRetryAtMs === null || plan.retryAtMs < deferredRetryAtMs) {
+        deferredRetryAtMs = plan.retryAtMs;
+        deferredKind = plan.kind;
+        deferredMessage = plan.message;
+      }
+      return plan;
+    };
+
     // 修改点（任务卡住排查 / 详情完善）：当前执行阶段与目标，让「任务管理」能看出卡在哪一步
     let currentStage: BackupStage = "preparing";
     let currentRef: string | null = null;
@@ -311,6 +351,9 @@ export class RepoBackupTaskHandler implements TaskHandler {
           currentTargetPath: currentTarget.mountPath,
           repositoryId: repoRow.id,
           repoIdentifier,
+          // 修改点（第 2 期 延迟重试）：本轮被推迟时的重试时间。
+          // 前端不渲染该字段，放在 stats 里是为了任务详情能直接看出「为什么没备份」。
+          deferRetryAt: deferredRetryAtMs ? describeRetryAt(deferredRetryAtMs) : null,
           targetCount: mounts.length,
           targetMounts: mounts.map((m) => ({
             id: m.id,
@@ -347,6 +390,8 @@ export class RepoBackupTaskHandler implements TaskHandler {
 
       const refStartedMs = Date.now();
       let backupId: string | null = null;
+      /** 本引用内出现的可延迟重试错误（修改点：第 2 期），决定这个引用记「失败」还是「已安排重试」 */
+      let refDeferral: ReturnType<typeof noteDeferral> = null;
 
       try {
         if (await context.isCancelled(job.jobId)) {
@@ -630,11 +675,22 @@ export class RepoBackupTaskHandler implements TaskHandler {
             guard.dispose();
             // 单个目标失败不影响其他目标；下次运行会自动补写
             const message = String(targetError?.message || targetError || "未知错误");
-            targetErrors.push(`${mount.name || mount.mount_path}: ${message}`);
+
+            // 修改点（第 2 期 错误分类）：先判断这个目标的失败是不是「限流 / 暂时性」。
+            // 是的话本轮不能以失败收尾——目标行记 skipped（而不是 failed），
+            // 并记下重试时间，由本轮收尾统一把延迟交给调度层。
+            const targetDeferral = noteDeferral(targetError);
+            if (targetDeferral && !refDeferral) refDeferral = targetDeferral;
+
+            targetErrors.push(
+              targetDeferral
+                ? `${mount.name || mount.mount_path}: 已延迟重试（${describeErrorKind(targetDeferral.kind)}）${message}`
+                : `${mount.name || mount.mount_path}: ${message}`,
+            );
 
             if (targetSummary) {
-              targetSummary.status = "failed";
-              targetSummary.error = message;
+              targetSummary.status = targetDeferral ? "skipped" : "failed";
+              targetSummary.error = targetDeferral ? `已安排自动重试：${message}` : message;
             }
 
             await codeRepo
@@ -643,7 +699,7 @@ export class RepoBackupTaskHandler implements TaskHandler {
                 backup_id: backupId,
                 mount_id: mount.id,
                 mount_path: mount.mount_path,
-                status: "failed",
+                status: targetDeferral ? "skipped" : "failed",
                 error_message: message,
               })
               .catch((e: any) =>
@@ -651,7 +707,7 @@ export class RepoBackupTaskHandler implements TaskHandler {
               );
 
             console.error(
-              `[RepoBackupTaskHandler] 目标写入失败 (${mount.name || mount.mount_path}):`,
+              `[RepoBackupTaskHandler] 目标写入${targetDeferral ? "被推迟" : "失败"} (${mount.name || mount.mount_path}):`,
               message,
             );
             await report(processed);
@@ -674,19 +730,33 @@ export class RepoBackupTaskHandler implements TaskHandler {
         const backupWarning = targetErrors.length > 0 ? targetErrors.join("；") : null;
 
         if (!anyDone) {
-          // 所有目标都没有副本：该引用判定为失败
+          // 所有目标都没有副本
           const message = backupWarning || "所有备份目标均写入失败";
+
+          // 修改点（第 2 期 延迟重试）：写入阶段撞上限流/暂时性故障时不算失败。
+          // 记录必须离开 running（否则会挡住下一次定时备份），但绝不能写 failed，
+          // 于是记 skipped，并在 error_message 里带上自动重试时间。
           await codeRepo.updateBackup(backupId, {
-            status: "failed",
-            error_message: message,
+            status: refDeferral ? "skipped" : "failed",
+            error_message: refDeferral
+              ? `本次未能完成，已安排在 ${describeRetryAt(refDeferral.retryAtMs as number)} 自动重试：${message}`
+              : message,
             finished_at: finishedAt,
           });
 
-          itemResult.status = "failed";
-          itemResult.error = message;
+          itemResult.status = refDeferral ? "skipped" : "failed";
+          if (refDeferral) {
+            itemResult.message = `已延迟重试（${describeErrorKind(refDeferral.kind)}，重试时间 ${describeRetryAt(refDeferral.retryAtMs as number)}）：${message}`;
+          } else {
+            itemResult.error = message;
+          }
           itemResult.durationMs = Date.now() - refStartedMs;
-          outcomes.push({ ref: version.ref ?? trackRef ?? null, status: "failed", error: message });
-          if (!firstError) firstError = new Error(message);
+          outcomes.push({
+            ref: version.ref ?? trackRef ?? null,
+            status: refDeferral ? "skipped" : "failed",
+            error: refDeferral ? undefined : message,
+          });
+          if (!refDeferral && !firstError) firstError = new Error(message);
           processed += 1;
           await report(processed);
           continue;
@@ -768,56 +838,97 @@ export class RepoBackupTaskHandler implements TaskHandler {
             `（本次写入 ${successTargets}/${missingMounts.length}，目标副本 ${doneCount}/${mounts.length}）`,
         );
       } catch (error: any) {
-        const cancelled = String(error?.message || "").toLowerCase() === "cancelled";
+        // 修改点（第 2 期 错误分类）：先排除「任务被取消」。
+        // 传输停滞看门狗触发的 abort 现在被归类为「暂时性错误」，如果任务其实已经
+        // 被取消，就不能按可重试处理，否则会安排一次没人想要的延迟重试。
+        const cancelled =
+          String(error?.message || "").toLowerCase() === "cancelled" ||
+          (await Promise.resolve(context.isCancelled(job.jobId)).catch(() => false));
         const message = cancelled ? "备份已取消" : String(error?.message || error || "未知错误");
 
-        if (backupId) {
-          await codeRepo
-            .updateBackup(backupId, {
-              status: cancelled ? "skipped" : "failed",
-              error_message: message,
-              finished_at: nowIso(),
-            })
-            .catch((e: any) => console.warn("[RepoBackupTaskHandler] 更新备份记录失败:", e?.message || e));
+        // 修改点（第 2 期 限流 = 延迟，不是失败）：
+        // 限流 / 超时 / 5xx 这类错误会自己好，既不该写进失败历史，也不该累计失败数，
+        // 只记下「最早可以重试的时间」，本轮结束后交给调度层安排延迟重试。
+        const deferral = cancelled ? null : noteDeferral(error);
+
+        if (deferral) {
+          const retryAtText = describeRetryAt(deferral.retryAtMs as number);
+
+          if (backupId) {
+            // 已经建好的记录不能留在 running（会永久挡住下一次定时备份），
+            // 但绝不能写 failed —— 记 skipped，表示「本次没备份，已安排重试」
+            await codeRepo
+              .updateBackup(backupId, {
+                status: "skipped",
+                error_message: `本次未能完成，已安排在 ${retryAtText} 自动重试：${message}`,
+                finished_at: nowIso(),
+              })
+              .catch((e: any) =>
+                console.warn("[RepoBackupTaskHandler] 更新延迟记录失败:", e?.message || e),
+              );
+          }
+          // 解析版本阶段就延迟时，原本会补一条失败留痕（见下方 else 分支）。
+          // 这里刻意不写任何记录：限流不是失败，写进备份历史只会污染它。
+
+          itemResult.status = "skipped";
+          itemResult.message = `已延迟重试（${describeErrorKind(deferral.kind)}，重试时间 ${retryAtText}）：${message}`;
+          itemResult.durationMs = Date.now() - refStartedMs;
+
+          outcomes.push({ ref: trackRef ?? null, status: "skipped", error: undefined });
+
+          // 不写 last_error：限流不是这个仓库的问题，留给收尾统一写「已安排重试」的说明
+          console.warn(
+            `[RepoBackupTaskHandler] 备份被推迟: ${repoIdentifier}@${trackRef || ""} ${itemResult.message}`,
+          );
         } else {
-          // 修改点（历史记录需显示失败记录）：
-          // 解析版本阶段就失败时（限流、网络不通、分支不存在）原本一条记录都不会写，
-          // 备份历史里因此永远只看到成功的版本。这里补一条失败留痕，
-          // commit_sha 用占位值绕过 NOT NULL + 唯一索引，DTO 读取时会还原为 null。
+          if (backupId) {
+            await codeRepo
+              .updateBackup(backupId, {
+                status: cancelled ? "skipped" : "failed",
+                error_message: message,
+                finished_at: nowIso(),
+              })
+              .catch((e: any) => console.warn("[RepoBackupTaskHandler] 更新备份记录失败:", e?.message || e));
+          } else {
+            // 修改点（历史记录需显示失败记录）：
+            // 解析版本阶段就失败时（限流、网络不通、分支不存在）原本一条记录都不会写，
+            // 备份历史里因此永远只看到成功的版本。这里补一条失败留痕，
+            // commit_sha 用占位值绕过 NOT NULL + 唯一索引，DTO 读取时会还原为 null。
+            await codeRepo
+              .createBackup({
+                id: generateId("bk"),
+                repository_id: repoRow.id,
+                ref_type: trackMode === "branch" ? "branch" : "tag",
+                ref: trackRef ?? null,
+                commit_sha: buildUnresolvedCommitSha(),
+                version: null,
+                status: cancelled ? "skipped" : "failed",
+                job_id: job.jobId,
+                error_message: message,
+                started_at: new Date(refStartedMs).toISOString(),
+                finished_at: nowIso(),
+              })
+              .catch((e: any) => console.warn("[RepoBackupTaskHandler] 写入失败留痕记录出错:", e?.message || e));
+          }
+
           await codeRepo
-            .createBackup({
-              id: generateId("bk"),
-              repository_id: repoRow.id,
-              ref_type: trackMode === "branch" ? "branch" : "tag",
-              ref: trackRef ?? null,
-              commit_sha: buildUnresolvedCommitSha(),
-              version: null,
-              status: cancelled ? "skipped" : "failed",
-              job_id: job.jobId,
-              error_message: message,
-              started_at: new Date(refStartedMs).toISOString(),
-              finished_at: nowIso(),
-            })
-            .catch((e: any) => console.warn("[RepoBackupTaskHandler] 写入失败留痕记录出错:", e?.message || e));
+            .updateRepository(repoRow.id, { last_error: message })
+            .catch((e: any) => console.warn("[RepoBackupTaskHandler] 更新仓库状态失败:", e?.message || e));
+
+          itemResult.status = cancelled ? "skipped" : "failed";
+          itemResult.error = message;
+          itemResult.durationMs = Date.now() - refStartedMs;
+
+          outcomes.push({
+            ref: trackRef ?? null,
+            status: cancelled ? "skipped" : "failed",
+            error: message,
+          });
+
+          if (!cancelled && !firstError) firstError = error;
+
+          console.error(`[RepoBackupTaskHandler] 备份失败: ${repoIdentifier}@${trackRef || ""}`, message);
         }
-
-        await codeRepo
-          .updateRepository(repoRow.id, { last_error: message })
-          .catch((e: any) => console.warn("[RepoBackupTaskHandler] 更新仓库状态失败:", e?.message || e));
-
-        itemResult.status = cancelled ? "skipped" : "failed";
-        itemResult.error = message;
-        itemResult.durationMs = Date.now() - refStartedMs;
-
-        outcomes.push({
-          ref: trackRef ?? null,
-          status: cancelled ? "skipped" : "failed",
-          error: message,
-        });
-
-        if (!cancelled && !firstError) firstError = error;
-
-        console.error(`[RepoBackupTaskHandler] 备份失败: ${repoIdentifier}@${trackRef || ""}`, message);
       }
 
       processed += 1;
@@ -829,12 +940,43 @@ export class RepoBackupTaskHandler implements TaskHandler {
       }
     }
 
+    // ---------- 4. 延迟重试收尾（修改点：第 2 期 限流 = 延迟，不是失败）----------
+    //
+    // 走到这里说明本轮至少有一处撞上了限流/暂时性故障。此时：
+    // - 不写任何失败记录（上面已经处理过）
+    // - 把该仓库的备份计划提前到「最早可重试时间」，让调度层到点自动重跑，
+    //   而不是白等一个完整周期（默认 6 小时）
+    // - 函数正常返回、不抛异常：这样 Workflows 的 execute-task 步骤不会被判定失败，
+    //   Node 侧的任务也不会被标 failed —— 下一次执行完全由调度器按 next_run_after 决定
+    if (deferredRetryAtMs !== null) {
+      const retryAtText = describeRetryAt(deferredRetryAtMs);
+      const kindText = describeErrorKind(deferredKind || "");
+      const note = `${kindText}，本次未备份，已安排在 ${retryAtText} 自动重试：${deferredMessage || ""}`;
+
+      // 只前移、不后移，也不会碰 schedule_type / interval_sec / enabled 等其他字段；
+      // 仓库未启用定时备份时返回 false，这种情况下只能由管理员手动重试
+      const moved = await deferRepositoryBackupSchedule(db, repoRow.id, retryAtText);
+
+      await codeRepo
+        .updateRepository(repoRow.id, { last_error: note })
+        .catch((e: any) =>
+          console.warn("[RepoBackupTaskHandler] 更新仓库延迟状态失败:", e?.message || e),
+        );
+
+      console.warn(
+        `[RepoBackupTaskHandler] ${repoIdentifier} 本轮被推迟：${note}` +
+          `（${moved ? "已提前备份计划" : "该仓库未启用定时备份，需手动重试"}）`,
+      );
+    }
+
     currentStage = "finished";
     currentRef = null;
     currentTarget = { name: null, mountPath: null };
     await report(processed, { durationMs: Date.now() - startedMs });
 
     // 全部引用都失败时向上抛出，让任务被标记为失败（部分失败按成功结束，便于重试单条）
+    // 修改点（第 2 期）：被推迟的引用记为 skipped 而不是 failed，因此
+    // 「整轮都是限流」不会被判成失败 —— 它已经交给调度层安排了延迟重试。
     const failedCount = outcomes.filter((o) => o.status === "failed").length;
     if (failedCount > 0 && failedCount === outcomes.length) {
       throw firstError || new Error("全部备份引用均失败");

@@ -19,12 +19,22 @@
  * 2. 源码下载：改用 codeload.github.com 直连，绕开 api.github.com 的 tarball 302
  *    （原路径每次下载都要先消耗一次 API 速率额度）
  * 这两项都不改变对外语义：逐分支的结果结构、错误隔离、去重键仍是 commitSha
+ *
+ * 修改点（第 2 期：错误分类 + 延迟重试）：
+ * 抛出的错误带上「类别」与「可重试时间」，供调用方区分处理：
+ * - RateLimitedError  429 / 403 且 x-ratelimit-remaining=0 -> 延迟到额度恢复再跑，不记失败
+ * - TransientError    超时 / 连接重置 / 5xx / 传输停滞      -> 短退避后重试，不记失败
+ * - 其余（NotFoundError / AppError）为永久性错误            -> 照旧记失败
+ * 具体分类规则见 repobackup/errors.js。
  */
 
 import { BaseRepoProvider } from "./BaseRepoProvider.js";
 import { ApiStatus } from "../../constants/index.js";
 import { AppError, NotFoundError, ValidationError } from "../../http/errors.js";
 import { MasqueradeClient } from "../../utils/httpMasquerade.js";
+// 修改点（第 2 期 错误分类）：上游错误不再一律抛 AppError，而是按
+// 「限流 / 暂时性」分类抛出并带上可重试时间，供调用方安排延迟重试而不是记失败
+import { RateLimitedError, TransientError } from "../errors.js";
 
 const DEFAULT_API_BASE = "https://api.github.com";
 const RETRY_MAX_ATTEMPTS = 3;
@@ -53,7 +63,14 @@ const API_TIMEOUT_MS = 30 * 1000;
  */
 const ARCHIVE_HEADERS_TIMEOUT_MS = 60 * 1000;
 
-/** 单次限流等待上限，超过则不再等待，直接失败并提示配置 token */
+/**
+ * 单次限流等待上限
+ *
+ * 修改点（第 2 期 错误分类）：超过这个上限时不再「放弃等待并直接判失败」，
+ * 而是抛出 RateLimitedError（带恢复时间），由调度层安排延迟重试。
+ * 这个上限只是「本次请求内愿意干等多久」，不是「重试与否」的分界线——
+ * 在 Worker 里睡一小时既会触发超时，也看不出任务到底卡在哪。
+ */
 const RATE_LIMIT_MAX_WAIT_MS = 60 * 1000;
 
 /**
@@ -330,6 +347,12 @@ export class GithubRepoProvider extends BaseRepoProvider {
         exhausted: false,
         /** 索引构建失败，本实例内不再重试，直接走单分支查询 */
         unavailable: false,
+        /**
+         * 索引失败的原因（修改点：第 2 期 错误分类）
+         * - 限流/暂时性故障时记在这里，后续引用直接复用同一个错误向上抛，
+         *   不再逐个回退到单分支查询（N 个分支 = N 份白烧的额度）
+         */
+        error: null,
       };
       this._branchIndexCache.set(key, state);
     }
@@ -350,7 +373,12 @@ export class GithubRepoProvider extends BaseRepoProvider {
    */
   async _lookupBranchInIndex(owner, repo, ref) {
     const state = this._getBranchIndexState(owner, repo);
-    if (state.unavailable) return null;
+    if (state.unavailable) {
+      // 修改点（第 2 期）：索引因为限流/暂时性故障建不起来时，后续引用直接复用
+      // 那个错误。否则每个分支都会回退去打一次同样被拒的请求，白白放大额度消耗。
+      if (state.error) throw state.error;
+      return null;
+    }
 
     const cached = state.entries.get(ref);
     if (cached) return cached;
@@ -384,7 +412,19 @@ export class GithubRepoProvider extends BaseRepoProvider {
     try {
       list = await this._fetchJson(url);
     } catch (error) {
+      // 修改点（第 2 期 错误分类）：限流/暂时性错误不能按「索引不可用」吞掉。
+      // 索引失败后回退到单分支查询，只会让 N 个分支各自再打一次同样被拒的请求
+      // （N 份白烧的额度、N 份重复日志），结果还是全部失败。
+      // 直接向上抛，整轮统一按「延迟重试」处理，语义反而更清晰。
+      // 注意：_fetchWithRetry 内部已经重试过 3 次，能走到这里的已经不算瞬时抖动。
+      if (error instanceof RateLimitedError || error instanceof TransientError) {
+        state.unavailable = true;
+        // 记住原因：同一实例内后续引用的查找会直接复用这个错误（见 _lookupBranchInIndex）
+        state.error = error;
+        throw error;
+      }
       state.unavailable = true;
+      state.error = null;
       console.warn(
         `[GithubRepoProvider] 分支列表拉取失败，本次回退单分支查询: ${url} - ${error?.message || error}`,
       );
@@ -712,12 +752,14 @@ export class GithubRepoProvider extends BaseRepoProvider {
       } catch (e) {
         abort.clearTimer();
 
-        // 调用方主动中止（任务取消 / 下载停滞看门狗）：重试没有意义，如实上报
+        // 调用方主动中止（任务取消 / 下载停滞看门狗）
+        // 修改点（第 2 期 错误分类）：归类为「暂时性」而不是永久失败——
+        // 传输停滞通常是上游或代理抽风，过几分钟自己会好，记 failed 反而要等一个完整周期。
+        // 真正的「任务被取消」由 handler 在捕获时用 context.isCancelled 单独识别，
+        // 不会走到这里被误判成可重试。
         if (externalSignal?.aborted) {
-          throw new AppError("GitHub 请求已中止（任务取消或传输停滞超时）", {
-            status: ApiStatus.INTERNAL_ERROR,
-            code: "REPO_BACKUP.GITHUB_REQUEST_ABORTED",
-            expose: true,
+          throw new TransientError("GitHub 请求已中止（任务取消或传输停滞超时）", {
+            retryAfterMs: RETRY_BASE_DELAY_MS,
             details: { url },
           });
         }
@@ -731,14 +773,13 @@ export class GithubRepoProvider extends BaseRepoProvider {
           continue;
         }
 
-        throw new AppError(
+        // 修改点（第 2 期 错误分类）：超时/连接重置属于「暂时性」，不再是永久失败
+        throw new TransientError(
           timedOut
             ? `GitHub 请求超时：${timeoutMs}ms 内未返回响应头（已重试 ${RETRY_MAX_ATTEMPTS} 次）`
             : "GitHub 请求失败: 网络错误",
           {
-            status: ApiStatus.INTERNAL_ERROR,
-            code: timedOut ? "REPO_BACKUP.GITHUB_REQUEST_TIMEOUT" : "REPO_BACKUP.GITHUB_REQUEST_FAILED",
-            expose: true,
+            retryAfterMs: RETRY_BASE_DELAY_MS,
             details: { url, cause: e?.message || String(e) },
           },
         );
@@ -758,35 +799,51 @@ export class GithubRepoProvider extends BaseRepoProvider {
 
       const { retryAfter, reset, remaining } = this._readRetryHeaders(resp);
       const rateLimited = resp.status === 429 || (resp.status === 403 && (retryAfter != null || remaining === 0));
-      const retryable5xx = resp.status === 502 || resp.status === 503 || resp.status === 504;
+      // 修改点（第 2 期 错误分类）：5xx 一律按「暂时性」处理。
+      // 原实现只认 502/503/504，500 等会被当成永久性错误直接记 failed。
+      const retryableServer = resp.status >= 500;
 
-      if (attempt < RETRY_MAX_ATTEMPTS && (rateLimited || (retryable5xx && canRetryNetwork))) {
+      // ------------- 限流（修改点：第 2 期 限流 = 延迟，不是失败）-------------
+      if (rateLimited) {
         const delayMs = this._computeDelayMs({
           attempt,
           retryAfterSeconds: retryAfter,
           resetEpochSeconds: reset,
         });
 
-        // 限流恢复时间太远时不再静默等待：睡一小时看起来就是「任务卡住」
-        if (delayMs > RATE_LIMIT_MAX_WAIT_MS) {
+        // 恢复时间在可等待范围内：本次请求内先睡一下再试（与改造前一致的短退避）
+        if (attempt < RETRY_MAX_ATTEMPTS && delayMs <= RATE_LIMIT_MAX_WAIT_MS) {
           await this._discardBody(resp);
-          const waitMinutes = Math.ceil(delayMs / 60000);
-          throw new AppError(
-            `GitHub API 速率受限，约 ${waitMinutes} 分钟后才恢复，已放弃等待` +
-              `（请在仓库配置里填写 GitHub Token 提高速率上限，或稍后重试）`,
-            {
-              status: ApiStatus.INTERNAL_ERROR,
-              code: "REPO_BACKUP.GITHUB_RATE_LIMITED",
-              expose: true,
-              details: { url, status: resp.status, waitMs: delayMs },
-            },
+          console.warn(
+            `[GithubRepoProvider] HTTP ${resp.status}（限流），${delayMs}ms 后第 ${attempt} 次重试: ${url}`,
           );
+          await this._sleep(delayMs);
+          continue;
         }
 
+        // 恢复时间太远（未配置 token 时最常见，reset 可能在一小时之后）：
+        // 既不能在这里静默睡一小时（看起来就是任务卡死），也不再直接判失败 ——
+        // 抛出带恢复时间的「限流错误」，由备份任务转成「延迟重试」交给调度层。
+        await this._discardBody(resp);
+        const waitMinutes = Math.max(1, Math.ceil(delayMs / 60000));
+        // 注意：这里只说事实（多久恢复），不承诺「已安排重试」——
+        // 是否安排重试由调用方决定（备份任务会，手动「检查更新」不会）
+        throw new RateLimitedError(
+          `GitHub API 速率受限，约 ${waitMinutes} 分钟后恢复` +
+            `；配置 GitHub Token 可把匿名上限 60 次/小时提高到 5000 次/小时`,
+          {
+            retryAfterMs: delayMs,
+            details: { url, status: resp.status, remaining, reset, waitMs: delayMs },
+          },
+        );
+      }
+
+      // ------------- 5xx：先按指数退避重试，耗尽后抛「暂时性」-------------
+      if (retryableServer && canRetryNetwork && attempt < RETRY_MAX_ATTEMPTS) {
+        const delayMs = this._computeDelayMs({ attempt });
         await this._discardBody(resp);
         console.warn(
-          `[GithubRepoProvider] HTTP ${resp.status}${rateLimited ? "（限流）" : ""}，` +
-            `${delayMs}ms 后第 ${attempt} 次重试: ${url}`,
+          `[GithubRepoProvider] HTTP ${resp.status}，${delayMs}ms 后第 ${attempt} 次重试: ${url}`,
         );
         await this._sleep(delayMs);
         continue;
@@ -799,8 +856,16 @@ export class GithubRepoProvider extends BaseRepoProvider {
         text = null;
       }
 
-      const hint = rateLimited ? "（GitHub API 速率受限，建议配置 token 提高上限）" : "";
-      throw new AppError(`GitHub 请求失败: HTTP ${resp.status}${hint}`, {
+      // 5xx 重试耗尽：暂时性错误（不是「仓库有问题」），让上层短时间退避后重试
+      if (retryableServer) {
+        throw new TransientError(`GitHub 服务暂时不可用: HTTP ${resp.status}`, {
+          retryAfterMs: RETRY_BASE_DELAY_MS,
+          details: { url, status: resp.status, body: text ? String(text).slice(0, 500) : null },
+        });
+      }
+
+      // 其余状态码（400/401/403 非限流/422 等）：永久性错误，照旧记失败
+      throw new AppError(`GitHub 请求失败: HTTP ${resp.status}`, {
         status: ApiStatus.INTERNAL_ERROR,
         code: "REPO_BACKUP.GITHUB_REQUEST_FAILED",
         expose: true,
@@ -809,12 +874,7 @@ export class GithubRepoProvider extends BaseRepoProvider {
     }
 
     // 理论上不会到达（循环内必定 return 或 throw）
-    throw new AppError("GitHub 请求失败: 超过最大重试次数", {
-      status: ApiStatus.INTERNAL_ERROR,
-      code: "REPO_BACKUP.GITHUB_REQUEST_FAILED",
-      expose: false,
-      details: { url },
-    });
+    throw new TransientError("GitHub 请求失败: 超过最大重试次数", { details: { url } });
   }
 
   /**

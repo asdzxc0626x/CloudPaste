@@ -11,6 +11,48 @@ import { recordScheduledJobRun } from "../services/scheduledJobRunService.js";
 import { CronExpressionParser } from "cron-parser";
 
 /**
+ * handler 返回的「本次延迟」下限（修改点：第 2 期 延迟重试）
+ * - 上游给出的重试时间可能是 0 或已经过去，直接落进 next_run_after 会让任务
+ *   每个 tick 都被判定为「已到期」而反复重跑，这里兜一个最小间隔
+ */
+const MIN_HANDLER_DEFER_MS = 30 * 1000;
+
+/**
+ * 解析 handler 返回值里的「本次延迟」（修改点：第 2 期 延迟重试）
+ *
+ * 背景：调度作业的 handler 有两种「本轮没真正做完，但也不算失败」的情况
+ * （例如仓库备份的上一次任务还在跑、上游限流需要等额度恢复）。
+ * 这类情况不应该白等一个完整周期，所以允许 handler 直接告诉调度器「下次什么时候来」：
+ *   - nextRunAfter: ISO 字符串，绝对时间
+ *   - deferMs:      相对当前时间的毫秒数
+ * 两者都支持，handler 按自己方便的那个返回即可；都没有时保持原有的周期计算。
+ *
+ * @param {any} handlerResult handler.run() 的返回值
+ * @returns {string|null} 覆盖用的 next_run_after（ISO 字符串），无覆盖时为 null
+ */
+function resolveNextRunOverride(handlerResult) {
+  if (!handlerResult || typeof handlerResult !== "object") return null;
+
+  const nowMs = Date.now();
+  const minAtMs = nowMs + MIN_HANDLER_DEFER_MS;
+
+  const rawIso = handlerResult.nextRunAfter;
+  if (typeof rawIso === "string" && rawIso.trim()) {
+    const parsed = new Date(rawIso);
+    if (!Number.isNaN(parsed.getTime())) {
+      return new Date(Math.max(parsed.getTime(), minAtMs)).toISOString();
+    }
+  }
+
+  const deferMs = Number(handlerResult.deferMs);
+  if (Number.isFinite(deferMs) && deferMs > 0) {
+    return new Date(Math.max(nowMs + deferMs, minAtMs)).toISOString();
+  }
+
+  return null;
+}
+
+/**
  * 尝试为指定任务获取锁
  * @param {D1Database} db
  * @param {string} taskId
@@ -41,7 +83,8 @@ async function tryAcquireLock(db, taskId, nowIso, lockTimeoutSec) {
 /**
  * 计算下一次调度计划
  * @param {any} row - scheduled_jobs 表的行
- * @param {{ status: 'success' | 'failure' | 'skipped', nowIso: string }} ctx
+ * @param {{ status: 'success' | 'failure' | 'skipped', nowIso: string, nextRunAfterOverride?: string|null }} ctx
+ *        nextRunAfterOverride（修改点：第 2 期 延迟重试）非空时直接作为下次执行时间
  * @returns {{ nextRunAfter: string | null, enabled: number, runCountDelta: number, failureCountDelta: number }}
  */
 function computeNextSchedule(row, ctx) {
@@ -72,6 +115,18 @@ function computeNextSchedule(row, ctx) {
   const nextRunCount = willIncreaseCount
     ? currentRunCount + 1
     : currentRunCount;
+
+  // 修改点（第 2 期 延迟重试）：handler 明确给出了「下次什么时候来」时以它为准，
+  // 不再按 interval/cron 推一个完整周期。用于「本轮没真正做完但也不算失败」的场景
+  // （仓库备份的上一次任务仍在跑、上游限流需要等额度恢复等）。
+  if (ctx.nextRunAfterOverride) {
+    return {
+      nextRunAfter: ctx.nextRunAfterOverride,
+      enabled: enabledNum,
+      runCountDelta: willIncreaseCount ? 1 : 0,
+      failureCountDelta: status === "failure" ? 1 : 0,
+    };
+  }
 
   // interval：基于 interval_sec 计算下一次执行时间
   if (scheduleType === "interval") {
@@ -148,7 +203,7 @@ function computeNextSchedule(row, ctx) {
  * 统一更新任务调度状态（成功/失败/跳过后）
  * @param {D1Database} db
  * @param {any} row - scheduled_jobs 行
- * @param {{ status: 'success' | 'failure' | 'skipped', nowIso: string, startedAt?: string, finishedAt?: string }} ctx
+ * @param {{ status: 'success' | 'failure' | 'skipped', nowIso: string, startedAt?: string, finishedAt?: string, nextRunAfterOverride?: string|null }} ctx
  */
 async function updateTaskSchedule(db, row, ctx) {
   const { nextRunAfter, enabled, runCountDelta, failureCountDelta } = computeNextSchedule(
@@ -324,11 +379,15 @@ export async function runDueScheduledJobs(db, env, options = {}) {
         config,
       });
       const finishedAt = new Date().toISOString();
+      // 修改点（第 2 期 延迟重试）：handler 可以返回 nextRunAfter / deferMs
+      // 来覆盖本次的 next_run_after（用于「本轮没做完但也不算失败」的推迟场景）
+      const nextRunAfterOverride = resolveNextRunOverride(handlerResult);
       await updateTaskSchedule(db, row, {
         status: "success",
         nowIso,
         startedAt,
         finishedAt,
+        nextRunAfterOverride,
       });
 
       const durationMs = Date.now() - startedMs;

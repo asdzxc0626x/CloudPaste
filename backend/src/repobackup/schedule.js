@@ -53,6 +53,21 @@ export const MAX_SCHEDULE_INTERVAL_SEC = 30 * 24 * 60 * 60;
 export const STALE_RUNNING_BACKUP_SEC = 6 * 60 * 60;
 
 /**
+ * 「上一次备份仍在进行中」时，本次调度往后推迟多久再看（修改点：第 2 期）
+ *
+ * 原实现直接按正常间隔（默认 6 小时）计算下次执行时间，意味着
+ * 「上一次还差 1 分钟跑完」也要白等 6 小时才能排下一次。
+ * 这里由 handler 返回一个短延迟，交给 runDueScheduledJobs 覆盖本次的 next_run_after。
+ */
+export const RUNNING_GUARD_RETRY_DELAY_MS = 5 * 60 * 1000;
+
+/**
+ * 延迟重试的最小等待（修改点：第 2 期）
+ * - 防止上游给出 0 或已经过去的重试时间，导致 next_run_after 落在过去、每个 tick 都重跑
+ */
+export const MIN_DEFER_RETRY_DELAY_MS = 30 * 1000;
+
+/**
  * 由仓库 ID 派生调度作业 ID
  * @param {string} repositoryId
  * @returns {string}
@@ -302,6 +317,61 @@ export async function syncRepositoryScheduleJob(
 }
 
 /**
+ * 把某个仓库的下一次备份提前到指定时间（修改点：第 2 期 延迟重试）
+ *
+ * 使用场景：
+ *   备份任务在跑到一半时遇到 GitHub 限流/暂时性故障。这类错误不是「失败」，
+ *   但也不能等到下个正常周期（默认 6 小时）才重来。任务 handler 会把
+ *   「允许重试的时间」交给本函数，本函数只做一件事：把它写进既有
+ *   scheduled_jobs 行的 next_run_after。
+ *
+ * 几条必须守住的规则：
+ * - 只前移，不后移：WHERE 上带 `next_run_after > ?`，永不推迟既有的正常计划，
+ *   所以正常 6 小时周期与限流重试之间是「取更早的那个」，不会互相打架。
+ * - 只动 next_run_after 一列：不碰 schedule_type / interval_sec / enabled，
+ *   避免与「定时任务」页的配置编辑产生语义冲突。
+ * - 计划行不存在（仓库只手动备份，从未开启定时备份）或已禁用时静默跳过：
+ *   没有计划可提前，交给管理员手动重试即可。
+ *
+ * @param {D1Database} db
+ * @param {string} repositoryId
+ * @param {string} retryAtIso 允许重试的时间（ISO 字符串）
+ * @returns {Promise<boolean>} 是否真的把计划提前了
+ */
+export async function deferRepositoryBackupSchedule(db, repositoryId, retryAtIso) {
+  if (!db || !repositoryId || !retryAtIso) return false;
+
+  const retryAt = new Date(retryAtIso);
+  if (Number.isNaN(retryAt.getTime())) return false;
+
+  const taskId = buildScheduleTaskId(repositoryId);
+  try {
+    const result = await db
+      .prepare(
+        `
+        UPDATE scheduled_jobs
+        SET next_run_after = ?
+        WHERE task_id = ?
+          AND enabled = 1
+          AND (next_run_after IS NULL OR next_run_after > ?)
+      `,
+      )
+      .bind(retryAtIso, taskId, retryAtIso)
+      .run();
+
+    const changes = result?.meta?.changes ?? result?.changes ?? 0;
+    return changes > 0;
+  } catch (error) {
+    // 提前计划失败不应该影响备份任务本身的收尾（它已经决定「本次不算失败」了）
+    console.warn(
+      `[repoBackup] 提前备份计划失败（repositoryId=${repositoryId}）:`,
+      error?.message || error,
+    );
+    return false;
+  }
+}
+
+/**
  * 删除仓库的备份计划行（仓库被删除时调用）
  * - 行本来就不存在时静默通过，保证可重入
  * @param {D1Database} db
@@ -326,11 +396,15 @@ export default {
   MIN_SCHEDULE_INTERVAL_SEC,
   MAX_SCHEDULE_INTERVAL_SEC,
   STALE_RUNNING_BACKUP_SEC,
+  // 修改点（第 2 期）：延迟重试相关
+  RUNNING_GUARD_RETRY_DELAY_MS,
+  MIN_DEFER_RETRY_DELAY_MS,
   buildScheduleTaskId,
   buildScheduleName,
   loadAllRepositorySchedules,
   loadRepositorySchedule,
   resolveScheduleInput,
   syncRepositoryScheduleJob,
+  deferRepositoryBackupSchedule,
   removeRepositoryScheduleJob,
 };

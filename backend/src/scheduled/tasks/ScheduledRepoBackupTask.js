@@ -6,6 +6,7 @@ import { UserType } from "../../constants/index.js";
 import {
   REPO_BACKUP_SCHEDULE_HANDLER_ID,
   STALE_RUNNING_BACKUP_SEC,
+  RUNNING_GUARD_RETRY_DELAY_MS,
 } from "../../repobackup/schedule.js";
 
 /**
@@ -89,6 +90,10 @@ export class ScheduledRepoBackupTask {
         repositoryId,
         runningCount,
         skipped: true,
+        // 修改点（第 2 期 延迟重试）：本次没有真正执行，不应该白等一个完整周期
+        // （默认 6 小时）。返回一个短延迟，由 runDueScheduledJobs 覆盖本次的
+        // next_run_after，这样上一次备份一结束，下一次备份就能很快排上。
+        deferMs: RUNNING_GUARD_RETRY_DELAY_MS,
       };
     }
 
