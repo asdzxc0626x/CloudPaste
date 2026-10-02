@@ -360,6 +360,22 @@ export const DEFAULT_SETTINGS = {
     default_value: "true",
   },
 
+  // 修改点（站点时区一期）：全站时间显示所用的时区
+  // - 后端存储与下发的时间一律是 UTC，这个设置只影响前端怎么把它显示出来
+  // - 本期不参与 cron 求值，调度仍按原样执行（cron 时区语义另立一期）
+  // - options 留空：可选项由前端用 Intl.supportedValuesOf("timeZone") 动态生成，
+  //   418 个 IANA 时区没必要塞进数据库，也避免仓库里维护一份会过期的时区表
+  site_timezone: {
+    key: "site_timezone",
+    type: SETTING_TYPES.SELECT,
+    group_id: SETTING_GROUPS.SITE,
+    help: "站点时间显示所用的时区（IANA 名称，如 Asia/Shanghai、Europe/Berlin）。仅影响显示，不改变后端存储与定时任务的实际执行时间。",
+    options: null,
+    sort_order: 11,
+    flag: SETTING_FLAGS.PUBLIC,
+    default_value: "UTC",
+  },
+
   // 系统内部设置（不在前端显示）
   db_initialized: {
     key: "db_initialized",
@@ -383,6 +399,29 @@ export const DEFAULT_SETTINGS = {
     default_value: "1",
   },
 };
+
+/**
+ * 判断是否长得像一个 IANA 时区名（修改点：站点时区一期）
+ *
+ * 只做形状校验，刻意不调用 Intl —— Workers 的 ICU 是裁剪过的，
+ * 用 Intl 验名字有把合法时区误判成非法、导致存不进去的风险。
+ * 权威的可选项列表由前端（完整 ICU）用 Intl.supportedValuesOf 提供。
+ *
+ * 覆盖的形态：
+ *   UTC                              无斜杠
+ *   Asia/Shanghai                     一层
+ *   America/Argentina/Buenos_Aires    两层
+ *   Etc/GMT+8                         含 +
+ *
+ * @param {any} value
+ * @returns {boolean}
+ */
+export function isTimeZoneNameShaped(value) {
+  if (typeof value !== "string") return false;
+  const text = value.trim();
+  if (!text || text.length > 64) return false;
+  return /^[A-Za-z][A-Za-z0-9+_-]*(?:\/[A-Za-z0-9+_-]+){0,2}$/.test(text);
+}
 
 /**
  * 验证设置值的辅助函数
@@ -412,6 +451,13 @@ export function validateSettingValue(key, value, type) {
     case SETTING_TYPES.SELECT:
       if (key === "webdav_upload_mode") {
         return ["single", "chunked"].includes(value);
+      }
+      // 修改点（站点时区一期）：时区只校验「形状」，不用 Intl 实际构造。
+      // 理由：Cloudflare Workers 的 ICU 数据是裁剪过的，拿 Intl 验时区名可能
+      // 把合法时区误判成非法，导致管理员根本存不进去。可选项由前端用
+      // Intl.supportedValuesOf 给出（浏览器 ICU 完整），这里只拦明显的脏数据。
+      if (key === "site_timezone") {
+        return isTimeZoneNameShaped(value);
       }
       return true;
 

@@ -4,6 +4,8 @@
  */
 
 import { get, post } from "../client";
+// 修改点（站点时区一期）：时间格式化统一走 timeUtils
+import { formatDateTime } from "@/utils/timeUtils.js";
 
 /******************************************************************************
  * 类型定义 (JSDoc)
@@ -269,18 +271,21 @@ export function calculateJobProgress(stats) {
 }
 
 /**
- * 格式化时间戳为本地时间字符串
- * @param {number|string|null} timestamp - 时间戳(ms)或ISO字符串
- * @returns {string} 格式化的时间字符串
+ * 格式化时间戳为站点时区下的时间字符串（修改点：站点时区一期）
+ *
+ * fs_search_index* 系列表的 *_ms 列是 epoch 毫秒 INTEGER，
+ * 原来 timeUtils 解析不了数字，所以这里自造了一份并直接用了浏览器时区。
+ * 现在 parseUTCDate 支持 epoch 毫秒，改走统一入口——顺便修掉
+ * 「站点时区设成 A，索引时间却按浏览器时区显示」的不一致。
+ *
+ * 保留原有的导出名与签名，调用方（FsIndexKPICards / FsIndexMountCard /
+ * FsIndexMountTable / FsIndexManagement）无需改动。
+ *
+ * @param {number|string|null} timestamp - epoch 毫秒或 ISO 字符串
+ * @returns {string} 格式化的时间字符串，无法解析时返回 "-"
  */
 export function formatTimestamp(timestamp) {
   if (!timestamp) return "-";
-
-  const date = typeof timestamp === "number"
-    ? new Date(timestamp)
-    : new Date(timestamp);
-
-  if (isNaN(date.getTime())) return "-";
-
-  return date.toLocaleString();
+  const text = formatDateTime(timestamp);
+  return text === "日期无效" || text === "Invalid Date" ? "-" : text;
 }

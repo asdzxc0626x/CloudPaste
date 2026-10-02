@@ -303,6 +303,8 @@ import { ref, computed, watch, onMounted, onUnmounted, h } from 'vue'
 import { useIntervalFn } from '@vueuse/core'
 import { useI18n } from 'vue-i18n'
 import { createLogger } from '@/utils/logger.js'
+// 修改点（站点时区一期）：统一走 timeUtils；改名避免与本文件内的同名包装函数冲突
+import { formatDateTime as formatDateTimeShared } from '@/utils/timeUtils.js'
 import { listJobs, getJobStatus, cancelJob, deleteJob, batchCopyItems, listJobTypes } from '@/api/services/fsService'
 import { useThemeMode } from '@/composables/core/useThemeMode.js'
 import { useConfirmDialog } from '@/composables/core/useConfirmDialog.js'
@@ -333,7 +335,7 @@ import { useAdminBase } from '@/composables/admin-management/useAdminBase.js'
 
 // Composables
 const { isDarkMode: darkMode } = useThemeMode()
-const { t, locale } = useI18n()
+const { t } = useI18n()
 const log = createLogger('AdminTasksView')
 const { dialogState, confirm, handleConfirm, handleCancel } = useConfirmDialog()
 const { getCreatorBadgeInfo } = useCreatorBadge()
@@ -763,16 +765,23 @@ const formatTaskTitle = (task) => {
 /** 仓库名大小写敏感，不能被 capitalize 改写成 Owner/Repo */
 const taskTitleCaseClass = (type) => (type === 'repo_backup' ? '' : 'capitalize')
 
+/**
+ * 格式化任务时间（修改点：站点时区一期）
+ *
+ * tasks 表的时间列是 epoch 毫秒 INTEGER，原来 timeUtils.parseUTCDate 遇到数字
+ * 直接返回 null，所以才在这里自造了一份。现在 parseUTCDate 支持 epoch 毫秒，
+ * 改走统一入口，顺便获得站点时区支持；保留原有的 month:short 显示粒度。
+ */
 const formatDateTime = (dateStr) => {
   if (!dateStr) return '-'
-  const date = new Date(dateStr)
-  return date.toLocaleString(locale.value, {
+  const text = formatDateTimeShared(dateStr, {
     year: 'numeric',
     month: 'short',
     day: 'numeric',
     hour: '2-digit',
     minute: '2-digit'
   })
+  return text === '日期无效' || text === 'Invalid Date' ? '-' : text
 }
 
 const getTaskIcon = (type) => {

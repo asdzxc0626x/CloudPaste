@@ -230,6 +230,13 @@ export default {
       hint: "Supports Markdown format, you can use links, bold text, etc. Leave empty to hide footer",
       placeholder: "© 2025 CloudPaste. All rights reserved.",
     },
+    // 修改点（站点时区一期）
+    timezone: {
+      label: "Site Time Zone",
+      hint: "All times across the site are displayed in this time zone. Display only — it does not change how times are stored, nor when scheduled jobs actually run.",
+      browserHint: "Your browser's time zone: {zone}",
+      preview: "Current time: {time}",
+    },
     frontendEntries: {
       title: "Frontend Entry Toggles",
       hint: "These toggles only affect the frontend entry points and the top navigation. When turned off, the entry will be hidden and visiting the URL will redirect to another available page.",

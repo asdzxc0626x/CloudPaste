@@ -9,6 +9,8 @@ import { useAdminMountService } from "@/modules/admin/services/mountService.js";
 import { useAdminStorageConfigService } from "@/modules/admin/services/storageConfigService.js";
 import { IconClose, IconFolder, IconHome, IconRefresh } from "@/components/icons";
 import { createLogger } from "@/utils/logger.js";
+// 修改点（站点时区一期）：datetime-local 输入框按站点时区做双向换算，避免编辑过期时间时漂移
+import { formatForDateTimeLocalInput, parseDateTimeLocalInput } from "@/utils/timeUtils.js";
 
 // 目录缓存对象，用于存储已加载的目录内容
 const directoryCache = shallowRef(new Map());
@@ -486,12 +488,11 @@ watch(
               customExpiration.value = "";
             } else {
               expiration.value = "custom";
-              // 转换为本地日期时间格式 yyyy-MM-ddThh:mm
-              const month = String(expiresAt.getMonth() + 1).padStart(2, "0");
-              const day = String(expiresAt.getDate()).padStart(2, "0");
-              const hours = String(expiresAt.getHours()).padStart(2, "0");
-              const minutes = String(expiresAt.getMinutes()).padStart(2, "0");
-              customExpiration.value = `${year}-${month}-${day}T${hours}:${minutes}`;
+              // 修改点（站点时区一期）：按站点时区换算成输入框需要的墙上时钟。
+              // 原来用 getFullYear/getMonth/... 取的是**浏览器本地**时间，
+              // 而写回时 new Date(...) 也按浏览器本地解释，靠「读写用同一套错」自洽；
+              // 现在显示统一走站点时区，读必须跟着走同一时区，否则会漂。
+              customExpiration.value = formatForDateTimeLocalInput(newVal.expires_at);
             }
           } else {
             // 日期无效，默认为永不过期
@@ -663,8 +664,10 @@ const handleSubmit = async () => {
       }
 
       // 验证自定义日期是否有效
-      const customDate = new Date(customExpiration.value);
-      if (isNaN(customDate.getTime())) {
+      // 修改点（站点时区一期）：输入框里的值是「站点时区下的墙上时钟」，
+      // 必须按站点时区反解回 UTC；直接用 new Date(...) 会按浏览器本地时区解释，产生偏移。
+      const customDate = parseDateTimeLocalInput(customExpiration.value);
+      if (!customDate || isNaN(customDate.getTime())) {
         error.value = props.isEditMode
           ? t("admin.keyManagement.editModal.errors.invalidExpiration", "无效的过期时间")
           : t("admin.keyManagement.createModal.errors.invalidExpiration", "无效的过期时间");

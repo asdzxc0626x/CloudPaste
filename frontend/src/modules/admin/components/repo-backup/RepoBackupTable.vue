@@ -13,6 +13,10 @@
 import { computed } from "vue";
 import { useI18n } from "vue-i18n";
 import RepoBackupRowActions from "./RepoBackupRowActions.vue";
+// 修改点（站点时区一期）：改用统一的 timeUtils。
+// 原来的 new Date(value).toLocaleString() 会把后端下发的
+// "2026-01-23 08:12:07"（UTC 无时区标记）当成浏览器本地时间解析，导致时间偏移。
+import { formatDateTime } from "@/utils/timeUtils.js";
 
 const props = defineProps({
   repositories: { type: Array, default: () => [] },
@@ -49,12 +53,12 @@ const statusClass = (status) => {
   }
 };
 
-/** 格式化时间（本地时区，缺失显示 -） */
+/** 格式化时间（修改点：站点时区一期，改用统一的 timeUtils）*/
 const formatTime = (value) => {
   if (!value) return "-";
-  const d = new Date(value);
-  if (Number.isNaN(d.getTime())) return "-";
-  return d.toLocaleString();
+  const text = formatDateTime(value);
+  // timeUtils 解析失败时会返回「日期无效 / Invalid Date」，这类值统一显示为 "-"
+  return text === "日期无效" || text === "Invalid Date" ? "-" : text;
 };
 
 /** 格式化字节数 */

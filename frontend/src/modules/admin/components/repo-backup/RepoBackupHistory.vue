@@ -10,6 +10,10 @@
  */
 import { computed } from "vue";
 import { IconClose, IconDownload, IconRefresh } from "@/components/icons";
+// 修改点（站点时区一期）：改用统一的 timeUtils。
+// 原来的 new Date(value).toLocaleString() 会把后端下发的
+// "2026-01-23 08:12:07"（UTC 无时区标记）当成浏览器本地时间解析，导致时间偏移。
+import { formatDateTime } from "@/utils/timeUtils.js";
 
 const props = defineProps({
   repo: { type: Object, default: null },
@@ -86,8 +90,9 @@ const statusClass = (status) => {
 
 const formatTime = (value) => {
   if (!value) return "-";
-  const d = new Date(value);
-  return Number.isNaN(d.getTime()) ? "-" : d.toLocaleString();
+  const text = formatDateTime(value);
+  // timeUtils 解析失败时会返回「日期无效 / Invalid Date」，这类值统一显示为 "-"
+  return text === "日期无效" || text === "Invalid Date" ? "-" : text;
 };
 
 const formatSize = (bytes) => {

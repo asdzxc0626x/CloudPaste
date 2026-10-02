@@ -187,6 +187,8 @@ import TaskDetailsCopy from './details/TaskDetailsCopy.vue'
 import TaskDetailsFsIndexRebuild from './details/TaskDetailsFsIndexRebuild.vue'
 import TaskDetailsFsIndexApplyDirty from './details/TaskDetailsFsIndexApplyDirty.vue'
 import TaskDetailsRepoBackup from './details/TaskDetailsRepoBackup.vue'
+// 修改点（站点时区一期）：统一走 timeUtils
+import { formatDateTime } from '@/utils/timeUtils.js'
 
 const props = defineProps({
   task: {
@@ -201,7 +203,7 @@ const props = defineProps({
 
 const emit = defineEmits(['close', 'retry-all-failed', 'retry-file'])
 
-const { t, locale } = useI18n()
+const { t } = useI18n()
 
 // === 响应式状态 ===
 const payloadExpanded = ref(false)
@@ -351,10 +353,16 @@ const getTaskDetailsComponent = (taskType) => {
  */
 const taskErrorText = computed(() => props.task?.errorMessage || props.task?.error || '')
 
+/**
+ * 格式化任务时间戳（修改点：站点时区一期）
+ *
+ * tasks 表的时间列是 epoch 毫秒 INTEGER，原来 timeUtils.parseUTCDate 遇到数字
+ * 直接返回 null，所以才在这里自造了一份。现在改走统一入口，获得站点时区支持；
+ * 保留原有的「月-日 时:分:秒、24 小时制」显示粒度。
+ */
 const formatTimestamp = (timestamp) => {
   if (!timestamp) return '-'
-  const date = new Date(timestamp)
-  return date.toLocaleString(locale.value, {
+  const text = formatDateTime(timestamp, {
     month: '2-digit',
     day: '2-digit',
     hour: '2-digit',
@@ -362,6 +370,7 @@ const formatTimestamp = (timestamp) => {
     second: '2-digit',
     hour12: false
   })
+  return text === '日期无效' || text === 'Invalid Date' ? '-' : text
 }
 
 const calculateDuration = (startTimestamp, endTimestamp) => {

@@ -1,16 +1,146 @@
 /**
  * 统一的时间处理工具函数
- * 用于处理从后端接收的 UTC 时间戳，并转换为用户本地时区的时间显示
+ * 用于处理从后端接收的 UTC 时间戳，并按「站点时区」统一显示
  *
- * 后端现在统一使用 CURRENT_TIMESTAMP 存储 UTC 时间
- * 前端负责根据用户的时区设置进行本地化显示
+ * 后端存储与下发的时间一律视为 UTC，共三种形态（均由 parseUTCDate 归一）：
+ *   1. SQLite CURRENT_TIMESTAMP  "YYYY-MM-DD HH:mm:ss"（无时区标记，值是 UTC）
+ *   2. ISO 字符串                "2026-01-23T08:12:07.000Z"
+ *   3. epoch 毫秒                1769155927000（tasks / fs_search_index 等表用 INTEGER 存）
+ *
+ * 修改点（站点时区一期）：
+ * - 新增 epoch 毫秒解析支持（原来遇到数字直接返回 null，这是 tasks / fsIndex 系列组件
+ *   各自造一套 formatTimestamp 的根因）
+ * - 所有 Intl.DateTimeFormat 统一注入站点时区，不再隐式跟随访问者浏览器时区
+ * - 新增 datetime-local 输入框的双向转换，保证「UTC → 站点时区 → 用户编辑 → UTC」不漂移
+ *
+ * 本期不改动：后端时间存储/下发格式、调度器、cron 语义。
  */
 
+import { ref } from "vue";
 import { useLocalStorage } from "@vueuse/core";
 import { createLogger } from "@/utils/logger.js";
 
 const storedLanguage = useLocalStorage("language", "zh-CN");
 const log = createLogger("TimeUtils");
+
+// ==================== 站点时区（修改点：站点时区一期）====================
+
+/** 默认时区：UTC —— 与后端存储一致，且对所有访问者稳定一致 */
+export const DEFAULT_TIME_ZONE = "UTC";
+
+/**
+ * siteConfigStore 的 localStorage 缓存键
+ * 这里直接读它只为了「首帧同步可用」：站点配置是挂载后异步拉取的，
+ * 若等网络返回再决定时区，首屏时间会先按错的时区渲染再跳一次。
+ */
+const SITE_CONFIG_STORAGE_KEY = "cloudpaste_site_config";
+
+/**
+ * 校验是否为运行时认识的 IANA 时区
+ * 用 Intl 实际构造一次，避免维护一份会过期的白名单
+ */
+export const isValidTimeZone = (timeZone) => {
+  const text = String(timeZone || "").trim();
+  if (!text) return false;
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: text });
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/** 非法或空值一律回落到 UTC，保证格式化永远不会因为配置脏数据而抛错 */
+const normalizeTimeZone = (timeZone) => {
+  const text = String(timeZone || "").trim();
+  if (!text) return DEFAULT_TIME_ZONE;
+  return isValidTimeZone(text) ? text : DEFAULT_TIME_ZONE;
+};
+
+/** 从 localStorage 缓存里取出时区，用于模块加载时的首帧值 */
+const readTimeZoneFromCache = () => {
+  try {
+    const raw = localStorage.getItem(SITE_CONFIG_STORAGE_KEY);
+    if (!raw) return DEFAULT_TIME_ZONE;
+    const parsed = JSON.parse(raw);
+    return normalizeTimeZone(parsed?.timezone);
+  } catch {
+    // 隐私模式 / 缓存损坏：按默认时区工作
+    return DEFAULT_TIME_ZONE;
+  }
+};
+
+/**
+ * 当前生效的站点时区
+ *
+ * 用 ref 而不是普通变量：格式化函数在渲染期间读它，
+ * 管理员改完时区（或站点配置拉取完成）后，页面上已显示的时间会自动重新渲染。
+ */
+const siteTimeZone = ref(readTimeZoneFromCache());
+
+/**
+ * 设置当前站点时区（由 siteConfigStore 调用，是唯一的写入口）
+ * @param {string} timeZone IANA 时区名
+ */
+export const setSiteTimeZone = (timeZone) => {
+  const next = normalizeTimeZone(timeZone);
+  if (next !== siteTimeZone.value) {
+    siteTimeZone.value = next;
+  }
+};
+
+/** 获取当前站点时区 */
+export const getSiteTimeZone = () => siteTimeZone.value;
+
+/** 访问者浏览器所在时区，仅用于设置界面上给管理员做参考 */
+export const getBrowserTimeZone = () => {
+  try {
+    return Intl.DateTimeFormat().resolvedOptions().timeZone || DEFAULT_TIME_ZONE;
+  } catch {
+    return DEFAULT_TIME_ZONE;
+  }
+};
+
+/**
+ * 可选时区列表（供设置界面使用）
+ * 优先用 Intl.supportedValuesOf 动态取全量 IANA 列表，取不到时退化为常用时区，
+ * 这样不需要在仓库里维护一份会过期的时区表。
+ */
+export const getSupportedTimeZones = () => {
+  try {
+    if (typeof Intl.supportedValuesOf === "function") {
+      const zones = Intl.supportedValuesOf("timeZone");
+      if (Array.isArray(zones) && zones.length > 0) {
+        // supportedValuesOf 不含 UTC，但它是我们的默认值，必须可选
+        return zones.includes("UTC") ? zones : ["UTC", ...zones];
+      }
+    }
+  } catch {
+    // 落到下面的兜底列表
+  }
+  return [
+    "UTC",
+    "Asia/Shanghai",
+    "Asia/Hong_Kong",
+    "Asia/Taipei",
+    "Asia/Tokyo",
+    "Asia/Seoul",
+    "Asia/Singapore",
+    "Asia/Kolkata",
+    "Asia/Dubai",
+    "Europe/London",
+    "Europe/Berlin",
+    "Europe/Paris",
+    "Europe/Moscow",
+    "America/New_York",
+    "America/Chicago",
+    "America/Denver",
+    "America/Los_Angeles",
+    "America/Sao_Paulo",
+    "Australia/Sydney",
+    "Pacific/Auckland",
+  ];
+};
 
 // 获取当前语言设置
 const getCurrentLanguage = () => {
@@ -118,12 +248,29 @@ const TIME_FORMAT_OPTIONS = {
 };
 
 /**
- * 将 UTC 时间字符串转换为本地 Date 对象
- * @param {string|Date|number} utcDateString - UTC 时间字符串、Date对象或时间戳
- * @returns {Date|null} 本地 Date 对象，如果无效则返回 null
+ * 给格式化选项补上站点时区（修改点：站点时区一期）
+ *
+ * 调用方传进来的 options 一律不带 timeZone（原来就不带，于是 Intl 隐式用浏览器时区）。
+ * 这里统一补上，是整个项目时间显示的唯一注入点。
+ * 若调用方自己显式指定了 timeZone，尊重它，不覆盖。
+ */
+const withSiteTimeZone = (options = {}) => {
+  if (options && options.timeZone) return options;
+  return { ...options, timeZone: getSiteTimeZone() };
+};
+
+/**
+ * 将 UTC 时间转换为 Date 对象
+ *
+ * 支持三种后端形态（见文件头注释）。注意：返回的 Date 代表一个**绝对时刻**，
+ * 不带时区概念；时区只在格式化那一步生效。
+ *
+ * @param {string|Date|number} utcDateString - UTC 时间字符串、Date 对象或 epoch 毫秒
+ * @returns {Date|null} Date 对象，如果无效则返回 null
  */
 export const parseUTCDate = (utcDateString) => {
-  if (!utcDateString) {
+  // 注意不能用 !utcDateString 直接判：epoch 0 是合法时刻（1970-01-01T00:00:00Z）
+  if (utcDateString === null || utcDateString === undefined || utcDateString === "") {
     return null;
   }
 
@@ -133,12 +280,28 @@ export const parseUTCDate = (utcDateString) => {
       return isNaN(utcDateString.getTime()) ? null : utcDateString;
     }
 
-    // 如果不是字符串，说明数据类型不正确，返回 null
+    // 修改点（站点时区一期）：支持 epoch 毫秒。
+    // tasks / fs_search_index 等表的时间列是 INTEGER，下发到前端就是数字；
+    // 原实现遇到非字符串直接返回 null，逼得相关组件各自造一套格式化。
+    if (typeof utcDateString === "number") {
+      if (!Number.isFinite(utcDateString)) return null;
+      const date = new Date(utcDateString);
+      return isNaN(date.getTime()) ? null : date;
+    }
+
     if (typeof utcDateString !== "string") {
       return null;
     }
 
     let dateString = utcDateString.trim();
+    if (!dateString) return null;
+
+    // 修改点（站点时区一期）：纯数字字符串按 epoch 毫秒处理。
+    // 限定 13 位及以上，避免把 "20260123" 这类紧凑日期误判成时间戳。
+    if (/^\d{13,}$/.test(dateString)) {
+      const date = new Date(Number(dateString));
+      return isNaN(date.getTime()) ? null : date;
+    }
 
     // 处理不同的UTC时间格式
     // 1. 如果已经是ISO格式（带Z或时区偏移），直接解析
@@ -157,7 +320,7 @@ export const parseUTCDate = (utcDateString) => {
       dateString = dateString + "T00:00:00Z";
     }
     // 4. 如果是ISO格式但没有Z，添加Z
-    else if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}$/.test(dateString)) {
+    else if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?$/.test(dateString)) {
       dateString = dateString + "Z";
     }
 
@@ -203,7 +366,7 @@ export const formatDateTime = (utcDateString, options = TIME_FORMAT_OPTIONS.FULL
   }
 
   try {
-    return new Intl.DateTimeFormat(locale, options).format(date);
+    return new Intl.DateTimeFormat(locale, withSiteTimeZone(options)).format(date);
   } catch (error) {
     log.error("日期格式化错误:", error, "输入:", utcDateString);
     return t("dateFormatError");
@@ -318,32 +481,153 @@ export const isExpired = (expiryDateString) => {
 
 /**
  * 格式化时间用于显示"最后刷新时间"等场景
- * @returns {string} 当前本地时间的简短格式
+ * @returns {string} 当前时间的简短格式（站点时区）
  */
 export const formatCurrentTime = () => {
   const now = new Date();
+  // 修改点（站点时区一期）：补上站点时区，与页面其它时间保持一致
   return now.toLocaleTimeString(getUserLocale(), {
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
+    timeZone: getSiteTimeZone(),
   });
+};
+
+// ==================== 站点时区下的「墙上时钟」换算（修改点：站点时区一期）====================
+
+/**
+ * 取某个绝对时刻在指定时区下的墙上时钟读数，并表示成「假装这读数是 UTC」的时间戳
+ *
+ * 这是不引入日期库就能做时区换算的标准手法：Intl 能把一个时刻按目标时区
+ * 拆成年月日时分秒，再用 Date.UTC 把这些数字拼回去，就得到一个便于做算术的值。
+ */
+const wallClockAsUTC = (date, timeZone) => {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).formatToParts(date);
+
+  const get = (type) => Number(parts.find((p) => p.type === type)?.value);
+  let hour = get("hour");
+  // 部分实现用 24 表示午夜，Date.UTC 会把它滚到第二天，这里先归零
+  if (hour === 24) hour = 0;
+
+  return Date.UTC(get("year"), get("month") - 1, get("day"), hour, get("minute"), get("second"));
+};
+
+/** 指定时区在某个时刻的 UTC 偏移（毫秒），夏令时会随时刻变化 */
+const zoneOffsetMs = (date, timeZone) => wallClockAsUTC(date, timeZone) - date.getTime();
+
+/**
+ * UTC 时间 -> `<input type="datetime-local">` 需要的 `YYYY-MM-DDTHH:mm`
+ *
+ * 输入框没有时区概念，显示的必须是「站点时区下的墙上时钟」，
+ * 否则管理员看到的过期时间和列表里显示的不是同一个。
+ *
+ * @param {string|Date|number} value 后端下发的 UTC 时间（三种形态均可）
+ * @returns {string} `YYYY-MM-DDTHH:mm`，无法解析时返回空串
+ */
+export const formatForDateTimeLocalInput = (value) => {
+  const date = parseUTCDate(value);
+  if (!date) return "";
+
+  try {
+    const shifted = new Date(wallClockAsUTC(date, getSiteTimeZone()));
+    const pad = (n) => String(n).padStart(2, "0");
+    return (
+      `${shifted.getUTCFullYear()}-${pad(shifted.getUTCMonth() + 1)}-${pad(shifted.getUTCDate())}` +
+      `T${pad(shifted.getUTCHours())}:${pad(shifted.getUTCMinutes())}`
+    );
+  } catch (error) {
+    log.error("datetime-local 格式化失败:", error, "输入:", value);
+    return "";
+  }
+};
+
+/**
+ * `<input type="datetime-local">` 的值 -> UTC Date
+ *
+ * 用户在输入框里填的是「站点时区的墙上时钟」，必须按站点时区反解回绝对时刻；
+ * 直接 `new Date("2026-01-23T08:12")` 会被 JS 当成**浏览器本地时间**，那就漂了。
+ *
+ * 夏令时的两种疑难情形都要处理：
+ * - 回拨日有「重复的一小时」（柏林 10/25 的 02:30 出现两次）：取**最早**那次，
+ *   与 Temporal 的默认消歧策略一致，也保证「格式化 → 解析」能严格往返
+ * - 前拨日有「不存在的一小时」（柏林 3/29 的 02:30 被跳过）：没有候选能对上，
+ *   退回两步迭代得到紧邻的真实时刻，不返回 null（否则用户填了个合法样子的值却被判非法）
+ *
+ * @param {string} text `YYYY-MM-DDTHH:mm`（可带秒）
+ * @returns {Date|null} 对应的绝对时刻
+ */
+export const parseDateTimeLocalInput = (text) => {
+  const matched = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(String(text || "").trim());
+  if (!matched) return null;
+
+  try {
+    const timeZone = getSiteTimeZone();
+    // 把用户填的读数当成 UTC 拼出一个时间戳，纯粹用来做算术
+    const target = Date.UTC(
+      Number(matched[1]),
+      Number(matched[2]) - 1,
+      Number(matched[3]),
+      Number(matched[4]),
+      Number(matched[5]),
+      matched[6] ? Number(matched[6]) : 0,
+    );
+
+    const DAY_MS = 24 * 60 * 60 * 1000;
+    // 用目标前后各一天的偏移作为候选：夏令时一天最多切换一次，
+    // 这两个偏移必然把切换点夹在中间，于是覆盖了所有可能的解
+    const offsets = [
+      zoneOffsetMs(new Date(target - DAY_MS), timeZone),
+      zoneOffsetMs(new Date(target + DAY_MS), timeZone),
+    ];
+
+    const candidates = [...new Set(offsets.map((offset) => target - offset))]
+      // 只留下「按站点时区渲染回去确实等于用户填的读数」的候选
+      .filter((ms) => wallClockAsUTC(new Date(ms), timeZone) === target)
+      .sort((a, b) => a - b);
+
+    if (candidates.length > 0) {
+      return new Date(candidates[0]);
+    }
+
+    // 落到这里说明这个墙上时钟在该时区并不存在（前拨跳过的那一小时）：
+    // 用两步迭代给出紧邻的真实时刻
+    let instant = target - zoneOffsetMs(new Date(target), timeZone);
+    instant = target - zoneOffsetMs(new Date(instant), timeZone);
+
+    const date = new Date(instant);
+    return isNaN(date.getTime()) ? null : date;
+  } catch (error) {
+    log.error("datetime-local 解析失败:", error, "输入:", text);
+    return null;
+  }
 };
 
 /**
  * 获取当前日期时间的文件名存档格式
  * 用于压缩包、拷贝、导出等场景
  * 格式: YYYY-MM-DD-HH-mm-ss
+ *
+ * 修改点（站点时区一期）：改按站点时区取值，
+ * 让导出文件名里的时间和界面上显示的时间对得上。
  */
 export const formatNowForFilename = () => {
-  const now = new Date();
-  const year = now.getFullYear();
-  const month = String(now.getMonth() + 1).padStart(2, "0");
-  const day = String(now.getDate()).padStart(2, "0");
-  const hours = String(now.getHours()).padStart(2, "0");
-  const minutes = String(now.getMinutes()).padStart(2, "0");
-  const seconds = String(now.getSeconds()).padStart(2, "0");
+  const shifted = new Date(wallClockAsUTC(new Date(), getSiteTimeZone()));
+  const pad = (n) => String(n).padStart(2, "0");
 
-  return `${year}-${month}-${day}-${hours}-${minutes}-${seconds}`;
+  return (
+    `${shifted.getUTCFullYear()}-${pad(shifted.getUTCMonth() + 1)}-${pad(shifted.getUTCDate())}` +
+    `-${pad(shifted.getUTCHours())}-${pad(shifted.getUTCMinutes())}-${pad(shifted.getUTCSeconds())}`
+  );
 };
 
 /**
@@ -360,7 +644,7 @@ export const formatLocalDateTimeWithSeconds = (date) => {
   }
 
   try {
-    return new Intl.DateTimeFormat(getUserLocale(), TIME_FORMAT_OPTIONS.FULL_DATETIME_WITH_SECONDS).format(parsed);
+    return new Intl.DateTimeFormat(getUserLocale(), withSiteTimeZone(TIME_FORMAT_OPTIONS.FULL_DATETIME_WITH_SECONDS)).format(parsed);
   } catch (error) {
     log.error("日期格式化错误:", error, "输入:", date);
     return t("dateFormatError");

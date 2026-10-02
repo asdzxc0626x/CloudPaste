@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted } from "vue";
+import { ref, computed, onMounted } from "vue";
 import { useI18n } from "vue-i18n";
 import VditorUnified from "@/components/common/VditorUnified.vue";
 import ConfirmDialog from "@/components/common/dialogs/ConfirmDialog.vue";
@@ -9,6 +9,8 @@ import { useGlobalMessage } from "@/composables/core/useGlobalMessage.js";
 import { useConfirmDialog } from "@/composables/core/useConfirmDialog.js";
 import { IconHome, IconMegaphone, IconAdjustments, IconRefresh, IconGallery } from "@/components/icons";
 import { createLogger } from "@/utils/logger.js";
+// 修改点（站点时区一期）：时区选项与校验统一来自 timeUtils，不另造一套
+import { getSupportedTimeZones, getBrowserTimeZone, isValidTimeZone, DEFAULT_TIME_ZONE } from "@/utils/timeUtils.js";
 
 const { t } = useI18n();
 const log = createLogger("SiteSettingsView");
@@ -31,7 +33,45 @@ const siteSettings = ref({
   site_home_editor_enabled: true,
   site_upload_page_enabled: true,
   site_mount_explorer_enabled: true,
+  // 修改点（站点时区一期）：全站时间显示所用的时区
+  site_timezone: DEFAULT_TIME_ZONE,
 });
+
+// 修改点（站点时区一期）：可选时区列表。
+// 用 Intl.supportedValuesOf 动态生成（418 个 IANA 时区），不在仓库里维护时区表，
+// 也不落库到 system_settings.options。
+const timezoneOptions = getSupportedTimeZones();
+
+/** 按「大洲/区域」分组，418 项的下拉框才找得到东西 */
+const groupedTimezones = computed(() => {
+  const groups = new Map();
+  for (const zone of timezoneOptions) {
+    // "Asia/Shanghai" -> "Asia"；"UTC" 没有斜杠，单独归到 UTC 组
+    const region = zone.includes("/") ? zone.split("/")[0] : "UTC";
+    if (!groups.has(region)) groups.set(region, []);
+    groups.get(region).push(zone);
+  }
+  // UTC 组排最前，其余按字母序
+  return [...groups.entries()].sort(([a], [b]) => (a === "UTC" ? -1 : b === "UTC" ? 1 : a.localeCompare(b)));
+});
+
+/** 当前选中时区的实时预览，让管理员存之前就能确认选对了 */
+const timezonePreview = computed(() => {
+  const zone = siteSettings.value.site_timezone;
+  if (!isValidTimeZone(zone)) return "";
+  try {
+    return new Intl.DateTimeFormat(undefined, {
+      dateStyle: "medium",
+      timeStyle: "medium",
+      timeZone: zone,
+    }).format(new Date());
+  } catch {
+    return "";
+  }
+});
+
+/** 访问者浏览器时区，仅作参考显示 */
+const browserTimezone = getBrowserTimeZone();
 
 // 加载状态
 const isLoading = ref(false);
@@ -79,6 +119,10 @@ onMounted(async () => {
         case "site_mount_explorer_enabled":
           siteSettings.value.site_mount_explorer_enabled = setting.value === "true";
           break;
+        // 修改点（站点时区一期）：存量库可能还没有这一行，取不到就保留默认 UTC
+        case "site_timezone":
+          siteSettings.value.site_timezone = setting.value || DEFAULT_TIME_ZONE;
+          break;
       }
     });
   } catch (error) {
@@ -99,6 +143,8 @@ const handleSaveBasic = async () => {
       site_title: siteSettings.value.site_title || "CloudPaste",
       site_favicon_url: siteSettings.value.site_favicon_url || "",
       site_footer_markdown: siteSettings.value.site_footer_markdown || "",
+      // 修改点（站点时区一期）：时区归在「基础站点信息」一起保存
+      site_timezone: siteSettings.value.site_timezone || DEFAULT_TIME_ZONE,
     });
     showSuccess(t("admin.site.messages.updateSuccess"));
     await updateSiteConfigStore();
@@ -155,6 +201,8 @@ const updateSiteConfigStore = async () => {
     const { useSiteConfigStore } = await import("@/stores/siteConfigStore.js");
     const siteConfigStore = useSiteConfigStore();
     siteConfigStore.updateSiteTitle(siteSettings.value.site_title);
+    // 修改点（站点时区一期）：立刻生效，不等 refresh 的网络往返
+    siteConfigStore.updateSiteTimezone(siteSettings.value.site_timezone);
     siteConfigStore.updateSiteFavicon(siteSettings.value.site_favicon_url);
     siteConfigStore.updateSiteFooter(siteSettings.value.site_footer_markdown);
     siteConfigStore.updateCustomHead(siteSettings.value.site_custom_head);
@@ -187,6 +235,8 @@ const resetSettings = async () => {
   siteSettings.value.site_mount_explorer_enabled = true;
   siteSettings.value.site_custom_head = "";
   siteSettings.value.site_custom_body = "";
+  // 修改点（站点时区一期）
+  siteSettings.value.site_timezone = DEFAULT_TIME_ZONE;
 };
 
 // 清空公告内容
@@ -326,6 +376,38 @@ const handleClearAnnouncementContent = () => {
             />
             <p class="text-xs mt-1" :class="darkMode ? 'text-gray-400' : 'text-gray-500'">
               {{ t("admin.site.footer.hint") }}
+            </p>
+          </div>
+
+          <!-- 分隔线 -->
+          <div class="border-t" :class="darkMode ? 'border-gray-700' : 'border-gray-200'"></div>
+
+          <!-- 站点时区（修改点：站点时区一期）
+               选项由 Intl.supportedValuesOf 动态生成并按大洲分组，
+               下方给出实时预览与浏览器时区参考，便于管理员保存前确认 -->
+          <div>
+            <div class="flex items-center justify-between gap-4 mb-2 flex-wrap">
+              <label class="block text-sm font-medium" :class="darkMode ? 'text-gray-200' : 'text-gray-700'">
+                {{ t("admin.site.timezone.label") }}
+              </label>
+              <span v-if="timezonePreview" class="text-xs font-mono" :class="darkMode ? 'text-gray-300' : 'text-gray-600'">
+                {{ t("admin.site.timezone.preview", { time: timezonePreview }) }}
+              </span>
+            </div>
+            <select
+              v-model="siteSettings.site_timezone"
+              class="w-full px-3 py-2 border rounded-lg text-sm transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500/40"
+              :class="darkMode ? 'bg-gray-700 border-gray-600 text-white' : 'bg-white border-gray-300 text-gray-900'"
+            >
+              <optgroup v-for="[region, zones] in groupedTimezones" :key="region" :label="region">
+                <option v-for="zone in zones" :key="zone" :value="zone">{{ zone }}</option>
+              </optgroup>
+            </select>
+            <p class="text-xs mt-1" :class="darkMode ? 'text-gray-400' : 'text-gray-500'">
+              {{ t("admin.site.timezone.hint") }}
+            </p>
+            <p class="text-xs mt-0.5" :class="darkMode ? 'text-gray-500' : 'text-gray-400'">
+              {{ t("admin.site.timezone.browserHint", { zone: browserTimezone }) }}
             </p>
           </div>
         </div>

@@ -4,10 +4,13 @@
  */
 
 import { defineStore } from "pinia";
-import { ref, computed } from "vue";
+import { ref, computed, watch } from "vue";
 import { useLocalStorage } from "@vueuse/core";
 import { api } from "@/api";
 import { createLogger } from "@/utils/logger.js";
+// 修改点（站点时区一期）：站点时区由本 store 负责下发给 timeUtils，
+// timeUtils 是全站时间显示的唯一格式化入口（它不依赖 Pinia，所以这里推给它）
+import { setSiteTimeZone, DEFAULT_TIME_ZONE } from "@/utils/timeUtils.js";
 
 // 配置常量
 const STORAGE_KEY = "cloudpaste_site_config";
@@ -108,6 +111,10 @@ export const useSiteConfigStore = defineStore("siteConfig", () => {
   const siteAnnouncementEnabled = ref(false);
   const siteAnnouncementContent = ref("");
 
+  // 修改点（站点时区一期）：全站时间显示所用的时区（IANA 名称）
+  // 默认 UTC，与后端存储一致，且对所有访问者稳定一致
+  const siteTimezone = ref(DEFAULT_TIME_ZONE);
+
   const isLoading = ref(false);
   const lastUpdated = ref(null);
   const isInitialized = ref(false);
@@ -140,9 +147,16 @@ export const useSiteConfigStore = defineStore("siteConfig", () => {
     homeEditorEnabled: siteHomeEditorEnabled.value,
     uploadPageEnabled: siteUploadPageEnabled.value,
     mountExplorerEnabled: siteMountExplorerEnabled.value,
+    // 修改点（站点时区一期）
+    timezone: siteTimezone.value,
     lastUpdated: lastUpdated.value,
     isInitialized: isInitialized.value,
   }));
+
+  // 修改点（站点时区一期）：时区一变就同步给 timeUtils。
+  // 用 watch 而不是在各处手动调用，确保「从缓存加载」「从接口拉取」
+  // 「管理员保存后」三条路径都不会漏掉下发。
+  watch(siteTimezone, (value) => setSiteTimeZone(value), { immediate: true });
 
   // ===== 私有方法 =====
 
@@ -183,6 +197,10 @@ export const useSiteConfigStore = defineStore("siteConfig", () => {
         if (config.announcementContent !== undefined) {
           siteAnnouncementContent.value = config.announcementContent || "";
         }
+        // 修改点（站点时区一期）：缓存里有时区就先用上，保证首帧时间就按正确时区渲染
+        if (config.timezone !== undefined) {
+          siteTimezone.value = config.timezone || DEFAULT_TIME_ZONE;
+        }
         if (config.lastUpdated) {
           lastUpdated.value = config.lastUpdated;
         }
@@ -218,6 +236,8 @@ export const useSiteConfigStore = defineStore("siteConfig", () => {
         homeEditorEnabled: siteHomeEditorEnabled.value,
         uploadPageEnabled: siteUploadPageEnabled.value,
         mountExplorerEnabled: siteMountExplorerEnabled.value,
+        // 修改点（站点时区一期）
+        timezone: siteTimezone.value,
         lastUpdated: lastUpdated.value,
       };
       storedConfig.value = config;
@@ -267,6 +287,12 @@ export const useSiteConfigStore = defineStore("siteConfig", () => {
         } else {
           siteAnnouncementContent.value = "";
         }
+
+        // 修改点（站点时区一期）：查找站点时区设置
+        // 存量数据库里可能还没有这一行（新设置项靠首次保存时自动补行），
+        // 取不到就按默认 UTC 处理，不影响其它字段
+        const timezoneSetting = response.data.find((setting) => setting.key === "site_timezone");
+        siteTimezone.value = timezoneSetting?.value || DEFAULT_TIME_ZONE;
 
         // 查找页脚Markdown设置
         const footerSetting = response.data.find((setting) => setting.key === "site_footer_markdown");
@@ -416,6 +442,21 @@ export const useSiteConfigStore = defineStore("siteConfig", () => {
       lastUpdated.value = Date.now();
       saveToStorage();
       log.debug("站点标题已更新:", siteTitle.value);
+    }
+  };
+
+  /**
+   * 更新站点时区（修改点：站点时区一期）
+   * 管理员保存设置后立即生效，不必等 refresh 的网络往返。
+   * 时区值的合法性由 timeUtils 的 setSiteTimeZone 兜底（非法一律回落 UTC），
+   * 这里只负责写入状态与缓存；watch 会把新值下发给 timeUtils。
+   */
+  const updateSiteTimezone = (newTimezone) => {
+    if (typeof newTimezone === "string") {
+      siteTimezone.value = newTimezone.trim() || DEFAULT_TIME_ZONE;
+      lastUpdated.value = Date.now();
+      saveToStorage();
+      log.debug("站点时区已更新:", siteTimezone.value);
     }
   };
 
@@ -659,6 +700,8 @@ export const useSiteConfigStore = defineStore("siteConfig", () => {
     siteHomeEditorEnabled.value = true;
     siteUploadPageEnabled.value = true;
     siteMountExplorerEnabled.value = true;
+    // 修改点（站点时区一期）
+    siteTimezone.value = DEFAULT_TIME_ZONE;
     lastUpdated.value = null;
     isInitialized.value = false;
     storedConfig.remove?.();
@@ -705,6 +748,8 @@ export const useSiteConfigStore = defineStore("siteConfig", () => {
     siteHomeEditorEnabled,
     siteUploadPageEnabled,
     siteMountExplorerEnabled,
+    // 修改点（站点时区一期）
+    siteTimezone,
     isLoading,
     lastUpdated,
     isInitialized,
@@ -717,6 +762,8 @@ export const useSiteConfigStore = defineStore("siteConfig", () => {
     initialize,
     refresh,
     updateSiteTitle,
+    // 修改点（站点时区一期）
+    updateSiteTimezone,
     updateSiteFavicon,
     updateSiteFooter,
     updateCustomHead,

@@ -227,6 +227,13 @@ export default {
       hint: "支持 Markdown 格式，可以使用链接、粗体等语法，留空则不显示页脚",
       placeholder: "© 2025 CloudPaste. 保留所有权利。",
     },
+    // 修改点（站点时区一期）
+    timezone: {
+      label: "站点时区",
+      hint: "全站时间按这个时区显示。仅影响显示，不改变后端存储，也不改变定时任务的实际执行时间。",
+      browserHint: "你当前浏览器所在时区：{zone}",
+      preview: "当前时间：{time}",
+    },
     frontendEntries: {
       title: "前台入口开关",
       hint: "这里的开关只影响“前端页面入口/顶部导航”。关闭后：入口会隐藏，用户访问对应地址会自动跳转到其它可用页面。",

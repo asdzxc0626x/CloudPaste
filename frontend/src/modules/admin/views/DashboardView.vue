@@ -145,18 +145,23 @@ const error = ref(null);
 const chartType = ref("bar"); // 'bar' 或 'line'
 
 // 导入统一的时间处理工具
-import { formatCurrentTime, getUserLocale } from "@/utils/timeUtils.js";
+import { formatCurrentTime, getUserLocale, formatDateTime, parseUTCDate, getSiteTimeZone } from "@/utils/timeUtils.js";
 
-// 图表日期标签
+/**
+ * 图表日期标签（修改点：站点时区一期）
+ *
+ * 这里渲染的是「站点时区下最近 7 天的日期」，所以既要按时区取年月日，
+ * 也要按时区格式化；原来直接用 new Date() + 浏览器时区的 Intl，
+ * 站点时区设成别的地区时标签会和图表数据对不上。
+ */
 const dateLabels = computed(() => {
-  // 获取过去7天的日期
   const dates = [];
+  const locale = getUserLocale();
+  const timeZone = getSiteTimeZone();
   for (let i = 6; i >= 0; i--) {
     const date = new Date();
     date.setDate(date.getDate() - i);
-    // 使用 Intl.DateTimeFormat 确保正确的本地化
-        const locale = getUserLocale();
-    dates.push(new Intl.DateTimeFormat(locale, { month: "short", day: "numeric" }).format(date));
+    dates.push(new Intl.DateTimeFormat(locale, { month: "short", day: "numeric", timeZone }).format(date));
   }
   return dates;
 });
@@ -354,17 +359,17 @@ const getSourceInfo = (source) => {
   };
 };
 
-// 格式化快照时间
+/**
+ * 格式化快照时间（修改点：站点时区一期）
+ * 改用统一的 timeUtils，顺便获得对「SQLite 裸串 / ISO / epoch ms」三种形态的解析，
+ * 并统一按站点时区显示。
+ */
 const formatSnapshotTime = (isoString) => {
   if (!isoString) return null;
   try {
-    const date = new Date(isoString);
-    return new Intl.DateTimeFormat(getUserLocale(), {
-      month: "short",
-      day: "numeric",
-      hour: "2-digit",
-      minute: "2-digit",
-    }).format(date);
+    if (!parseUTCDate(isoString)) return null;
+    const text = formatDateTime(isoString, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+    return text === "日期无效" || text === "Invalid Date" ? null : text;
   } catch {
     return null;
   }

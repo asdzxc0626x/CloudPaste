@@ -440,6 +440,17 @@ export async function addSiteSettings(db) {
       sort_order: 5,
       flags: 0,
     },
+    {
+      // 修改点（站点时区一期）：全站时间显示所用的时区
+      // 默认 UTC，与后端存储一致；仅影响显示，不改变定时任务的实际执行时间
+      key: "site_timezone",
+      value: "UTC",
+      description: "站点时间显示所用的时区（IANA 名称，如 Asia/Shanghai、Europe/Berlin）。仅影响显示，不改变后端存储与定时任务的实际执行时间。",
+      type: "select",
+      group_id: 4,
+      sort_order: 11,
+      flags: 0,
+    },
   ];
 
   for (const setting of siteSettings) {
