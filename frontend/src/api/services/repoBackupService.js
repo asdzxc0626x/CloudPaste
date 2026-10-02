@@ -185,10 +185,14 @@ export function listRepositories() {
 /**
  * 获取单个仓库
  * @param {string} id
+ * @param {{ reveal?: 'plain' }} [options] 修改点（第 3 期 3-B）：
+ *        reveal='plain' 时后端会连凭据池的明文一起返回（仅管理员，后端有审计日志）。
+ *        默认不带该参数，凭据一律是掩码。
  * @returns {Promise<{success: boolean, data: CodeRepository, message: string}>}
  */
-export function getRepository(id) {
-  return get(`${BASE}/repositories/${encodeURIComponent(id)}`);
+export function getRepository(id, options = {}) {
+  const query = options?.reveal === "plain" ? "?reveal=plain" : "";
+  return get(`${BASE}/repositories/${encodeURIComponent(id)}${query}`);
 }
 
 /**
@@ -311,6 +315,30 @@ export function getBackupDownloadLink(backupId, options = {}) {
   return get(`${BASE}/backups/${encodeURIComponent(backupId)}/link${query ? `?${query}` : ""}`);
 }
 
+/******************************************************************************
+ * 全局 GitHub 凭据池（修改点：第 3 期 3-B）
+ ******************************************************************************/
+
+/**
+ * 获取全局 Token / 代理池
+ * @param {{ reveal?: 'plain' }} [options] reveal='plain' 时返回明文（仅管理员，后端有审计日志）
+ * @returns {Promise<{success: boolean, data: {tokens: CredentialEntry[], proxies: CredentialEntry[]}, message: string}>}
+ */
+export function getGlobalCredentials(options = {}) {
+  const query = options?.reveal === "plain" ? "?reveal=plain" : "";
+  return get(`${BASE}/credentials${query}`);
+}
+
+/**
+ * 保存全局 Token / 代理池（整体保存）
+ * - 未改动的条目可以把掩码原样回传，后端会还原成原值
+ * @param {{tokens: CredentialEntry[], proxies: CredentialEntry[]}} pool
+ * @returns {Promise<{success: boolean, data: {tokens: CredentialEntry[], proxies: CredentialEntry[]}, message: string}>}
+ */
+export function saveGlobalCredentials(pool) {
+  return put(`${BASE}/credentials`, pool);
+}
+
 export default {
   getProviders,
   listRepositories,
@@ -323,4 +351,6 @@ export default {
   triggerBackup,
   listBackups,
   getBackupDownloadLink,
+  getGlobalCredentials,
+  saveGlobalCredentials,
 };

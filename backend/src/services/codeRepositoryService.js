@@ -41,6 +41,15 @@ import {
   MAX_TARGET_MOUNTS,
 } from "../repobackup/config.js";
 import { normalizePathPrefix, buildRepoFolderName } from "../repobackup/paths.js";
+// 修改点（第 3 期 3-B 凭据池）：全局池的读写与视图构建
+import {
+  loadGlobalPool,
+  saveGlobalPool,
+  mergePool,
+  buildPoolView,
+  POOL_TOKEN_KEY,
+  POOL_PROXY_KEY,
+} from "../repobackup/credentials.js";
 import {
   resolveScheduleInput,
   syncRepositoryScheduleJob,
@@ -337,8 +346,11 @@ export async function listRepositories(db, repositoryFactory, encryptionSecret, 
 
 /**
  * 获取单个仓库
+ *
+ * 修改点（第 3 期 3-B）：options.reveal === "plain" 时把凭据池明文一并返回。
+ * 仅管理员可走该分支（路由层负责鉴权与审计日志），默认仍是掩码。
  */
-export async function getRepository(db, repositoryFactory, encryptionSecret, id, env = {}) {
+export async function getRepository(db, repositoryFactory, encryptionSecret, id, env = {}, options = {}) {
   const factory = ensureRepositoryFactory(db, repositoryFactory, env);
   const codeRepo = factory.getCodeRepositoryRepository();
   const mountRepository = factory.getMountRepository();
@@ -358,7 +370,7 @@ export async function getRepository(db, repositoryFactory, encryptionSecret, id,
   const latestBackupTargets = latestBackup ? await codeRepo.findTargetsByBackup(latestBackup.id) : [];
 
   return toRepositoryDto(row, {
-    config: await buildProviderConfigView(row.provider, row.config_json, encryptionSecret),
+    config: await buildProviderConfigView(row.provider, row.config_json, encryptionSecret, options),
     targetMount: targetMounts[0] || null,
     targetMounts,
     missingMountIds: targetMountIds.filter((_, index) => !targetMounts[index]),
@@ -366,6 +378,49 @@ export async function getRepository(db, repositoryFactory, encryptionSecret, id,
     schedule: await loadRepositorySchedule(db, row.id),
     latestBackup: latestBackup ? toBackupDto(latestBackup, { targets: latestBackupTargets }) : null,
   });
+}
+
+// ==================== 全局 GitHub 凭据池（修改点：第 3 期 3-B）====================
+
+/**
+ * 读取全局凭据池
+ * @param {any} db
+ * @param {string} encryptionSecret
+ * @param {{ reveal?: 'plain'|null }} [options]
+ */
+export async function getGlobalCredentialPool(db, encryptionSecret, options = {}) {
+  const pool = await loadGlobalPool(db, encryptionSecret);
+  return buildPoolView(pool, { revealPlain: options?.reveal === "plain" });
+}
+
+/**
+ * 更新全局凭据池（整体保存，前端每次提交完整的池）
+ * - 掩码值会被还原成原值，因此「只改备注/开关」不会把 Token 抹掉
+ * @param {any} db
+ * @param {string} encryptionSecret
+ * @param {any} incoming 前端提交的池
+ */
+export async function updateGlobalCredentialPool(db, encryptionSecret, incoming) {
+  const existing = await loadGlobalPool(db, encryptionSecret);
+  const merged = mergePool(existing, incoming);
+  await saveGlobalPool(db, merged, encryptionSecret);
+  return buildPoolView(merged);
+}
+
+/**
+ * 只读取池的「配置概况」，供仓库页/诊断使用
+ * - 绝不含任何凭据内容，只报数量
+ */
+export async function describeGlobalCredentialPool(db, encryptionSecret) {
+  const pool = await loadGlobalPool(db, encryptionSecret);
+  const summarize = (entries) => ({
+    total: entries.length,
+    enabled: entries.filter((entry) => entry.enabled && String(entry.value || "").trim() !== "").length,
+  });
+  return {
+    tokens: summarize(pool[POOL_TOKEN_KEY]),
+    proxies: summarize(pool[POOL_PROXY_KEY]),
+  };
 }
 
 /**
@@ -723,8 +778,13 @@ export async function checkRepository(db, repositoryFactory, encryptionSecret, i
   const providerConfig = await parseProviderConfig(row.provider, row.config_json, encryptionSecret);
   // 修改点（第 3 期 请求调度）：把 db/env 交给 provider，让所有 GitHub API 请求
   // 统一经过请求调度器（并发/间隔节流 + 共享额度账本 + 同名请求合并）。
-  // 「检查更新」也会消耗匿名额度，因此必须与备份任务共用同一份账本。
-  const provider = RepoProviderFactory.createProvider(row.provider, providerConfig, { db, env });
+  // 「检查更新」也会消耗约额度，因此必须与备份任务共用同一份账本。
+  // 修改点（第 3 期 3-B）：再带上 encryptionSecret，provider 才能读取全局凭据池。
+  const provider = RepoProviderFactory.createProvider(row.provider, providerConfig, {
+    db,
+    env,
+    encryptionSecret,
+  });
 
   const trackMode = String(row.track_mode || "branch");
   const trackRefs = resolveTrackRefs(row);
@@ -919,4 +979,8 @@ export default {
   listBackups,
   getBackupDownloadLink,
   countRepositoriesByMount,
+  // 修改点（第 3 期 3-B）：全局 GitHub 凭据池
+  getGlobalCredentialPool,
+  updateGlobalCredentialPool,
+  describeGlobalCredentialPool,
 };

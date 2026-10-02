@@ -5,14 +5,16 @@
  * 用途：把外部代码仓库的源码快照备份到已配置的 Storage Mount，
  * 防止仓库被删除/封禁导致源码丢失。
  */
-import { onMounted } from "vue";
+import { onMounted, ref } from "vue";
 import { useThemeMode } from "@/composables/core/useThemeMode.js";
 import { useRepoBackup } from "@/modules/admin/composables/useRepoBackup.js";
-import { IconPlus, IconRefresh } from "@/components/icons";
+import { IconPlus, IconRefresh, IconKey } from "@/components/icons";
 
 import RepoBackupTable from "@/modules/admin/components/repo-backup/RepoBackupTable.vue";
 import RepoBackupForm from "@/modules/admin/components/repo-backup/RepoBackupForm.vue";
 import RepoBackupHistory from "@/modules/admin/components/repo-backup/RepoBackupHistory.vue";
+// 修改点（第 3 期 3-B）：全局 Token / 代理池配置弹窗
+import GithubPoolDialog from "@/modules/admin/components/repo-backup/GithubPoolDialog.vue";
 
 const { isDarkMode: darkMode } = useThemeMode();
 
@@ -73,6 +75,13 @@ const onBackup = async (repo) => {
   }
 };
 
+/** 修改点（第 3 期 3-B）：全局 Token / 代理池弹窗的开关 */
+const showPoolDialog = ref(false);
+
+const onPoolSaved = () => {
+  showPoolDialog.value = false;
+};
+
 onMounted(() => {
   initialize();
 });
@@ -93,6 +102,20 @@ onMounted(() => {
         </div>
 
         <div class="flex items-center gap-2 shrink-0">
+          <!-- 修改点（第 3 期 3-B）：全局 Token / 代理池 -->
+          <button
+            class="inline-flex items-center whitespace-nowrap px-2.5 py-1.5 md:px-4 md:py-2 border text-sm font-medium rounded-md shadow-sm focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
+            :class="
+              darkMode
+                ? 'border-gray-600 text-gray-200 bg-gray-800 hover:bg-gray-700'
+                : 'border-gray-300 text-gray-700 bg-white hover:bg-gray-50'
+            "
+            @click="showPoolDialog = true"
+          >
+            <IconKey class="h-4 w-4 mr-1 shrink-0" />
+            <span>{{ $t("admin.repoBackup.toolbar.globalCredentials") }}</span>
+          </button>
+
           <button
             class="inline-flex items-center whitespace-nowrap px-2.5 py-1.5 md:px-4 md:py-2 border border-transparent text-sm font-medium rounded-md shadow-sm text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
             @click="openCreateForm"
@@ -166,6 +189,12 @@ onMounted(() => {
       @status-change="changeHistoryStatuses"
       @download="downloadBackup"
     />
+
+    <!-- 全局 Token / 代理池（修改点：第 3 期 3-B）
+         与其它弹窗一样 Teleport 到 body，避免被 AdminLayout 的层叠上下文压住 -->
+    <Teleport to="body">
+      <GithubPoolDialog v-if="showPoolDialog" :dark-mode="darkMode" @close="showPoolDialog = false" @saved="onPoolSaved" />
+    </Teleport>
 
     <!-- 删除确认：手机端按钮全宽堆叠，仓库名可能很长故允许换行 -->
     <!-- 修改点（弹窗顶部被控制栏遮挡）：Teleport 到 body，脱离 AdminLayout main 容器的

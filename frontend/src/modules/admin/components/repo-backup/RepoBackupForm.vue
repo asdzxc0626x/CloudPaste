@@ -24,6 +24,9 @@
 import { computed, reactive, ref, watch, onMounted, onBeforeUnmount } from "vue";
 import { useI18n } from "vue-i18n";
 import { IconClose, IconChevronDown, IconCheck } from "@/components/icons";
+// 修改点（第 3 期 3-B）：仓库级 Token / 代理池编辑器
+import CredentialPoolField from "./CredentialPoolField.vue";
+import { getRepository } from "@/api/services/repoBackupService";
 
 const props = defineProps({
   /** 编辑的仓库对象；为 null 表示新建 */
@@ -252,6 +255,30 @@ const fieldDescription = (field) => translate(field.ui?.descriptionKey, "");
 const getConfigValue = (name) => formData.config?.[name] ?? "";
 const setConfigValue = (name, value) => {
   formData.config[name] = value;
+};
+
+// ==================== 凭据池（修改点：第 3 期 3-B）====================
+
+/** 池字段的当前值（缺失时按空数组处理，避免子组件拿到 undefined） */
+const getPoolValue = (name) => {
+  const value = formData.config?.[name];
+  return Array.isArray(value) ? value : [];
+};
+
+/**
+ * 取回某个池的明文（仅在用户点「显示」时调用）
+ *
+ * 只对已存在的仓库可用 —— 新建仓库还没有 id，此时池里的值本来就是用户刚输入的明文，
+ * 子组件会直接切换输入框类型，不会走到这里。
+ *
+ * 后端会记录一条不含明文的审计日志（与存储配置的 reveal 同一套做法）。
+ */
+const revealRepoPool = async (name) => {
+  const id = props.repo?.id;
+  if (!id) return [];
+  const resp = await getRepository(id, { reveal: "plain" });
+  const entries = resp?.data?.config?.[name];
+  return Array.isArray(entries) ? entries : [];
 };
 
 // ==================== 多分支：chip 输入 ====================
@@ -787,14 +814,24 @@ onBeforeUnmount(() => document.removeEventListener("keydown", onEscClose));
             </button>
 
             <div v-if="advancedOpen" class="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5">
-              <div v-for="field in configFields" :key="field.name">
+              <div v-for="field in configFields" :key="field.name" :class="field.type === 'secretPool' ? 'sm:col-span-2 lg:col-span-3' : ''">
                 <label :class="labelClass">
                   {{ fieldLabel(field) }}
                   <span v-if="field.required" class="text-red-500">*</span>
                 </label>
 
+                <!-- secretPool 类型（修改点：第 3 期 3-B）：可增删的多条 Token / 代理 -->
+                <CredentialPoolField
+                  v-if="field.type === 'secretPool'"
+                  :model-value="getPoolValue(field.name)"
+                  :field="field"
+                  :dark-mode="darkMode"
+                  :reveal="() => revealRepoPool(field.name)"
+                  @update:model-value="setConfigValue(field.name, $event)"
+                />
+
                 <!-- secret 类型：密码框 + 显示切换 -->
-                <div v-if="field.type === 'secret'" class="relative">
+                <div v-else-if="field.type === 'secret'" class="relative">
                   <input
                     :type="secretVisible[field.name] ? 'text' : 'password'"
                     :value="getConfigValue(field.name)"

@@ -17,6 +17,13 @@ ADMIN_TOKEN_EXPIRY_DAYS = "7"
 # 调试开关（默认 false，不区分大小写）
 # - DEBUG_DRIVER_CACHE=true：开启驱动缓存命中日志
 # DEBUG_DRIVER_CACHE = "false"
+# 代码仓库备份：GitHub 请求调度参数（修改点：第 3 期，均可选，注释掉即用默认值）
+# - REPO_BACKUP_GITHUB_MAX_CONCURRENCY：全局并发上限，默认 2
+# - REPO_BACKUP_GITHUB_MIN_INTERVAL_MS：相邻请求最小间隔（毫秒），默认 800
+# - REPO_BACKUP_GITHUB_HOURLY_BUDGET：无 Token 时的小时预算，默认 45（真实匿名上限为 60）
+# REPO_BACKUP_GITHUB_MAX_CONCURRENCY = "2"
+# REPO_BACKUP_GITHUB_MIN_INTERVAL_MS = "800"
+# REPO_BACKUP_GITHUB_HOURLY_BUDGET = "45"
 
 # 绑定D1数据库
 # 需要替换为实际的数据库ID

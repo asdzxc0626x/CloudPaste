@@ -159,6 +159,8 @@ RepoProviderFactory.registerProvider(RepoProviderFactory.SUPPORTED_TYPES.GITHUB,
   configSchema: {
     fields: [
       {
+        // 修改点（第 3 期 3-B）：单个 Token 保留为「快速填写」入口，
+        // 真正参与调度的是下面的 tokens 池（该字段会被当作池里的第一条）
         name: "token",
         type: "secret",
         required: false,
@@ -167,6 +169,36 @@ RepoProviderFactory.registerProvider(RepoProviderFactory.SUPPORTED_TYPES.GITHUB,
           fullWidth: true,
           placeholderKey: "admin.repoBackup.placeholder.github.token",
           descriptionKey: "admin.repoBackup.description.github.token",
+        },
+      },
+      {
+        // 修改点（第 3 期 3-B）：仓库级 Token 池。
+        // 留空则自动使用全局池；全局池也没有时按匿名额度调度。
+        name: "tokens",
+        type: "secretPool",
+        required: false,
+        labelKey: "admin.repoBackup.fields.github.tokens",
+        ui: {
+          fullWidth: true,
+          descriptionKey: "admin.repoBackup.description.github.tokens",
+          entryLabelKey: "admin.repoBackup.pool.tokenEntry",
+          valuePlaceholderKey: "admin.repoBackup.pool.tokenPlaceholder",
+          addLabelKey: "admin.repoBackup.pool.addToken",
+        },
+      },
+      {
+        // 修改点（第 3 期 3-B）：仓库级加速代理池。
+        // 与 Token 池相互独立，调度时动态组合，不固定绑定。
+        name: "proxies",
+        type: "secretPool",
+        required: false,
+        labelKey: "admin.repoBackup.fields.github.proxies",
+        ui: {
+          fullWidth: true,
+          descriptionKey: "admin.repoBackup.description.github.proxies",
+          entryLabelKey: "admin.repoBackup.pool.proxyEntry",
+          valuePlaceholderKey: "admin.repoBackup.pool.proxyPlaceholder",
+          addLabelKey: "admin.repoBackup.pool.addProxy",
         },
       },
       {
@@ -200,7 +232,7 @@ RepoProviderFactory.registerProvider(RepoProviderFactory.SUPPORTED_TYPES.GITHUB,
         {
           name: "advanced",
           titleKey: "admin.repoBackup.groups.advanced",
-          fields: ["token", "gh_proxy", "endpoint_url"],
+          fields: ["token", "tokens", "proxies", "gh_proxy", "endpoint_url"],
         },
       ],
     },

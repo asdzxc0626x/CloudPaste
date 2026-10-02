@@ -9,6 +9,8 @@ export default {
       create: "Add Repository",
       refresh: "Refresh",
       refreshing: "Refreshing...",
+      // 修改点（第 3 期 3-B）：全局 Token / 代理池入口
+      globalCredentials: "Global credentials",
     },
 
     table: {
@@ -151,10 +153,39 @@ export default {
       hide: "Hide",
     },
 
+    // 修改点（第 3 期 3-B）：Token / 代理池编辑器
+    pool: {
+      globalTitle: "Global GitHub credential pool",
+      globalSubtitle: "Tokens and proxies shared by every repository that does not define its own",
+      tokenEntry: "Token label (optional)",
+      proxyEntry: "Proxy label (optional)",
+      tokenPlaceholder: "ghp_xxx",
+      proxyPlaceholder: "https://ghproxy.example.com",
+      entryLabel: "Label",
+      valuePlaceholder: "Credential value",
+      add: "Add entry",
+      addToken: "Add token",
+      addProxy: "Add proxy",
+      remove: "Remove",
+      enabled: "Enabled",
+      empty: "No entry configured yet",
+      priorityHint:
+        "Selection order: repository credentials, then global credentials, then the anonymous quota. Tokens and proxies are picked independently rather than pinned together; a throttled or invalid credential is avoided temporarily.",
+      save: "Save",
+      saving: "Saving...",
+      cancel: "Cancel",
+      loading: "Loading...",
+      loadFailed: "Failed to load the global credential pool",
+      saveFailed: "Failed to save the global credential pool",
+    },
+
     fields: {
       github: {
         token: "GitHub token (optional)",
         gh_proxy: "Acceleration proxy (optional)",
+        // 修改点（第 3 期 3-B）
+        tokens: "Repository token pool (optional)",
+        proxies: "Repository proxy pool (optional)",
         endpoint_url: "API endpoint (optional)",
       },
     },
@@ -171,6 +202,10 @@ export default {
       github: {
         token:
           "Not needed for public repositories. Providing one raises the GitHub API rate limit so frequent checks are not throttled",
+        tokens:
+          "Leave empty to fall back to the global credential pool; if that is empty too, the anonymous quota is used. With several tokens the scheduler picks dynamically by quota and rate-limit state, so one being throttled does not affect the others",
+        proxies:
+          "Kept separate from the token pool and combined dynamically at request time rather than pinned together. A failing node is avoided temporarily; when none is usable the request goes direct",
         gh_proxy: "Prepended to the download URL to accelerate source archive downloads",
         endpoint_url: "GitHub Enterprise or self-hosted API endpoint, defaults to https://api.github.com",
       },

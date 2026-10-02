@@ -381,7 +381,12 @@ export class RepoBackupTaskHandler implements TaskHandler {
     // GitHub API 请求统一经过请求调度器（全局并发 <=2、间隔 >=800ms、
     // 请求前查共享额度账本、同名请求合并）。额度不足时会抛出 RateLimitedError，
     // 由下面的第 2 期延迟重试逻辑接住 —— 不记失败，改为安排到点重跑。
-    const providerInstance = RepoProviderFactory.createProvider(provider, providerConfig, { db, env });
+    // 修改点（第 3 期 3-B）：再带上 encryptionSecret，provider 才能读取全局凭据池。
+    const providerInstance = RepoProviderFactory.createProvider(provider, providerConfig, {
+      db,
+      env,
+      encryptionSecret,
+    });
 
     currentStage = "resolving";
     await report(0);

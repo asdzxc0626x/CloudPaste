@@ -24,6 +24,9 @@ import {
   checkRepository,
   listBackups,
   getBackupDownloadLink,
+  // 修改点（第 3 期 3-B）：全局 GitHub 凭据池
+  getGlobalCredentialPool,
+  updateGlobalCredentialPool,
 } from "../services/codeRepositoryService.js";
 
 const codeRepositoryRoutes = new Hono();
@@ -67,10 +70,75 @@ codeRepositoryRoutes.get("/api/admin/repo-backup/repositories", requireAdmin, as
   return jsonOk(c, items, "获取代码仓库列表成功");
 });
 
+// ==================== 全局 GitHub 凭据池（修改点：第 3 期 3-B）====================
+
+/**
+ * 读取全局 Token / 代理池
+ *
+ * 默认返回掩码；`?reveal=plain` 才下发明文。语义与存储配置的
+ * `GET /api/admin/storage/:id?reveal=plain` 保持一致，并且同样写一条
+ * 不含明文的审计日志 —— 明文只在管理员显式请求时出现。
+ */
+codeRepositoryRoutes.get("/api/admin/repo-backup/credentials", requireAdmin, async (c) => {
+  const { db, encryptionSecret, env } = resolveContext(c);
+  const identity = resolvePrincipal(c, { allowedTypes: [UserType.ADMIN] });
+
+  const reveal = c.req.query("reveal");
+  const revealPlain = reveal === "plain";
+
+  const pool = await getGlobalCredentialPool(db, encryptionSecret, { reveal: revealPlain ? "plain" : null });
+
+  if (revealPlain) {
+    // 简要审计日志：只记谁在什么时候看了明文，不记明文本身
+    console.log(
+      JSON.stringify({
+        type: "repo_backup.credentials.reveal",
+        scope: "global",
+        adminId: identity?.userId ?? null,
+        timestamp: new Date().toISOString(),
+      }),
+    );
+  }
+
+  return jsonOk(c, pool, "获取全局 GitHub 凭据池成功");
+});
+
+/**
+ * 保存全局 Token / 代理池（整体保存）
+ * - 前端每次提交完整的池；掩码值会被还原成原值，不会因为「只改备注」而抹掉 Token
+ */
+codeRepositoryRoutes.put("/api/admin/repo-backup/credentials", requireAdmin, async (c) => {
+  const { db, encryptionSecret, env } = resolveContext(c);
+  resolvePrincipal(c, { allowedTypes: [UserType.ADMIN] });
+
+  const body = await c.req.json().catch(() => ({}));
+  const pool = await updateGlobalCredentialPool(db, encryptionSecret, body);
+  return jsonOk(c, pool, "全局 GitHub 凭据池已保存");
+});
+
 codeRepositoryRoutes.get("/api/admin/repo-backup/repositories/:id", requireAdmin, async (c) => {
   const { db, repositoryFactory, encryptionSecret, env } = resolveContext(c);
   const { id } = c.req.param();
-  const repo = await getRepository(db, repositoryFactory, encryptionSecret, id, env);
+
+  // 修改点（第 3 期 3-B）：仓库级凭据池同样支持显式 reveal（仅管理员）
+  const revealPlain = c.req.query("reveal") === "plain";
+  const repo = await getRepository(db, repositoryFactory, encryptionSecret, id, env, {
+    reveal: revealPlain ? "plain" : null,
+  });
+
+  if (revealPlain) {
+    const identity = resolvePrincipal(c, { allowedTypes: [UserType.ADMIN] });
+    console.log(
+      JSON.stringify({
+        type: "repo_backup.credentials.reveal",
+        scope: "repository",
+        repositoryId: id,
+        adminId: identity?.userId ?? null,
+        timestamp: new Date().toISOString(),
+      }),
+    );
+  }
+
   return jsonOk(c, repo, "获取代码仓库成功");
 });
 

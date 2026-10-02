@@ -76,9 +76,20 @@ export const GITHUB_SCHEDULER_ENV_KEYS = {
 /** 账本在 metrics_cache 里的坐标（scope_type / scope_id / metric_key） */
 const QUOTA_SCOPE_TYPE = "repobackup_github";
 const QUOTA_METRIC_KEY = "rate_limit";
+/** 同一个 scope 的「暂时避开」状态（修改点：第 3 期 3-B） */
+export const COOLDOWN_METRIC_KEY = "cooldown";
 
 /** 未配置 Token 时共用的账本分区（匿名额度按 IP 计，所有匿名请求共享同一份额度） */
 export const ANONYMOUS_SCOPE_ID = "anonymous";
+
+/**
+ * 故障冷却时长（修改点：第 3 期 3-B）
+ * - Token 明确失效（401）时避开 15 分钟：期间换别的 Token，避免每次都白撞一次
+ * - 代理网络层失败时避开 3 分钟：多半是节点抽风，短时间避开即可
+ * 限流走的是账本里的 remaining/resetAt，不再额外设冷却（那是重复的两套状态）
+ */
+export const TOKEN_INVALID_COOLDOWN_MS = 15 * 60 * 1000;
+export const PROXY_FAILURE_COOLDOWN_MS = 3 * 60 * 1000;
 
 const METRICS_TABLE = DbTables.METRICS_CACHE;
 
@@ -172,6 +183,160 @@ export function buildQuotaScopeId(token) {
   const text = String(token || "").trim();
   if (!text) return ANONYMOUS_SCOPE_ID;
   return `token-${fnv1aHex(text).slice(0, 12)}`;
+}
+
+/**
+ * 计算加速代理的账本分区（修改点：第 3 期 3-B）
+ *
+ * 与 Token 一样按值散列：同一个代理被多个仓库、多个 Token 共用时，
+ * 「这个节点刚失败过」的状态天然共享，不会每个仓库各撞一次。
+ *
+ * 注意：代理地址可能内嵌 basic auth（https://user:pass@host），
+ * 因此这里同样只输出散列，代理明文不会进入账本或日志。
+ *
+ * @param {string|null} proxyUrl
+ * @returns {string}
+ */
+export function buildProxyScopeId(proxyUrl) {
+  const text = String(proxyUrl || "").trim();
+  if (!text) return "direct";
+  return `proxy-${fnv1aHex(text).slice(0, 12)}`;
+}
+
+// ==================== 凭据运行期状态（第 3 期 3-B）====================
+//
+// 这些函数把「某个 Token / 某个代理现在能不能用」收敛成一次查询，
+// 供 provider 在挑选凭据时使用。状态全部落在第 3-A 已经建好的 metrics_cache 上，
+// 因此跨仓库、跨任务、跨实例共享，且不需要任何新表。
+
+/** 空状态（没有任何已知的不可用信息） */
+function emptyScopeState() {
+  return { cooldownUntilMs: 0, remaining: null, resetAtMs: null, limit: null };
+}
+
+/**
+ * 一次读出全部凭据分区的运行期状态
+ *
+ * 用「一次全表读 + 内存分组」而不是「每个候选各查一次」：池里通常只有几条，
+ * 一次查询足够，且避免了按 id 拼 SQL。
+ *
+ * @param {any} db
+ * @returns {Promise<Map<string, { cooldownUntilMs: number, remaining: number|null, resetAtMs: number|null, limit: number|null }>>}
+ */
+export async function readScopeStates(db) {
+  const map = new Map();
+  if (!db) return map;
+
+  try {
+    const result = await db
+      .prepare(
+        `SELECT scope_id, metric_key, value_num, value_json_text
+           FROM ${METRICS_TABLE}
+          WHERE scope_type = ?`,
+      )
+      .bind(QUOTA_SCOPE_TYPE)
+      .all();
+
+    const rows = result?.results || [];
+    for (const row of rows) {
+      const scopeId = String(row?.scope_id || "");
+      if (!scopeId) continue;
+
+      const state = map.get(scopeId) || emptyScopeState();
+      if (row.metric_key === COOLDOWN_METRIC_KEY) {
+        state.cooldownUntilMs = Number(row.value_num) || 0;
+      } else if (row.metric_key === QUOTA_METRIC_KEY) {
+        const info = parseLedgerJson(row.value_json_text);
+        state.remaining = Number.isFinite(Number(info.remaining)) ? Number(info.remaining) : null;
+        state.resetAtMs = Number.isFinite(Number(info.resetAtMs)) ? Number(info.resetAtMs) : null;
+        state.limit = Number.isFinite(Number(info.limit)) ? Number(info.limit) : null;
+      }
+      map.set(scopeId, state);
+    }
+  } catch (error) {
+    // 读不到就当作「没有任何已知的不可用状态」：宁可多试一次，
+    // 也不能因为账本读失败把所有 Token / 代理判成不可用
+    console.warn(
+      `[GithubRequestScheduler] 读取凭据状态失败，按全部可用处理（fail-open）: ${error?.message || error}`,
+    );
+  }
+
+  return map;
+}
+
+/** 取某个分区的状态（缺省 = 没有任何不可用信息） */
+export function resolveScopeState(map, scopeId) {
+  return map?.get?.(scopeId) || emptyScopeState();
+}
+
+/**
+ * 判断某个分区此刻是否应当避开
+ * @param {object} state resolveScopeState 的结果
+ * @param {{ nowMs: number, reserve?: number }} options
+ */
+export function isScopeBlocked(state, { nowMs, reserve = 0 } = {}) {
+  if (!state) return false;
+  // 1. 明确处于冷却期（Token 失效 / 代理刚失败）
+  if (Number(state.cooldownUntilMs) > nowMs) return true;
+  // 2. 额度已见底且还没到恢复时间（与请求前的额度预检同一个判据）
+  const remaining = Number(state.remaining);
+  const reserveAmount = Number.isFinite(Number(reserve)) ? Number(reserve) : 0;
+  if (Number.isFinite(remaining) && remaining <= reserveAmount && Number(state.resetAtMs) > nowMs) return true;
+  return false;
+}
+
+/** 该分区最早可能恢复的时间（用于算「全都不可用时该等到什么时候」） */
+export function scopeRecoverAtMs(state) {
+  if (!state) return 0;
+  return Math.max(Number(state.cooldownUntilMs) || 0, Number(state.resetAtMs) || 0);
+}
+
+/**
+ * 把某个分区标记为「暂时避开」
+ *
+ * 冷却只会被延长、不会被缩短（SQL 里用 MAX），避免两个实例互相覆盖成更短的窗口。
+ * reason 只写非敏感的短标签（例如 "token-invalid"），绝不写凭据本身。
+ *
+ * @param {any} db
+ * @param {string} scopeId
+ * @param {number} untilMs 恢复到什么时候（epoch ms）
+ * @param {string} [reason] 非敏感的原因标签
+ * @returns {Promise<boolean>}
+ */
+export async function markScopeCooldown(db, scopeId, untilMs, reason = "") {
+  if (!db || !scopeId) return false;
+  const until = Number(untilMs);
+  if (!Number.isFinite(until) || until <= Date.now()) return false;
+
+  const nowMs = Date.now();
+  try {
+    const result = await db
+      .prepare(
+        `INSERT INTO ${METRICS_TABLE}
+           (scope_type, scope_id, metric_key, value_num, value_text, value_json_text, snapshot_at_ms, updated_at_ms, error_message)
+         VALUES (?, ?, ?, ?, ?, NULL, ?, ?, NULL)
+         ON CONFLICT(scope_type, scope_id, metric_key) DO UPDATE SET
+           value_num = MAX(COALESCE(value_num, 0), excluded.value_num),
+           value_text = excluded.value_text,
+           updated_at_ms = excluded.updated_at_ms`,
+      )
+      .bind(
+        QUOTA_SCOPE_TYPE,
+        scopeId,
+        COOLDOWN_METRIC_KEY,
+        until,
+        reason ? String(reason).slice(0, 120) : null,
+        nowMs,
+        nowMs,
+      )
+      .run();
+
+    return changesOf(result) > 0;
+  } catch (error) {
+    // 记不上冷却只是少一层保护，不影响本次请求
+    console.warn(`[GithubRequestScheduler] 写入凭据冷却状态失败: ${error?.message || error}`);
+    return false;
+  }
 }
 
 /** 解析账本里的 JSON 列（坏数据一律当空） */
@@ -697,10 +862,19 @@ export default {
   GITHUB_SCHEDULER_DEFAULTS,
   GITHUB_SCHEDULER_ENV_KEYS,
   ANONYMOUS_SCOPE_ID,
+  COOLDOWN_METRIC_KEY,
+  TOKEN_INVALID_COOLDOWN_MS,
+  PROXY_FAILURE_COOLDOWN_MS,
   GithubRequestScheduler,
   githubRequestScheduler,
   resolveGithubSchedulerConfig,
   buildQuotaScopeId,
+  buildProxyScopeId,
+  readScopeStates,
+  resolveScopeState,
+  isScopeBlocked,
+  scopeRecoverAtMs,
+  markScopeCooldown,
   runCoalesced,
   clearCoalescedCache,
   coalescedCacheSize,

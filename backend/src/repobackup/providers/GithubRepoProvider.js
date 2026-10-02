@@ -50,8 +50,26 @@ import {
   githubRequestScheduler,
   resolveGithubSchedulerConfig,
   buildQuotaScopeId,
+  buildProxyScopeId,
+  readScopeStates,
+  resolveScopeState,
+  isScopeBlocked,
+  scopeRecoverAtMs,
+  markScopeCooldown,
   runCoalesced,
+  ANONYMOUS_SCOPE_ID,
+  TOKEN_INVALID_COOLDOWN_MS,
+  PROXY_FAILURE_COOLDOWN_MS,
 } from "../GithubRequestScheduler.js";
+// 修改点（第 3 期 3-B 凭据池）：多 Token / 多代理，仓库级优先、全局级兜底
+import {
+  loadGlobalPool,
+  extractRepoPool,
+  listCredentialCandidates,
+  hasConfiguredEntries,
+  POOL_TOKEN_KEY,
+  POOL_PROXY_KEY,
+} from "../credentials.js";
 
 const DEFAULT_API_BASE = "https://api.github.com";
 const RETRY_MAX_ATTEMPTS = 3;
@@ -112,6 +130,16 @@ const DEFAULT_CODELOAD_BASE = "https://codeload.github.com";
 /** 默认 API 主机名，用于判断是否可以安全切到 codeload */
 const DEFAULT_API_BASE_HOST = "api.github.com";
 
+/**
+ * 凭据轮转游标（修改点：第 3 期 3-B）
+ *
+ * 放在模块级而不是实例上：每次备份任务都会新建一个 provider 实例，
+ * 如果游标跟着实例走，每个任务都从第 0 个凭据开始，「不固定绑定」就名存实亡
+ * —— 所有流量会一直压在第一个 Token / 代理上，直到它被限流为止。
+ * 模块级游标让轮转跨任务、跨调用方持续推进。
+ */
+const credentialRotation = { token: 0, proxy: 0 };
+
 // 说明：constants/index.js 的 ApiStatus 未定义 502/BAD_GATEWAY，
 // 为避免引用未定义常量（会静默退化成 undefined），上游失败统一使用 INTERNAL_ERROR，
 // 并通过 expose:true + 明确 message 让管理端看到真实原因。
@@ -141,11 +169,14 @@ function parseRepoIdentifier(raw) {
 
 export class GithubRepoProvider extends BaseRepoProvider {
   /**
-   * @param {Object} config 已解密的 provider 配置 { token?, gh_proxy?, endpoint_url? }
-   * @param {{ db?: any, env?: object|null }} [runtime] 运行时依赖（修改点：第 3 期）
-   *        db  —— 额度账本所在的数据库句柄（D1 binding 或 Node SQLite 适配器）。
-   *               拿不到时只做进程内节流，跳过额度账本（fail-open，不影响原有功能）。
-   *        env —— 用于读取第 3 期的调度参数覆盖（并发 / 间隔 / 小时预算）。
+   * @param {Object} config 已解密的 provider 配置
+   *        { token?, gh_proxy?, endpoint_url?, tokens?: Array, proxies?: Array }
+   *        （tokens / proxies 是第 3 期 3-B 的凭据池，见 repobackup/credentials.js）
+   * @param {{ db?: any, env?: object|null, encryptionSecret?: string|null }} [runtime] 运行时依赖
+   *        db               —— 额度账本 / 凭据状态的数据库句柄（D1 binding 或 Node SQLite 适配器）。
+   *                            拿不到时只做进程内节流，跳过共享账本（fail-open，不影响原有功能）。
+   *        env              —— 第 3 期的调度参数覆盖（并发 / 间隔 / 小时预算）。
+   *        encryptionSecret —— 解密全局凭据池所需；缺失时全局池按空处理。
    */
   constructor(config = {}, runtime = {}) {
     super(config);
@@ -158,21 +189,35 @@ export class GithubRepoProvider extends BaseRepoProvider {
     this._masqueradeClient = new MasqueradeClient({ rotateIP: true, rotateUA: false });
 
     /**
-     * 请求调度参数与额度分区（修改点：第 3 期）
+     * 请求调度参数与凭据池（修改点：第 3 期 / 3-B）
      *
      * - db 由调用方在构造时通过 createProvider(type, config, { db, env }) 传入；
-     *   拿不到时只做进程内节流、跳过共享额度账本（fail-open，不影响原有功能）
-     * - scopeId 由 Token 派生（匿名共用 anonymous，不同 Token 各自独立），
-     *   Token 明文不会进入账本
+     *   拿不到时只做进程内节流、跳过共享状态（fail-open，不影响原有功能）
+     * - 凭据分区一律由「值」派生散列（匿名共用 anonymous，不同 Token/代理各自独立），
+     *   明文不会进入账本、日志或错误信息
      */
     this._db = runtime?.db ?? null;
+    this._encryptionSecret = runtime?.encryptionSecret ?? null;
     this._schedulerConfig = resolveGithubSchedulerConfig(runtime?.env ?? null);
-    this._quotaScopeId = buildQuotaScopeId(this.token);
-    /** 匿名请求按 45 次/小时自设上限；带 Token 时不设上限（见 GithubRequestScheduler 注释） */
-    this._quotaBudget = this.token ? null : this._schedulerConfig.anonymousHourlyBudget;
     this._quotaReserve = this.token
       ? this._schedulerConfig.tokenReserve
       : this._schedulerConfig.anonymousReserve;
+
+    /**
+     * 仓库级凭据池（修改点：第 3 期 3-B）
+     *
+     * 兼容：第 3 期之前配置的单个 token 视为「仓库级池里的第一条」，
+     * 这样老配置既不会失效，也会正常参与额度记账与轮换。
+     * 旧的 gh_proxy 不并入池 —— 它历史上只作用于源码下载，并入会顺手改变
+     * 所有 API 请求的走向，属于本期不该发生的行为变更。
+     */
+    this._repoPool = extractRepoPool(config);
+    if (this.token && !hasConfiguredEntries(this._repoPool, POOL_TOKEN_KEY)) {
+      this._repoPool[POOL_TOKEN_KEY].unshift({ id: "tk_legacy", label: "", value: this.token, enabled: true });
+    }
+    /** 全局池懒加载（只在第一次真的要发请求时读一次库） */
+    this._globalPool = null;
+    this._globalPoolPromise = null;
 
     /**
      * 分支索引缓存（修改点：第 1 期请求数量优化）
@@ -272,8 +317,10 @@ export class GithubRepoProvider extends BaseRepoProvider {
     // （若期间分支有新提交，用分支名会下载到不一致的内容）
     // 修改点（第 1 期源码下载优化）：归档地址改由 _buildArchiveUrl 构造，
     // 默认走 codeload.github.com 直连，不再经过 api.github.com 的 tarball 302
+    // 修改点（第 3 期 3-B）：代理不再在这里套用，改由 _fetchWithRetry 统一处理
+    //（优先用凭据池里选中的代理，池里没有才回落到历史上的 gh_proxy）
     const archiveRef = commitSha || ref;
-    const url = this._applyGhProxy(this._buildArchiveUrl(owner, repo, archiveRef));
+    const url = this._buildArchiveUrl(owner, repo, archiveRef);
 
     const resp = await this._fetchWithRetry(
       url,
@@ -667,9 +714,15 @@ export class GithubRepoProvider extends BaseRepoProvider {
 
   /**
    * 构建请求头
+   * @param {object} [extra] 额外请求头
+   * @param {string|null} [targetUrl] 用于生成伪装请求头的目标地址
+   * @param {string|null|undefined} [token] 本次请求使用的 Token（修改点：第 3 期 3-B）
+   *        - undefined：沿用实例上的历史单 Token（第 3 期之前的调用方式）
+   *        - null：明确不带认证（选中的是匿名额度）
+   *        - 字符串：使用凭据池里选中的那个 Token
    * @private
    */
-  _buildHeaders(extra = {}, targetUrl = null) {
+  _buildHeaders(extra = {}, targetUrl = null, token = undefined) {
     const browserHeaders = this._masqueradeClient.buildHeaders({}, targetUrl);
     const headers = {
       ...browserHeaders,
@@ -677,8 +730,9 @@ export class GithubRepoProvider extends BaseRepoProvider {
       "X-GitHub-Api-Version": "2022-11-28",
       ...extra,
     };
-    if (this.token) {
-      headers.Authorization = `Bearer ${this.token}`;
+    const effectiveToken = token === undefined ? this.token : token;
+    if (effectiveToken) {
+      headers.Authorization = `Bearer ${effectiveToken}`;
     }
     return headers;
   }
@@ -797,20 +851,28 @@ export class GithubRepoProvider extends BaseRepoProvider {
     const gated = this._isApiRequest(url);
 
     for (let attempt = 1; attempt <= RETRY_MAX_ATTEMPTS; attempt += 1) {
+      // 修改点（第 3 期 3-B）：每一次尝试都重新挑一次 Token / 代理。
+      // 「动态组合」的意义就在这里：上一次把某个 Token 打到限流，下一次会自然换一个。
+      // 这一步可能直接抛 RateLimitedError（凭据池整体不可用），同样交给第 2 期的延迟重试流程。
+      const credential = await this._pickCredential({ strict: gated, url });
+      const targetUrl = this._applyCredentialProxy(url, { proxy: credential.proxy, apiRequest: gated });
+
       // 修改点（第 3 期）：发起前先过调度器——
       // 1) 查共享额度账本，额度不足时直接抛 RateLimitedError（一个请求都不发），
       //    由第 2 期已经做好的延迟重试流程接住；
       // 2) 排队等全局并发名额与最小发起间隔。
       // 每一次「重试」都是一次真实请求，所以通行证按 attempt 逐个申请。
-      const ticket = gated ? await this._acquireRequestTicket(url) : null;
+      const ticket = gated ? await this._acquireRequestTicket(url, credential) : null;
 
       const abort = this._linkAbort(externalSignal, timeoutMs);
       let resp = null;
       let fetchError = null;
       try {
-        resp = await fetch(url, {
+        // 注意：headers 用**原始 URL** 生成（伪装头要按真实目标算），
+        // 而 errors / details 里也一律记原始 URL —— 代理地址可能含认证信息，绝不能外泄
+        resp = await fetch(targetUrl, {
           ...init,
-          headers: this._buildHeaders(init.headers || {}, url),
+          headers: this._buildHeaders(init.headers || {}, url, credential.token),
           signal: abort.signal,
         });
       } catch (e) {
@@ -820,6 +882,11 @@ export class GithubRepoProvider extends BaseRepoProvider {
         abort.clearTimer();
         // 归还并发名额，并把响应头里的额度信息写回共享账本（resp 为 null 表示请求抛错）
         if (ticket) await ticket.settle(resp);
+        // 修改点（第 3 期 3-B）：把失败归因到具体凭据，让后续请求自动避开它
+        await this._noteCredentialFailure(credential, {
+          networkError: Boolean(fetchError),
+          status: resp?.status ?? null,
+        });
       }
 
       if (fetchError) {
@@ -949,6 +1016,220 @@ export class GithubRepoProvider extends BaseRepoProvider {
     throw new TransientError("GitHub 请求失败: 超过最大重试次数", { details: { url } });
   }
 
+  // ==================== 凭据池：挑选与故障隔离（第 3 期 3-B）====================
+
+  /**
+   * 懒加载全局凭据池（只读一次库）
+   *
+   * 用「记住 Promise」而不是「记住结果」：并发请求同时进来时只会真正读一次，
+   * 后面的调用等着同一个 Promise，不会各自发一次查询。
+   * @private
+   */
+  async _ensureCredentialPools() {
+    if (!this._globalPoolPromise) {
+      this._globalPoolPromise = loadGlobalPool(this._db, this._encryptionSecret);
+    }
+    this._globalPool = await this._globalPoolPromise;
+    return this._globalPool;
+  }
+
+  /**
+   * 在候选里轮转挑一个
+   *
+   * 排序规则（从主到次）：
+   * 1. 仓库级优先于全局级 —— 仓库显式配置的凭据应当先用
+   * 2. 剩余额度多的优先 —— 尽量把请求摊到额度更宽裕的凭据上
+   * 3. 同一档内轮转 —— 避免退化成「固定绑定某一个」
+   *
+   * 代理没有「剩余额度」的概念，因此第 2 条对代理恒为空，实际效果就是纯轮转。
+   *
+   * @private
+   */
+  /**
+   * 在候选里轮转挑一个
+   *
+   * 规则（从主到次）：
+   * 1. 仓库级优先于全局级 —— 仓库显式配置的凭据应当先用
+   * 2. 组内轮转 —— 避免退化成「固定绑定某一个」
+   *
+   * 这里刻意**不按「剩余额度」排序**：额度见底、处于冷却的候选在上一步就已经被
+   * 过滤掉了，留在组里的都是当下可用的；再按额度排序会让流量长期压在某一个凭据上，
+   * 反而把「不固定绑定」变成「绑定到额度最多的那个」。
+   * 「根据额度动态组合」体现在**排除**上，而不是排序上。
+   *
+   * @private
+   */
+  _rotatePick(candidates, cursorKind) {
+    const repoLevel = candidates.filter((c) => c.source === "repository");
+    const group = repoLevel.length > 0 ? repoLevel : candidates;
+
+    // 游标跨实例共享（见 credentialRotation 的注释），因此直接读写模块级状态
+    const cursor = Number(credentialRotation[cursorKind]) || 0;
+    const picked = group[cursor % group.length];
+    credentialRotation[cursorKind] = (cursor + 1) % group.length;
+    return picked;
+  }
+
+  /**
+   * 为本次请求挑一组 Token + 代理（修改点：第 3 期 3-B）
+   *
+   * 优先级（与需求一致）：
+   *   仓库级 Token/代理  ->  全局池  ->  匿名
+   * Token 与代理**各自独立挑选**，不固定绑定，可以随时组合出不同的搭配。
+   *
+   * 两种严格模式：
+   * - strict=true（API 请求）：仓库自己配了 Token 却全部暂时不可用时**延迟重试**，
+   *   而不是悄悄降级成匿名 —— 否则私有仓库会拿到 404 并被记成永久失败，
+   *   这正是第 2 期花力气消除的那类误判。
+   * - strict=false（源码下载）：挑得到就用、挑不到就直连。公开仓库不带 Token
+   *   也能下载，不该因为 Token 都被限流就把下载也卡住。
+   *
+   * @private
+   */
+  async _pickCredential({ strict = true, url = "" } = {}) {
+    await this._ensureCredentialPools();
+
+    const nowMs = Date.now();
+    // 没有 db 时读不到共享状态，退化为「只看池里的启用情况」
+    const states = this._db ? await readScopeStates(this._db) : new Map();
+
+    // ---------- Token ----------
+    let token = null;
+    let tokenScopeId = ANONYMOUS_SCOPE_ID;
+    let tokenSource = "anonymous";
+
+    const tokenCandidates = listCredentialCandidates({
+      repoPool: this._repoPool,
+      globalPool: this._globalPool,
+      kind: POOL_TOKEN_KEY,
+    });
+
+    if (tokenCandidates.length > 0) {
+      const usable = [];
+      for (const candidate of tokenCandidates) {
+        const scopeId = buildQuotaScopeId(candidate.entry.value);
+        const state = resolveScopeState(states, scopeId);
+        if (isScopeBlocked(state, { nowMs, reserve: this._schedulerConfig.tokenReserve })) continue;
+        usable.push({ ...candidate, scopeId, remaining: state.remaining });
+      }
+
+      if (usable.length > 0) {
+        const picked = this._rotatePick(usable, "token");
+        token = picked.entry.value;
+        tokenScopeId = picked.scopeId;
+        tokenSource = picked.source;
+      } else if (strict && hasConfiguredEntries(this._repoPool, POOL_TOKEN_KEY)) {
+        // 仓库级配置了 Token，但仓库级与全局级此刻都不可用：
+        // 等到最早的一个恢复再试，而不是降级成匿名赌一把
+        const recoverAtMs = tokenCandidates.reduce(
+          (acc, candidate) =>
+            Math.max(acc, scopeRecoverAtMs(resolveScopeState(states, buildQuotaScopeId(candidate.entry.value)))),
+          0,
+        );
+        throw new RateLimitedError(
+          `GitHub 凭据池当前全部不可用（共 ${tokenCandidates.length} 个 Token，均在限流或冷却中），本次未发送请求，等待最早可用的那个恢复`,
+          {
+            retryAtMs: recoverAtMs > nowMs ? recoverAtMs + 5000 : nowMs + 60 * 1000,
+            retryAfterMs: recoverAtMs > nowMs ? recoverAtMs - nowMs + 5000 : 60 * 1000,
+            details: {
+              url,
+              source: "github-credential-pool",
+              candidateCount: tokenCandidates.length,
+              // 只报数量与恢复时间，绝不报是哪些凭据
+              recoverAtMs: recoverAtMs || null,
+            },
+          },
+        );
+      }
+      // 其余情况（只配了全局池且全不可用）：退回匿名。
+      // 全局池的状态不应该让一个本来用匿名就能工作的公开仓库变成失败。
+    }
+
+    // ---------- 代理 ----------
+    let proxy = null;
+    let proxyScopeId = null;
+
+    const proxyCandidates = listCredentialCandidates({
+      repoPool: this._repoPool,
+      globalPool: this._globalPool,
+      kind: POOL_PROXY_KEY,
+    });
+
+    if (proxyCandidates.length > 0) {
+      const usable = [];
+      for (const candidate of proxyCandidates) {
+        const scopeId = buildProxyScopeId(candidate.entry.value);
+        if (isScopeBlocked(resolveScopeState(states, scopeId), { nowMs })) continue;
+        usable.push({ ...candidate, scopeId });
+      }
+      if (usable.length > 0) {
+        const picked = this._rotatePick(usable, "proxy");
+        proxy = picked.entry.value;
+        proxyScopeId = picked.scopeId;
+      }
+      // 代理全部不可用时直连：直连失败会被归类为「暂时性错误」并安排重试，
+      // 比把请求挂在一个已知有问题的节点上要好
+    }
+
+    return { token, tokenScopeId, tokenSource, proxy, proxyScopeId };
+  }
+
+  /**
+   * 给 URL 套上本次选中的代理
+   *
+   * - API 请求：只认凭据池里的代理（历史上的 gh_proxy 从不作用于 API，保持不变）
+   * - 源码下载：优先用凭据池里的代理，池里没有才回落到历史上的 gh_proxy
+   *
+   * 注意：返回的是「实际要请求的地址」，其中可能含代理的认证信息；
+   * 它绝不能被写进日志、错误信息或任务详情 —— 对外一律使用原始 URL。
+   *
+   * @private
+   */
+  _applyCredentialProxy(url, { proxy, apiRequest }) {
+    if (proxy) {
+      const base = String(proxy).trim().replace(/\/+$/, "");
+      return `${base}/${url}`;
+    }
+    // API 请求从不走历史上的 gh_proxy（它一直只作用于源码下载），保持不变
+    if (apiRequest) return url;
+    return this._applyGhProxy(url);
+  }
+
+  /**
+   * 把一次失败归因到具体的凭据上，让后续请求自动避开（修改点：第 3 期 3-B）
+   *
+   * 归因规则刻意保守：
+   * - 网络层失败 + 走了代理  -> 认为这个代理节点有问题，短时间避开
+   * - 401                  -> 这个 Token 明确失效，较长时间避开
+   * - 限流                 -> **不在这里处理**：它由账本里的 remaining/resetAt 表达，
+   *                           再记一份冷却就等于两套状态互相打架
+   * - 404 / 其它 4xx       -> 是仓库或权限的问题，不是凭据的问题，不避开
+   *
+   * @private
+   */
+  async _noteCredentialFailure(credential, { networkError = false, status = null } = {}) {
+    if (!this._db || !credential) return;
+    const nowMs = Date.now();
+
+    if (networkError && credential.proxy && credential.proxyScopeId) {
+      await markScopeCooldown(
+        this._db,
+        credential.proxyScopeId,
+        nowMs + PROXY_FAILURE_COOLDOWN_MS,
+        "proxy-network-error",
+      );
+    }
+
+    if (status === 401 && credential.token && credential.tokenScopeId) {
+      await markScopeCooldown(
+        this._db,
+        credential.tokenScopeId,
+        nowMs + TOKEN_INVALID_COOLDOWN_MS,
+        "token-invalid",
+      );
+    }
+  }
+
   /**
    * 申请一张请求通行证（修改点：第 3 期 请求调度）
    *
@@ -958,19 +1239,20 @@ export class GithubRepoProvider extends BaseRepoProvider {
    * - 归还时（ticket.settle）：把响应头里的 limit/remaining/reset 写回账本，
    *   让其他任务、其他实例立刻知道额度已经见底，不必各自再撞一次 429
    *
-   * 参数全部来自实例上的调度配置，调用方无需关心。
+   * 额度分区跟着**本次选中的凭据**走（修改点：第 3 期 3-B）：
+   * 用 Token A 打的请求记在 A 的账上，A 被限流不会牵连 Token B。
    *
    * @private
    */
-  async _acquireRequestTicket(url) {
+  async _acquireRequestTicket(url, credential = null) {
+    const hasToken = Boolean(credential?.token);
     return await githubRequestScheduler.acquire({
       db: this._db,
-      // 匿名请求共用一份账本，不同 Token 各自独立（见 buildQuotaScopeId）
-      scopeId: this._quotaScopeId,
-      hasToken: Boolean(this.token),
-      // 有 Token 时 budget 为 null：不套用匿名 45 次/小时的预算
-      budget: this._quotaBudget,
-      reserve: this._quotaReserve,
+      scopeId: credential?.tokenScopeId || ANONYMOUS_SCOPE_ID,
+      hasToken,
+      // 有 Token 时不套用匿名 45 次/小时的预算（见 GithubRequestScheduler 注释）
+      budget: hasToken ? null : this._schedulerConfig.anonymousHourlyBudget,
+      reserve: hasToken ? this._schedulerConfig.tokenReserve : this._schedulerConfig.anonymousReserve,
       url,
       maxConcurrency: this._schedulerConfig.maxConcurrency,
       minIntervalMs: this._schedulerConfig.minIntervalMs,
@@ -995,20 +1277,45 @@ export class GithubRepoProvider extends BaseRepoProvider {
   async _fetchJson(url, init = {}, opts = {}) {
     const method = String(init?.method || "GET").toUpperCase();
 
-    // 只在「GET + API 主机 + 同一额度分区」时合并：
-    // - 非 GET 合并会改变语义
-    // - 不同 Token / 匿名的可见范围不同（私有仓库匿名会 404），结果不能互相复用
-    // URL 里已经带了 owner/repo/ref，所以「同一 (repository, ref) 的并发查询」天然被合并
-    const coalesceKey =
-      method === "GET" && this._isApiRequest(url)
-        ? `${this._quotaScopeId} ${method} ${url}`
-        : null;
+    // 只在「GET + API 主机」时合并；非 GET 合并会改变语义
+    if (method !== "GET" || !this._isApiRequest(url)) {
+      return await this._fetchJsonDirect(url, init, opts);
+    }
 
-    if (!coalesceKey) return await this._fetchJsonDirect(url, init, opts);
+    // 修改点（第 3 期 3-B）：合并键里带上「当前生效的凭据组合」。
+    // 理由：不同 Token / 匿名的可见范围不同（私有仓库匿名会 404），
+    // 若只按 URL 合并，配了匿名的一方可能拿到另一方的授权结果。
+    // 指纹只包含凭据值的散列，明文不会进入合并键。
+    const scopeKey = await this._credentialFingerprint();
+    const coalesceKey = `${scopeKey} ${method} ${url}`;
 
     return await runCoalesced(coalesceKey, () => this._fetchJsonDirect(url, init, opts), {
       ttlMs: this._schedulerConfig.coalesceTtlMs,
     });
+  }
+
+  /**
+   * 当前生效凭据组合的稳定指纹（修改点：第 3 期 3-B）
+   *
+   * 只用于请求合并的分区，不参与任何鉴权决策；输出是散列，凭据明文不外泄。
+   * 完全没有配置凭据时返回 anonymous，与匿名分区一致。
+   * @private
+   */
+  async _credentialFingerprint() {
+    if (this._poolFingerprint) return this._poolFingerprint;
+
+    const globalPool = await this._ensureCredentialPools();
+    const parts = [];
+    for (const kind of [POOL_TOKEN_KEY, POOL_PROXY_KEY]) {
+      for (const candidate of listCredentialCandidates({ repoPool: this._repoPool, globalPool, kind })) {
+        parts.push(`${candidate.source}|${kind}|${candidate.entry.value}`);
+      }
+    }
+    parts.sort();
+
+    // buildQuotaScopeId 在这里只当作「把任意字符串映射成不含明文的稳定 id」使用
+    this._poolFingerprint = buildQuotaScopeId(parts.join("\n"));
+    return this._poolFingerprint;
   }
 
   /**

@@ -10,6 +10,9 @@
  */
 
 import { encryptValue, decryptIfNeeded, maskSecret } from "../utils/crypto.js";
+// 修改点（第 3 期 3-B 凭据池）：tokens / proxies 是「数组形态的敏感字段」，
+// 加解密、掩码、按 id 合并的规则与全局池必须完全一致，因此统一走 credentials.js
+import { decryptEntryList, encryptEntryList, mergeEntryList } from "./credentials.js";
 
 /**
  * 多分支 / 多备份目标 / 版本保留的取值边界（修改点：仓库备份优化）
@@ -156,6 +159,25 @@ export function getSecretFields(provider) {
 }
 
 /**
+ * 各 provider 的「结构化敏感字段」（修改点：第 3 期 3-B）
+ *
+ * 与 SECRET_FIELDS 的区别：这些字段是**数组**，数组元素里带 value 子字段，
+ * 例如 [{ id, label, value, enabled }]。加密/掩码要逐条处理，不能整体当作一个字符串。
+ */
+const SECRET_POOL_FIELDS_BY_PROVIDER = {
+  github: ["tokens", "proxies"],
+};
+
+/**
+ * 获取某 provider 的结构化敏感字段列表
+ * @param {string} provider
+ * @returns {string[]}
+ */
+export function getSecretPoolFields(provider) {
+  return SECRET_POOL_FIELDS_BY_PROVIDER[provider] || [];
+}
+
+/**
  * 解析 config_json 为运行时配置（敏感字段解密）
  * @param {string} provider
  * @param {string|null|undefined} configJson
@@ -179,6 +201,11 @@ export async function parseProviderConfig(provider, configJson, encryptionSecret
   for (const field of getSecretFields(provider)) {
     if (result[field] === undefined || result[field] === null) continue;
     result[field] = await decryptIfNeeded(result[field], encryptionSecret);
+  }
+  // 修改点（第 3 期 3-B）：凭据池逐条解密
+  for (const field of getSecretPoolFields(provider)) {
+    if (result[field] === undefined || result[field] === null) continue;
+    result[field] = await decryptEntryList(result[field], encryptionSecret, field);
   }
   return result;
 }
@@ -207,17 +234,30 @@ export async function serializeProviderConfig(provider, config, encryptionSecret
     result[field] = plain.startsWith("encrypted:") ? plain : await encryptValue(plain, encryptionSecret);
   }
 
+  // 修改点（第 3 期 3-B）：凭据池逐条加密
+  for (const field of getSecretPoolFields(provider)) {
+    if (result[field] === undefined) continue;
+    result[field] = await encryptEntryList(result[field], encryptionSecret, field);
+  }
+
   return JSON.stringify(result);
 }
 
 /**
- * 构建返回给前端的配置视图（敏感字段掩码，不下发明文）
+ * 构建返回给前端的配置视图
+ *
+ * 默认对敏感字段掩码、不下发明文；
+ * 传入 { reveal: "plain" } 时给出明文 —— 仅限管理员显式请求（与存储配置的
+ * `?reveal=plain` 同一套语义），调用方必须自行做鉴权与审计。
+ *
  * @param {string} provider
  * @param {string|null|undefined} configJson
  * @param {string} encryptionSecret
+ * @param {{ reveal?: 'plain'|null }} [options]
  * @returns {Promise<Object>}
  */
-export async function buildProviderConfigView(provider, configJson, encryptionSecret) {
+export async function buildProviderConfigView(provider, configJson, encryptionSecret, options = {}) {
+  const revealPlain = options?.reveal === "plain";
   const config = await parseProviderConfig(provider, configJson, encryptionSecret);
   const view = { ...config };
 
@@ -228,8 +268,25 @@ export async function buildProviderConfigView(provider, configJson, encryptionSe
       view[`has_${field}`] = false;
       continue;
     }
-    view[field] = maskSecret(String(view[field]));
+    view[field] = revealPlain ? String(view[field]) : maskSecret(String(view[field]));
     view[`has_${field}`] = true;
+  }
+
+  // 修改点（第 3 期 3-B）：凭据池逐条处理。
+  // 默认同样只下发掩码，前端要「点击查看」需显式走 reveal。
+  for (const field of getSecretPoolFields(provider)) {
+    const entries = Array.isArray(view[field]) ? view[field] : [];
+    view[field] = entries.map((entry) => ({
+      id: entry.id,
+      label: entry.label,
+      enabled: entry.enabled,
+      value: entry.value
+        ? revealPlain
+          ? String(entry.value)
+          : maskSecret(String(entry.value))
+        : "",
+      hasValue: Boolean(entry.value),
+    }));
   }
 
   return view;
@@ -246,9 +303,18 @@ export async function buildProviderConfigView(provider, configJson, encryptionSe
 export function mergeProviderConfig(provider, existingConfig = {}, incomingConfig = {}) {
   const merged = { ...(existingConfig || {}) };
   const secretFields = new Set(getSecretFields(provider));
+  // 修改点（第 3 期 3-B）：凭据池字段单独处理（按 id 增删改，而不是整体覆盖）
+  const poolFields = new Set(getSecretPoolFields(provider));
 
   for (const [key, value] of Object.entries(incomingConfig || {})) {
     if (value === undefined) continue;
+
+    if (poolFields.has(key)) {
+      // 只有明确传来数组才改动池：null / 非数组一律视为「本次不涉及池」，
+      // 避免一次字段缺失就把整个池清空
+      if (Array.isArray(value)) merged[key] = mergeEntryList(merged[key], value, key);
+      continue;
+    }
 
     if (secretFields.has(key)) {
       // 空串 = 显式清空；全为 * 的掩码串 = 未改动，保留原值
