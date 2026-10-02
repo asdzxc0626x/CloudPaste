@@ -52,9 +52,12 @@ export class RepoProviderFactory {
    * 创建 provider 实例
    * @param {string} providerType
    * @param {Object} config 已解密的 provider 配置
+   * @param {{ db?: any, env?: object|null }} [runtime] 运行时依赖（修改点：第 3 期）
+   *        第 3 期的请求调度器需要数据库句柄读写跨实例共享的额度账本；
+   *        不传时 provider 退化为「只做进程内节流」，原有调用方行为不变。
    * @returns {import("./BaseRepoProvider.js").BaseRepoProvider}
    */
-  static createProvider(providerType, config = {}) {
+  static createProvider(providerType, config = {}, runtime = {}) {
     if (!providerType) {
       throw new ValidationError("provider 类型不能为空");
     }
@@ -62,7 +65,7 @@ export class RepoProviderFactory {
     if (!entry) {
       throw new NotFoundError(`不支持的代码仓库类型: ${providerType}`);
     }
-    return new entry.ctor(config);
+    return new entry.ctor(config, runtime);
   }
 
   static isTypeSupported(providerType) {

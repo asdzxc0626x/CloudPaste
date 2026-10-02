@@ -721,7 +721,10 @@ export async function checkRepository(db, repositoryFactory, encryptionSecret, i
   }
 
   const providerConfig = await parseProviderConfig(row.provider, row.config_json, encryptionSecret);
-  const provider = RepoProviderFactory.createProvider(row.provider, providerConfig);
+  // 修改点（第 3 期 请求调度）：把 db/env 交给 provider，让所有 GitHub API 请求
+  // 统一经过请求调度器（并发/间隔节流 + 共享额度账本 + 同名请求合并）。
+  // 「检查更新」也会消耗匿名额度，因此必须与备份任务共用同一份账本。
+  const provider = RepoProviderFactory.createProvider(row.provider, providerConfig, { db, env });
 
   const trackMode = String(row.track_mode || "branch");
   const trackRefs = resolveTrackRefs(row);

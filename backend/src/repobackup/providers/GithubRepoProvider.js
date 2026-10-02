@@ -26,6 +26,16 @@
  * - TransientError    超时 / 连接重置 / 5xx / 传输停滞      -> 短退避后重试，不记失败
  * - 其余（NotFoundError / AppError）为永久性错误            -> 照旧记失败
  * 具体分类规则见 repobackup/errors.js。
+ *
+ * 修改点（第 3 期：统一走请求调度器）：
+ * 所有打在 api.github.com 上的请求都先经过 repobackup/GithubRequestScheduler.js：
+ * - 全局并发 <= 2、相邻请求发起间隔 >= 800ms（进程内）
+ * - 请求前查共享额度账本，额度不足时**不发请求**，直接抛 RateLimitedError
+ *   交给第 2 期的延迟重试流程（它已经能把限流转成「延迟」而不是「失败」）
+ * - 响应头里的 limit/remaining/reset 回写账本，跨任务、跨实例共享
+ * - 同一 scope + 同一 URL 的并发 GET 合并成一次请求
+ * 注意：codeload.github.com 的源码下载**不经过调度器**（第 1 期已确认它不消耗 API 额度），
+ * 只有 endpoint_url 指向自建实例时才落到 API 主机上、才需要计数。
  */
 
 import { BaseRepoProvider } from "./BaseRepoProvider.js";
@@ -35,6 +45,13 @@ import { MasqueradeClient } from "../../utils/httpMasquerade.js";
 // 修改点（第 2 期 错误分类）：上游错误不再一律抛 AppError，而是按
 // 「限流 / 暂时性」分类抛出并带上可重试时间，供调用方安排延迟重试而不是记失败
 import { RateLimitedError, TransientError } from "../errors.js";
+// 修改点（第 3 期 请求调度）：统一节流 + 共享额度账本 + 同名请求合并
+import {
+  githubRequestScheduler,
+  resolveGithubSchedulerConfig,
+  buildQuotaScopeId,
+  runCoalesced,
+} from "../GithubRequestScheduler.js";
 
 const DEFAULT_API_BASE = "https://api.github.com";
 const RETRY_MAX_ATTEMPTS = 3;
@@ -125,8 +142,12 @@ function parseRepoIdentifier(raw) {
 export class GithubRepoProvider extends BaseRepoProvider {
   /**
    * @param {Object} config 已解密的 provider 配置 { token?, gh_proxy?, endpoint_url? }
+   * @param {{ db?: any, env?: object|null }} [runtime] 运行时依赖（修改点：第 3 期）
+   *        db  —— 额度账本所在的数据库句柄（D1 binding 或 Node SQLite 适配器）。
+   *               拿不到时只做进程内节流，跳过额度账本（fail-open，不影响原有功能）。
+   *        env —— 用于读取第 3 期的调度参数覆盖（并发 / 间隔 / 小时预算）。
    */
-  constructor(config = {}) {
+  constructor(config = {}, runtime = {}) {
     super(config);
     this.type = "github";
 
@@ -135,6 +156,23 @@ export class GithubRepoProvider extends BaseRepoProvider {
     this.apiBase = (config?.endpoint_url ? String(config.endpoint_url).trim() : DEFAULT_API_BASE).replace(/\/+$/, "");
 
     this._masqueradeClient = new MasqueradeClient({ rotateIP: true, rotateUA: false });
+
+    /**
+     * 请求调度参数与额度分区（修改点：第 3 期）
+     *
+     * - db 由调用方在构造时通过 createProvider(type, config, { db, env }) 传入；
+     *   拿不到时只做进程内节流、跳过共享额度账本（fail-open，不影响原有功能）
+     * - scopeId 由 Token 派生（匿名共用 anonymous，不同 Token 各自独立），
+     *   Token 明文不会进入账本
+     */
+    this._db = runtime?.db ?? null;
+    this._schedulerConfig = resolveGithubSchedulerConfig(runtime?.env ?? null);
+    this._quotaScopeId = buildQuotaScopeId(this.token);
+    /** 匿名请求按 45 次/小时自设上限；带 Token 时不设上限（见 GithubRequestScheduler 注释） */
+    this._quotaBudget = this.token ? null : this._schedulerConfig.anonymousHourlyBudget;
+    this._quotaReserve = this.token
+      ? this._schedulerConfig.tokenReserve
+      : this._schedulerConfig.anonymousReserve;
 
     /**
      * 分支索引缓存（修改点：第 1 期请求数量优化）
@@ -151,6 +189,19 @@ export class GithubRepoProvider extends BaseRepoProvider {
      * 同一轮处理里重复解析同一个 tag 时不再发请求
      */
     this._tagShaCache = new Map();
+  }
+
+  /**
+   * 判断某个 URL 是否打在 GitHub API 主机上（修改点：第 3 期）
+   *
+   * 只有 API 请求才消耗速率额度，也才需要计数与节流：
+   * - 默认配置下源码归档走 codeload.github.com -> 不计数（第 1 期的成果，必须保住）
+   * - endpoint_url 指向自建实例时归档仍走 `${apiBase}/repos/.../tarball/...` -> 计数
+   *
+   * @private
+   */
+  _isApiRequest(url) {
+    return typeof url === "string" && url.startsWith(this.apiBase);
   }
 
   /**
@@ -740,9 +791,22 @@ export class GithubRepoProvider extends BaseRepoProvider {
     const timeoutMs = opts?.timeoutMs ?? API_TIMEOUT_MS;
     const externalSignal = opts?.signal ?? null;
 
+    // 修改点（第 3 期 请求调度）：只有打在 API 主机上的请求才需要计数与节流。
+    // 默认配置下源码归档走 codeload.github.com，不消耗 API 额度，因此不经过调度器
+    // —— 第 1 期的「codeload 直连」优化不能被这一期影响。
+    const gated = this._isApiRequest(url);
+
     for (let attempt = 1; attempt <= RETRY_MAX_ATTEMPTS; attempt += 1) {
+      // 修改点（第 3 期）：发起前先过调度器——
+      // 1) 查共享额度账本，额度不足时直接抛 RateLimitedError（一个请求都不发），
+      //    由第 2 期已经做好的延迟重试流程接住；
+      // 2) 排队等全局并发名额与最小发起间隔。
+      // 每一次「重试」都是一次真实请求，所以通行证按 attempt 逐个申请。
+      const ticket = gated ? await this._acquireRequestTicket(url) : null;
+
       const abort = this._linkAbort(externalSignal, timeoutMs);
       let resp = null;
+      let fetchError = null;
       try {
         resp = await fetch(url, {
           ...init,
@@ -750,7 +814,16 @@ export class GithubRepoProvider extends BaseRepoProvider {
           signal: abort.signal,
         });
       } catch (e) {
+        fetchError = e;
+      } finally {
+        // 已拿到响应头（或已失败）：立刻停掉超时定时器
         abort.clearTimer();
+        // 归还并发名额，并把响应头里的额度信息写回共享账本（resp 为 null 表示请求抛错）
+        if (ticket) await ticket.settle(resp);
+      }
+
+      if (fetchError) {
+        const e = fetchError;
 
         // 调用方主动中止（任务取消 / 下载停滞看门狗）
         // 修改点（第 2 期 错误分类）：归类为「暂时性」而不是永久失败——
@@ -785,8 +858,7 @@ export class GithubRepoProvider extends BaseRepoProvider {
         );
       }
 
-      // 已拿到响应头：立刻停掉超时定时器，否则会在读 body 的过程中把连接掐断
-      abort.clearTimer();
+      // 已拿到响应头（超时定时器与并发名额都在上面的 finally 里处理完了）
 
       if (resp.status === 404) {
         await this._discardBody(resp);
@@ -878,14 +950,72 @@ export class GithubRepoProvider extends BaseRepoProvider {
   }
 
   /**
+   * 申请一张请求通行证（修改点：第 3 期 请求调度）
+   *
+   * 通行证负责两件事：
+   * - 申请时：查共享额度账本 + 排队等并发名额与最小发起间隔；
+   *   额度不足会抛 RateLimitedError（一个请求都不发）
+   * - 归还时（ticket.settle）：把响应头里的 limit/remaining/reset 写回账本，
+   *   让其他任务、其他实例立刻知道额度已经见底，不必各自再撞一次 429
+   *
+   * 参数全部来自实例上的调度配置，调用方无需关心。
+   *
+   * @private
+   */
+  async _acquireRequestTicket(url) {
+    return await githubRequestScheduler.acquire({
+      db: this._db,
+      // 匿名请求共用一份账本，不同 Token 各自独立（见 buildQuotaScopeId）
+      scopeId: this._quotaScopeId,
+      hasToken: Boolean(this.token),
+      // 有 Token 时 budget 为 null：不套用匿名 45 次/小时的预算
+      budget: this._quotaBudget,
+      reserve: this._quotaReserve,
+      url,
+      maxConcurrency: this._schedulerConfig.maxConcurrency,
+      minIntervalMs: this._schedulerConfig.minIntervalMs,
+      maxStartDelayMs: this._schedulerConfig.maxStartDelayMs,
+      windowMs: this._schedulerConfig.windowMs,
+    });
+  }
+
+  /**
    * 带限流重试的 JSON 请求
    *
    * 修改点（备份任务卡住排查）：_fetchWithRetry 的超时只覆盖到「拿到响应头」，
    * 之后读 body 是没有保护的。JSON 响应虽小，但连接在响应头之后停滞同样会永久挂起，
    * 所以这里给 resp.json() 再加一道截止时间。
+   *
+   * 修改点（第 3 期 请求去重）：同一额度分区下对同一 URL 的并发 GET 只真正发一次。
+   * 合并的是「已经解析好的 JSON 结果」（Response 的 body 只能被读一次，无法分给多个调用方）。
+   * 调用方只读不写这些结果，因此共用是安全的。
+   *
    * @private
    */
   async _fetchJson(url, init = {}, opts = {}) {
+    const method = String(init?.method || "GET").toUpperCase();
+
+    // 只在「GET + API 主机 + 同一额度分区」时合并：
+    // - 非 GET 合并会改变语义
+    // - 不同 Token / 匿名的可见范围不同（私有仓库匿名会 404），结果不能互相复用
+    // URL 里已经带了 owner/repo/ref，所以「同一 (repository, ref) 的并发查询」天然被合并
+    const coalesceKey =
+      method === "GET" && this._isApiRequest(url)
+        ? `${this._quotaScopeId} ${method} ${url}`
+        : null;
+
+    if (!coalesceKey) return await this._fetchJsonDirect(url, init, opts);
+
+    return await runCoalesced(coalesceKey, () => this._fetchJsonDirect(url, init, opts), {
+      ttlMs: this._schedulerConfig.coalesceTtlMs,
+    });
+  }
+
+  /**
+   * 真正发请求并解析 JSON（未合并版本）
+   * @private
+   */
+  async _fetchJsonDirect(url, init = {}, opts = {}) {
     const resp = await this._fetchWithRetry(url, init, opts);
     const timeoutMs = opts?.timeoutMs ?? API_TIMEOUT_MS;
 

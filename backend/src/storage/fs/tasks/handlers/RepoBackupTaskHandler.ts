@@ -52,6 +52,14 @@ import { deferRepositoryBackupSchedule } from "../../../../repobackup/schedule.j
  * - 只记下「最早可重试时间」，收尾时把它写进该仓库既有 scheduled_jobs 行的
  *   next_run_after，由调度层到点自动重跑
  * - 永久性错误（仓库/分支不存在等）行为不变，照旧记 failed
+ *
+ * 修改点（第 3 期：所有 GitHub API 请求统一经过请求调度器）：
+ * - provider 由 createProvider 带上 db/env 创建，于是备份过程中的每一次 API 请求
+ *   都先过 GithubRequestScheduler：全局并发 <= 2、间隔 >= 800ms、
+ *   请求前查共享额度账本（额度不足则不发请求）、同一 URL 的并发查询合并成一次
+ * - 调度器抛出的 RateLimitedError 由上面的第 2 期逻辑接住：依旧不记失败、不累计失败数、
+ *   只把「最早可重试时间」交给调度层
+ * - 源码归档走 codeload.github.com，不消耗 API 额度，因此不经过调度器（第 1 期成果不变）
  */
 
 type RepoBackupPayload = {
@@ -369,7 +377,11 @@ export class RepoBackupTaskHandler implements TaskHandler {
 
     // ---------- 2. 解析 Provider（失败即整体失败） ----------
     const providerConfig = await parseProviderConfig(provider, repoRow.config_json, encryptionSecret);
-    const providerInstance = RepoProviderFactory.createProvider(provider, providerConfig);
+    // 修改点（第 3 期 请求调度）：把 db/env 交给 provider，让备份过程的全部
+    // GitHub API 请求统一经过请求调度器（全局并发 <=2、间隔 >=800ms、
+    // 请求前查共享额度账本、同名请求合并）。额度不足时会抛出 RateLimitedError，
+    // 由下面的第 2 期延迟重试逻辑接住 —— 不记失败，改为安排到点重跑。
+    const providerInstance = RepoProviderFactory.createProvider(provider, providerConfig, { db, env });
 
     currentStage = "resolving";
     await report(0);
