@@ -157,18 +157,19 @@ export default {
     pool: {
       globalTitle: "Global GitHub credential pool",
       globalSubtitle: "Tokens and proxies shared by every repository that does not define its own",
-      tokenEntry: "Token label (optional)",
-      proxyEntry: "Proxy label (optional)",
       tokenPlaceholder: "ghp_xxx",
       proxyPlaceholder: "https://ghproxy.example.com",
-      entryLabel: "Label",
+      // 修改点（第 3 期 3-B 交互重做）：单框连续录入的提示与各项 title
       valuePlaceholder: "Credential value",
-      add: "Add entry",
-      addToken: "Add token",
-      addProxy: "Add proxy",
-      remove: "Remove",
-      enabled: "Enabled",
-      empty: "No entry configured yet",
+      inputHint:
+        "Press Enter, comma or newline to confirm, and paste several at once (separated by spaces, commas or newlines). Click an entry to reveal it, click the dot on the left to enable or disable it, click × to remove it.",
+      limitReached: "Maximum of {max} entries reached",
+      emptyValue: "(empty)",
+      clickToEnable: "Disabled — click to enable",
+      clickToDisable: "Enabled — click to disable",
+      revealTitle: "Click to reveal the plain value",
+      hideTitle: "Click to hide the plain value",
+      removeTitle: "Remove this entry",
       priorityHint:
         "Selection order: repository credentials, then global credentials, then the anonymous quota. Tokens and proxies are picked independently rather than pinned together; a throttled or invalid credential is avoided temporarily.",
       save: "Save",

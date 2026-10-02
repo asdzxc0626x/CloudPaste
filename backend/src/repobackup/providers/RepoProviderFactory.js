@@ -181,9 +181,8 @@ RepoProviderFactory.registerProvider(RepoProviderFactory.SUPPORTED_TYPES.GITHUB,
         ui: {
           fullWidth: true,
           descriptionKey: "admin.repoBackup.description.github.tokens",
-          entryLabelKey: "admin.repoBackup.pool.tokenEntry",
+          // 修改点（第 3 期 3-B 交互重做）：单框连续录入，只保留占位符文案
           valuePlaceholderKey: "admin.repoBackup.pool.tokenPlaceholder",
-          addLabelKey: "admin.repoBackup.pool.addToken",
         },
       },
       {
@@ -196,9 +195,8 @@ RepoProviderFactory.registerProvider(RepoProviderFactory.SUPPORTED_TYPES.GITHUB,
         ui: {
           fullWidth: true,
           descriptionKey: "admin.repoBackup.description.github.proxies",
-          entryLabelKey: "admin.repoBackup.pool.proxyEntry",
+          // 修改点（第 3 期 3-B 交互重做）：单框连续录入，只保留占位符文案
           valuePlaceholderKey: "admin.repoBackup.pool.proxyPlaceholder",
-          addLabelKey: "admin.repoBackup.pool.addProxy",
         },
       },
       {

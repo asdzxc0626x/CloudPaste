@@ -115,20 +115,15 @@ const loadError = ref("");
 
 const pool = reactive({ tokens: [], proxies: [] });
 
-/** 复用 configSchema 里的文案 key，避免全局/仓库两处各写一套翻译 */
+/**
+ * 复用 configSchema 里的文案 key，避免全局/仓库两处各写一套翻译
+ * 修改点（第 3 期 3-B 交互重做）：池字段改为单框连续录入，只需要占位符
+ */
 const tokenField = {
-  ui: {
-    entryLabelKey: "admin.repoBackup.pool.tokenEntry",
-    valuePlaceholderKey: "admin.repoBackup.pool.tokenPlaceholder",
-    addLabelKey: "admin.repoBackup.pool.addToken",
-  },
+  ui: { valuePlaceholderKey: "admin.repoBackup.pool.tokenPlaceholder" },
 };
 const proxyField = {
-  ui: {
-    entryLabelKey: "admin.repoBackup.pool.proxyEntry",
-    valuePlaceholderKey: "admin.repoBackup.pool.proxyPlaceholder",
-    addLabelKey: "admin.repoBackup.pool.addProxy",
-  },
+  ui: { valuePlaceholderKey: "admin.repoBackup.pool.proxyPlaceholder" },
 };
 
 const normalize = (value) => (Array.isArray(value) ? value : []);
