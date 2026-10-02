@@ -130,6 +130,20 @@ export function isDeferrableKind(kind) {
 }
 
 /**
+ * 取有限数值，拿不到就返回 null
+ *
+ * 修改点（审计修复 — 返回值契约）：不能只用 Number.isFinite(Number(v)) 判断 ——
+ * Number(null) === 0 且 0 是有限数，于是「没有建议等待时长」会被规整成「等待 0 毫秒」。
+ * 下游 resolveDeferDelayMs 用 `> 0` 兜住了这个值，行为上没出问题，
+ * 但函数声明的 number|null 契约名不副实，排查时容易被误导。
+ */
+function finiteOrNull(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
  * 把任意错误归类
  *
  * 优先按错误实例判断；同时兼容「跨层传递导致原型丢失、只剩 code/kind 字段」的情况
@@ -152,8 +166,8 @@ export function classifyRepoBackupError(error) {
   if (error instanceof RateLimitedError || error?.kind === REPO_ERROR_KIND.RATE_LIMITED) {
     return {
       kind: REPO_ERROR_KIND.RATE_LIMITED,
-      retryAfterMs: Number.isFinite(Number(error?.retryAfterMs)) ? Number(error.retryAfterMs) : null,
-      retryAtMs: Number.isFinite(Number(error?.retryAtMs)) ? Number(error.retryAtMs) : null,
+      retryAfterMs: finiteOrNull(error?.retryAfterMs),
+      retryAtMs: finiteOrNull(error?.retryAtMs),
       code,
       message,
     };
@@ -161,7 +175,7 @@ export function classifyRepoBackupError(error) {
   if (error instanceof TransientError || error?.kind === REPO_ERROR_KIND.TRANSIENT) {
     return {
       kind: REPO_ERROR_KIND.TRANSIENT,
-      retryAfterMs: Number.isFinite(Number(error?.retryAfterMs)) ? Number(error.retryAfterMs) : null,
+      retryAfterMs: finiteOrNull(error?.retryAfterMs),
       retryAtMs: null,
       code,
       message,
@@ -174,8 +188,8 @@ export function classifyRepoBackupError(error) {
   if (code === RATE_LIMITED_CODE) {
     return {
       kind: REPO_ERROR_KIND.RATE_LIMITED,
-      retryAfterMs: Number.isFinite(Number(error?.retryAfterMs)) ? Number(error.retryAfterMs) : null,
-      retryAtMs: Number.isFinite(Number(error?.retryAtMs)) ? Number(error.retryAtMs) : null,
+      retryAfterMs: finiteOrNull(error?.retryAfterMs),
+      retryAtMs: finiteOrNull(error?.retryAtMs),
       code,
       message,
     };

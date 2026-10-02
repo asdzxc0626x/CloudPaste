@@ -47,8 +47,6 @@ import {
   saveGlobalPool,
   mergePool,
   buildPoolView,
-  POOL_TOKEN_KEY,
-  POOL_PROXY_KEY,
 } from "../repobackup/credentials.js";
 import {
   resolveScheduleInput,
@@ -405,22 +403,6 @@ export async function updateGlobalCredentialPool(db, encryptionSecret, incoming)
   const merged = mergePool(existing, incoming);
   await saveGlobalPool(db, merged, encryptionSecret);
   return buildPoolView(merged);
-}
-
-/**
- * 只读取池的「配置概况」，供仓库页/诊断使用
- * - 绝不含任何凭据内容，只报数量
- */
-export async function describeGlobalCredentialPool(db, encryptionSecret) {
-  const pool = await loadGlobalPool(db, encryptionSecret);
-  const summarize = (entries) => ({
-    total: entries.length,
-    enabled: entries.filter((entry) => entry.enabled && String(entry.value || "").trim() !== "").length,
-  });
-  return {
-    tokens: summarize(pool[POOL_TOKEN_KEY]),
-    proxies: summarize(pool[POOL_PROXY_KEY]),
-  };
 }
 
 /**
@@ -982,5 +964,4 @@ export default {
   // 修改点（第 3 期 3-B）：全局 GitHub 凭据池
   getGlobalCredentialPool,
   updateGlobalCredentialPool,
-  describeGlobalCredentialPool,
 };

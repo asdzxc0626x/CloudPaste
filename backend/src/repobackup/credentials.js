@@ -332,9 +332,9 @@ export async function saveGlobalPool(db, pool, encryptionSecret) {
 }
 
 /**
- * 从 code_repositories 行里取出仓库级明文池
- * @param {object} repoRow
+ * 从仓库的已解密配置里取出仓库级明文池
  * @param {object} decryptedConfig parseProviderConfig 的结果（明文）
+ * @returns {{ tokens: object[], proxies: object[] }}
  */
 export function extractRepoPool(decryptedConfig) {
   return normalizePool(decryptedConfig);

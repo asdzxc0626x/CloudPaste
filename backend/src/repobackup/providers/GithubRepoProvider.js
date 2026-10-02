@@ -66,6 +66,7 @@ import {
   extractRepoPool,
   listCredentialCandidates,
   hasConfiguredEntries,
+  isMaskedPlaceholder,
   POOL_TOKEN_KEY,
   POOL_PROXY_KEY,
 } from "../credentials.js";
@@ -139,6 +140,45 @@ const DEFAULT_API_BASE_HOST = "api.github.com";
  */
 const credentialRotation = { token: 0, proxy: 0 };
 
+/**
+ * 复位凭据轮询游标（修改点：审计修复 — 测试与排障用）
+ *
+ * 游标是模块级状态，会跨调用方持续累积。运行期不该重置（那会让轮询退化成
+ * 「每次都从第一个开始」），但测试需要一个确定性的起点，否则只能靠猜游标位置
+ * 来断言轮询顺序。排障时也可以用它把轮询拉回可预测的起点。
+ */
+export function resetCredentialRotation() {
+  credentialRotation.token = 0;
+  credentialRotation.proxy = 0;
+}
+
+/**
+ * 游标的回绕模数（修改点：审计修复 — 轮询均匀性）
+ *
+ * 为什么需要它：游标是模块级共享的，而每次挑选时「可用池」的长度各不相同
+ * （不同仓库的池大小不同，被限流/冷却的条目也会被排除）。
+ * 原实现写回 `(cursor + 1) % group.length`，等于用「当前这个池的长度」去约束
+ * 一个共享游标 —— 只要系统里存在一个短池，游标就会被永久压在它的范围内，
+ * 长池里靠后的 Token / 代理一次都轮不到，「均匀分摊」直接失效。
+ *
+ * 正确做法是「写回时只自增、读取时才按组长取模」。这里再模一个足够大的数，
+ * 纯粹是为了防止长期运行后数值无边界增长；10 亿次请求才回绕一次，
+ * 回绕处最多产生一次不均，可以忽略。
+ */
+const ROTATION_CURSOR_MODULUS = 1_000_000_000;
+
+/**
+ * 单次请求内「换凭据重试」的次数上限（修改点：审计修复 2）
+ *
+ * 与网络重试（RETRY_MAX_ATTEMPTS）是两套独立预算：
+ * 一个坏 Token 不应该把网络抖动的重试额度吃掉，反之亦然。
+ *
+ * 为什么不等于池上限（20）：401 导致的换人每次都是一次真实请求、要烧一次额度。
+ * 5 次足以覆盖常见池规模（2~5 条），又不会在「整池都失效」时连烧 20 次额度 ——
+ * 那种情况下换人是徒劳的，交给冷却 + 下一个调度周期更合适。
+ */
+const MAX_CREDENTIAL_SWITCHES = 5;
+
 // 说明：constants/index.js 的 ApiStatus 未定义 502/BAD_GATEWAY，
 // 为避免引用未定义常量（会静默退化成 undefined），上游失败统一使用 INTERNAL_ERROR，
 // 并通过 expose:true + 明确 message 让管理端看到真实原因。
@@ -198,9 +238,10 @@ export class GithubRepoProvider extends BaseRepoProvider {
     this._db = runtime?.db ?? null;
     this._encryptionSecret = runtime?.encryptionSecret ?? null;
     this._schedulerConfig = resolveGithubSchedulerConfig(runtime?.env ?? null);
-    this._quotaReserve = this.token
-      ? this._schedulerConfig.tokenReserve
-      : this._schedulerConfig.anonymousReserve;
+    // 说明：预留量（reserve）不在这里缓存。它必须跟着**每次请求实际选中的凭据**走
+    // （有 Token 用 tokenReserve，匿名用 anonymousReserve），
+    // 而实例上的 this.token 只是兼容旧配置的单一 Token，不能代表轮询结果。
+    // 取值见 _pickCredential 与 _acquireRequestTicket。
 
     /**
      * 仓库级凭据池（修改点：第 3 期 3-B）
@@ -274,6 +315,31 @@ export class GithubRepoProvider extends BaseRepoProvider {
         }
       } catch {
         errors.push(`${key} 格式无效`);
+      }
+    }
+
+    // 修改点（审计修复 3）：代理池逐条校验 URL / 协议，保存时就拒绝非法地址。
+    //
+    // 为什么必须在这里拦：非 URL 的代理地址会让 fetch 直接抛错，被归类为
+    // 「网络错误」-> 冷却该节点 3 分钟 -> 冷却到期后又轮到它 -> 无限循环，
+    // 而用户在界面上看不到任何「这条配错了」的提示。
+    //
+    // 掩码值（前端回传的未改动条目，形如 ****abcd）必须跳过：它不是用户新填的值，
+    // 原值已经在创建时校验过了，这里再校验只会把「只改备注」的保存操作误判成非法。
+    for (const entry of Array.isArray(cfg[POOL_PROXY_KEY]) ? cfg[POOL_PROXY_KEY] : []) {
+      const raw = entry?.value === null || entry?.value === undefined ? "" : String(entry.value).trim();
+      if (!raw) continue;
+      if (isMaskedPlaceholder(raw)) continue;
+
+      const label = entry?.label ? `「${String(entry.label).slice(0, 40)}」` : "";
+      try {
+        const parsed = new URL(raw);
+        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+          errors.push(`加速代理${label}必须以 http:// 或 https:// 开头`);
+        }
+      } catch {
+        // 注意：错误信息里绝不能回显 raw —— 代理地址可能内嵌 basic auth
+        errors.push(`加速代理${label}格式无效，应为完整的 http(s) 地址`);
       }
     }
 
@@ -849,19 +915,80 @@ export class GithubRepoProvider extends BaseRepoProvider {
     // —— 第 1 期的「codeload 直连」优化不能被这一期影响。
     const gated = this._isApiRequest(url);
 
-    for (let attempt = 1; attempt <= RETRY_MAX_ATTEMPTS; attempt += 1) {
-      // 修改点（第 3 期 3-B）：每一次尝试都重新挑一次 Token / 代理。
-      // 「动态组合」的意义就在这里：上一次把某个 Token 打到限流，下一次会自然换一个。
-      // 修改点（第 3 期 3-B 回退规则）：挑不到凭据时返回匿名，不再抛 RateLimitedError。
-      const credential = await this._pickCredential();
+    /**
+     * 本轮已判定不可用的凭据分区（修改点：审计修复 2）
+     *
+     * 只在这一次请求内生效、不写库：它让「换下一个凭据接着试」成为本轮就能完成的动作，
+     * 而不是等下一个调度周期。需要跨请求保留的状态（401 冷却、代理冷却）
+     * 仍然由 _noteCredentialFailure 落到共享账本里。
+     */
+    const excludeTokenScopes = new Set();
+    const excludeProxyScopes = new Set();
+
+    /**
+     * 两套独立的重试预算（修改点：审计修复 2）
+     * - attempt  网络错误 / 5xx / 限流退避的轮次，上限 RETRY_MAX_ATTEMPTS（语义与改造前一致）
+     * - switches 因凭据本身不可用（401 / 权限不足 / 额度耗尽 / 代理挂了）而换人重试的次数
+     *
+     * 分开的理由：一个坏 Token 不该把网络抖动的重试额度吃光。否则池里配了 5 个 Token
+     * 也只能试到第 3 个就被判失败 —— 那就退化成了「主 Token + 备用」，而不是轮询池。
+     */
+    let attempt = 1;
+    let switches = 0;
+    /** 兜底的总轮次上限，防止任何意外路径把循环变成死循环 */
+    let rounds = 0;
+    const maxRounds = RETRY_MAX_ATTEMPTS + MAX_CREDENTIAL_SWITCHES + 1;
+
+    for (;;) {
+      rounds += 1;
+      if (rounds > maxRounds) {
+        throw new TransientError("GitHub 请求失败: 超过最大重试次数", { details: { url } });
+      }
+
+      // 修改点（第 3 期 3-B）：每一次尝试都重新挑一次 Token / 代理 —— 这是个轮询池，
+      // 每次调用都会往后推进游标，请求因此持续分摊到池里的每一条，
+      // 而不是只有当前凭据失败了才切换。
+      // 修改点（审计修复 1）：API 请求不走代理，所以也不挑代理（不推进代理游标）。
+      const credential = await this._pickCredential({
+        needProxy: !gated,
+        excludeTokenScopes,
+        excludeProxyScopes,
+      });
       const targetUrl = this._applyCredentialProxy(url, { proxy: credential.proxy, apiRequest: gated });
+      /**
+       * 本次是否真的经过了代理。
+       * 修改点（审计修复 1 配套）：归因要看「实际是否走了代理」而不是「有没有挑到代理」，
+       * 否则 API 请求的网络抖动会冷却掉一个根本没参与本次请求的代理节点。
+       */
+      const proxyApplied = targetUrl !== url;
 
       // 修改点（第 3 期）：发起前先过调度器——
       // 1) 查共享额度账本，额度不足时直接抛 RateLimitedError（一个请求都不发），
       //    由第 2 期已经做好的延迟重试流程接住；
       // 2) 排队等全局并发名额与最小发起间隔。
-      // 每一次「重试」都是一次真实请求，所以通行证按 attempt 逐个申请。
-      const ticket = gated ? await this._acquireRequestTicket(url, credential) : null;
+      // 每一次「重试」都是一次真实请求，所以通行证按轮次逐个申请。
+      let ticket = null;
+      if (gated) {
+        try {
+          ticket = await this._acquireRequestTicket(url, credential);
+        } catch (quotaError) {
+          // 修改点（审计修复 — 各 Token 独立限流）：被限流的是「这一个 Token」，
+          // 它的额度是独立分区。池里还有别的可用 Token 时应当立刻换一个继续，
+          // 而不是让整次请求因为某一个 Token 没额度就失败。
+          if (
+            quotaError instanceof RateLimitedError &&
+            credential.token &&
+            credential.usableTokenCount > 1 &&
+            switches < MAX_CREDENTIAL_SWITCHES
+          ) {
+            excludeTokenScopes.add(credential.tokenScopeId);
+            switches += 1;
+            console.warn(`[GithubRepoProvider] 当前 Token 额度不足，换池内下一个继续: ${url}`);
+            continue;
+          }
+          throw quotaError;
+        }
+      }
 
       const abort = this._linkAbort(externalSignal, timeoutMs);
       let resp = null;
@@ -885,6 +1012,7 @@ export class GithubRepoProvider extends BaseRepoProvider {
         await this._noteCredentialFailure(credential, {
           networkError: Boolean(fetchError),
           status: resp?.status ?? null,
+          proxyApplied,
         });
       }
 
@@ -904,11 +1032,28 @@ export class GithubRepoProvider extends BaseRepoProvider {
         }
 
         const timedOut = abort.state.timedOut;
+
+        // 修改点（审计修复 2）：网络失败且本次确实走了代理 —— 先换一个代理节点试。
+        // 这不消耗网络重试预算：问题在节点上，不在网络上。
+        // 冷却已由 _noteCredentialFailure 写进账本，这里再加一次本轮排除，
+        // 确保紧接着的 _pickCredential 一定轮到别的节点（而不是靠游标碰运气）。
+        if (proxyApplied && credential.proxyScopeId) {
+          excludeProxyScopes.add(credential.proxyScopeId);
+          if (credential.usableProxyCount > 1 && switches < MAX_CREDENTIAL_SWITCHES) {
+            switches += 1;
+            console.warn(
+              `[GithubRepoProvider] 代理节点${timedOut ? "超时" : "失败"}，换池内下一个继续: ${url}`,
+            );
+            continue;
+          }
+        }
+
         if (attempt < RETRY_MAX_ATTEMPTS && canRetryNetwork) {
           console.warn(
             `[GithubRepoProvider] 请求${timedOut ? "超时" : "失败"}，第 ${attempt} 次重试: ${url}`,
           );
           await this._sleep(this._computeDelayMs({ attempt }));
+          attempt += 1;
           continue;
         }
 
@@ -954,8 +1099,45 @@ export class GithubRepoProvider extends BaseRepoProvider {
       // 原实现只认 502/503/504，500 等会被当成永久性错误直接记 failed。
       const retryableServer = resp.status >= 500;
 
+      // ------------- 凭据被拒：换池内下一个继续（修改点：审计修复 2）-------------
+      //
+      // 401            = 这个 Token 明确失效（已由 _noteCredentialFailure 冷却 15 分钟）
+      // 403 且非限流   = 这个 Token 对该仓库权限不足 / SSO 未授权
+      //
+      // 池里还有别的可用 Token 时必须立刻换一个重试，否则一个坏 Token 就能把整轮
+      // 判成永久失败、写进备份历史 —— 多 Token 池的意义正是「坏了就换下一个」。
+      // 这类重试不消耗网络重试预算（问题在凭据上，不在网络上）。
+      //
+      // 403 刻意只在本轮排除、不落库冷却：它多半是「这个 Token + 这个仓库」的组合问题，
+      // 写长冷却会误伤该 Token 在其他仓库的正常使用。
+      const credentialRejected = resp.status === 401 || (resp.status === 403 && !rateLimited);
+      if (
+        credentialRejected &&
+        credential.token &&
+        credential.usableTokenCount > 1 &&
+        switches < MAX_CREDENTIAL_SWITCHES
+      ) {
+        await this._discardBody(resp);
+        excludeTokenScopes.add(credential.tokenScopeId);
+        switches += 1;
+        console.warn(
+          `[GithubRepoProvider] HTTP ${resp.status}（当前 Token 不可用），换池内下一个继续: ${url}`,
+        );
+        continue;
+      }
+
       // ------------- 限流（修改点：第 2 期 限流 = 延迟，不是失败）-------------
       if (rateLimited) {
+        // 修改点（审计修复 — 各 Token 独立限流）：撞到 429 的只是「这一个 Token」。
+        // 池里还有别的可用 Token 时先换人，不要让整个请求陪着它等额度恢复。
+        if (credential.token && credential.usableTokenCount > 1 && switches < MAX_CREDENTIAL_SWITCHES) {
+          await this._discardBody(resp);
+          excludeTokenScopes.add(credential.tokenScopeId);
+          switches += 1;
+          console.warn(`[GithubRepoProvider] HTTP ${resp.status}（当前 Token 限流），换池内下一个继续: ${url}`);
+          continue;
+        }
+
         const delayMs = this._computeDelayMs({
           attempt,
           retryAfterSeconds: retryAfter,
@@ -969,6 +1151,7 @@ export class GithubRepoProvider extends BaseRepoProvider {
             `[GithubRepoProvider] HTTP ${resp.status}（限流），${delayMs}ms 后第 ${attempt} 次重试: ${url}`,
           );
           await this._sleep(delayMs);
+          attempt += 1;
           continue;
         }
 
@@ -997,6 +1180,7 @@ export class GithubRepoProvider extends BaseRepoProvider {
           `[GithubRepoProvider] HTTP ${resp.status}，${delayMs}ms 后第 ${attempt} 次重试: ${url}`,
         );
         await this._sleep(delayMs);
+        attempt += 1;
         continue;
       }
 
@@ -1015,7 +1199,11 @@ export class GithubRepoProvider extends BaseRepoProvider {
         });
       }
 
-      // 其余状态码（400/401/403 非限流/422 等）：永久性错误，照旧记失败
+      // 其余状态码（400/422 等，以及池内已无其他可用 Token 时的 401/403）：
+      // 永久性错误，照旧记失败。
+      // 修改点（审计修复 2）：401/403 只有在「换无可换」时才落到这里 ——
+      // 池里还有可用 Token 的情况已经在上面换人重试了。
+      // 单 Token 且它失效时走到这里是对的：那是配置问题，应当让用户看到。
       throw new AppError(`GitHub 请求失败: HTTP ${resp.status}`, {
         status: ApiStatus.INTERNAL_ERROR,
         code: "REPO_BACKUP.GITHUB_REQUEST_FAILED",
@@ -1023,9 +1211,8 @@ export class GithubRepoProvider extends BaseRepoProvider {
         details: { url, status: resp.status, body: text ? String(text).slice(0, 500) : null },
       });
     }
-
-    // 理论上不会到达（循环内必定 return 或 throw）
-    throw new TransientError("GitHub 请求失败: 超过最大重试次数", { details: { url } });
+    // 注意：上面是 for(;;)，所有路径都 return 或 throw，
+    // 轮次上限由循环开头的 rounds 兜底（抛 TransientError），此处无需再兜一次。
   }
 
   // ==================== 凭据池：挑选与故障隔离（第 3 期 3-B）====================
@@ -1048,26 +1235,20 @@ export class GithubRepoProvider extends BaseRepoProvider {
   /**
    * 在候选里轮转挑一个
    *
-   * 排序规则（从主到次）：
-   * 1. 仓库级优先于全局级 —— 仓库显式配置的凭据应当先用
-   * 2. 剩余额度多的优先 —— 尽量把请求摊到额度更宽裕的凭据上
-   * 3. 同一档内轮转 —— 避免退化成「固定绑定某一个」
-   *
-   * 代理没有「剩余额度」的概念，因此第 2 条对代理恒为空，实际效果就是纯轮转。
-   *
-   * @private
-   */
-  /**
-   * 在候选里轮转挑一个
-   *
    * 规则（从主到次）：
-   * 1. 仓库级优先于全局级 —— 仓库显式配置的凭据应当先用
-   * 2. 组内轮转 —— 避免退化成「固定绑定某一个」
+   * 1. 仓库级优先于全局级 —— 仓库显式配置的凭据应当先用；
+   *    传进来的 candidates 已经过滤掉「此刻不可用」的条目，所以只要仓库级还剩一条
+   *    可用，就一定选它，不会掺入全局的（需求：仓库级 -> 全局 -> 匿名）
+   * 2. 组内轮转 —— 每次调用都往后推进一位，让请求持续分摊到池里的每一条
    *
    * 这里刻意**不按「剩余额度」排序**：额度见底、处于冷却的候选在上一步就已经被
    * 过滤掉了，留在组里的都是当下可用的；再按额度排序会让流量长期压在某一个凭据上，
    * 反而把「不固定绑定」变成「绑定到额度最多的那个」。
    * 「根据额度动态组合」体现在**排除**上，而不是排序上。
+   *
+   * 修改点（审计修复 — 轮询均匀性）：游标写回时只自增、不按 group.length 取模。
+   * 详见 ROTATION_CURSOR_MODULUS 的说明：用当前组长去约束共享游标会让长池的
+   * 尾部凭据永远轮不到。
    *
    * @private
    */
@@ -1078,12 +1259,16 @@ export class GithubRepoProvider extends BaseRepoProvider {
     // 游标跨实例共享（见 credentialRotation 的注释），因此直接读写模块级状态
     const cursor = Number(credentialRotation[cursorKind]) || 0;
     const picked = group[cursor % group.length];
-    credentialRotation[cursorKind] = (cursor + 1) % group.length;
+    credentialRotation[cursorKind] = (cursor + 1) % ROTATION_CURSOR_MODULUS;
     return picked;
   }
 
   /**
    * 为本次请求挑一组 Token + 代理（修改点：第 3 期 3-B）
+   *
+   * 这是一个**轮询池**，不是「主 Token + 失败备用」：
+   * 每次调用都会往后推进游标，因此每一次新的 API / 归档请求都会轮到下一个可用凭据，
+   * 而不是等当前凭据失败了才切换。Token 与代理各自独立轮询、不固定绑定。
    *
    * 优先级（与需求一致）：
    *   仓库级 Token/代理  ->  全局池  ->  匿名
@@ -1095,14 +1280,24 @@ export class GithubRepoProvider extends BaseRepoProvider {
    * - 全局池也不可用就降级为匿名，**不再延迟等待**：匿名额度由调度器的账本单独把关，
    *   真的没额度时 acquire 仍会抛 RateLimitedError，所以这里没必要再造一个「池全灭就停摆」的状态
    *
-   * Token 与代理**各自独立挑选**，不固定绑定，可以随时组合出不同的搭配。
-   *
    * 降级成匿名时如果打到私有仓库会拿到 404，那个误判由 _fetchWithRetry 里的
    * 「被迫匿名」判断单独兜住，不在这里处理。
    *
+   * @param {object} [options]
+   * @param {boolean} [options.needProxy] 是否需要挑代理（修改点：审计修复 1）。
+   *        API 请求一律不走代理，因此也不该挑 —— 否则会白白推进代理游标，
+   *        把归档下载的代理分摊搅乱（API 请求通常远多于归档请求）。
+   * @param {Set<string>|null} [options.excludeTokenScopes] 本轮已判定不可用的 Token 分区
+   * @param {Set<string>|null} [options.excludeProxyScopes] 本轮已判定不可用的代理分区
+   * @returns {Promise<{
+   *   token: string|null, tokenScopeId: string, tokenSource: string,
+   *   proxy: string|null, proxyScopeId: string|null,
+   *   usableTokenCount: number, usableProxyCount: number,
+   * }>} usableXxxCount 是「排除集生效后仍可用的候选数」，
+   *     调用方据此判断「换一个还有没有意义」，避免在只剩一条时空转
    * @private
    */
-  async _pickCredential() {
+  async _pickCredential({ needProxy = true, excludeTokenScopes = null, excludeProxyScopes = null } = {}) {
     await this._ensureCredentialPools();
 
     const nowMs = Date.now();
@@ -1113,6 +1308,7 @@ export class GithubRepoProvider extends BaseRepoProvider {
     let token = null;
     let tokenScopeId = ANONYMOUS_SCOPE_ID;
     let tokenSource = "anonymous";
+    let usableTokenCount = 0;
 
     const tokenCandidates = listCredentialCandidates({
       repoPool: this._repoPool,
@@ -1124,11 +1320,17 @@ export class GithubRepoProvider extends BaseRepoProvider {
       const usable = [];
       for (const candidate of tokenCandidates) {
         const scopeId = buildQuotaScopeId(candidate.entry.value);
+        // 修改点（审计修复 2）：本轮已经撞过 401 / 额度不足的，直接跳过，
+        // 保证「继续轮询其他可用项」而不是反复踩同一个
+        if (excludeTokenScopes?.has(scopeId)) continue;
         const state = resolveScopeState(states, scopeId);
+        // 每个 Token 的额度状态是独立分区（见 buildQuotaScopeId）：
+        // 一个被限流只会把它自己排除，不影响其他 Token
         if (isScopeBlocked(state, { nowMs, reserve: this._schedulerConfig.tokenReserve })) continue;
         usable.push({ ...candidate, scopeId, remaining: state.remaining });
       }
 
+      usableTokenCount = usable.length;
       if (usable.length > 0) {
         const picked = this._rotatePick(usable, "token");
         token = picked.entry.value;
@@ -1143,37 +1345,53 @@ export class GithubRepoProvider extends BaseRepoProvider {
     // ---------- 代理 ----------
     let proxy = null;
     let proxyScopeId = null;
+    let usableProxyCount = 0;
 
-    const proxyCandidates = listCredentialCandidates({
-      repoPool: this._repoPool,
-      globalPool: this._globalPool,
-      kind: POOL_PROXY_KEY,
-    });
+    // 修改点（审计修复 1）：只有真的会用到代理的请求（归档下载）才挑代理
+    if (needProxy) {
+      const proxyCandidates = listCredentialCandidates({
+        repoPool: this._repoPool,
+        globalPool: this._globalPool,
+        kind: POOL_PROXY_KEY,
+      });
 
-    if (proxyCandidates.length > 0) {
-      const usable = [];
-      for (const candidate of proxyCandidates) {
-        const scopeId = buildProxyScopeId(candidate.entry.value);
-        if (isScopeBlocked(resolveScopeState(states, scopeId), { nowMs })) continue;
-        usable.push({ ...candidate, scopeId });
+      if (proxyCandidates.length > 0) {
+        const usable = [];
+        for (const candidate of proxyCandidates) {
+          const scopeId = buildProxyScopeId(candidate.entry.value);
+          if (excludeProxyScopes?.has(scopeId)) continue;
+          if (isScopeBlocked(resolveScopeState(states, scopeId), { nowMs })) continue;
+          usable.push({ ...candidate, scopeId });
+        }
+        usableProxyCount = usable.length;
+        if (usable.length > 0) {
+          const picked = this._rotatePick(usable, "proxy");
+          proxy = picked.entry.value;
+          proxyScopeId = picked.scopeId;
+        }
+        // 代理全部不可用时直连：直连失败会被归类为「暂时性错误」并安排重试，
+        // 比把请求挂在一个已知有问题的节点上要好
       }
-      if (usable.length > 0) {
-        const picked = this._rotatePick(usable, "proxy");
-        proxy = picked.entry.value;
-        proxyScopeId = picked.scopeId;
-      }
-      // 代理全部不可用时直连：直连失败会被归类为「暂时性错误」并安排重试，
-      // 比把请求挂在一个已知有问题的节点上要好
     }
 
-    return { token, tokenScopeId, tokenSource, proxy, proxyScopeId };
+    return { token, tokenScopeId, tokenSource, proxy, proxyScopeId, usableTokenCount, usableProxyCount };
   }
 
   /**
    * 给 URL 套上本次选中的代理
    *
-   * - API 请求：只认凭据池里的代理（历史上的 gh_proxy 从不作用于 API，保持不变）
-   * - 源码下载：优先用凭据池里的代理，池里没有才回落到历史上的 gh_proxy
+   * 修改点（审计修复 1）：**API 请求一律不走代理**，恢复 gh_proxy 的历史语义。
+   *
+   * 第 3-B 原实现把凭据池里的代理也套到了 api.github.com 上，这是个误判级的问题：
+   * ghproxy 这类「前缀式」加速服务通常只转发 github.com / codeload / raw，
+   * 并不转发 api.github.com。请求打过去会拿到代理自己的 404，
+   * 而 404 在 _fetchWithRetry 里会被翻译成 NotFoundError（「仓库不存在」）
+   * 并被备份任务记成**永久失败** —— 用户只是配了个加速代理，仓库就再也备不了份。
+   * 而且这类 HTTP 层失败不会触发代理冷却（只有网络层错误才会），于是每轮都重复踩。
+   *
+   * 现在的分工回到清晰状态：
+   * - API 请求（含自建 endpoint_url 的 API）：直连，不套任何代理
+   * - 源码归档下载：优先用凭据池里轮到的代理，池里没有才回落到历史上的 gh_proxy
    *
    * 注意：返回的是「实际要请求的地址」，其中可能含代理的认证信息；
    * 它绝不能被写进日志、错误信息或任务详情 —— 对外一律使用原始 URL。
@@ -1181,12 +1399,13 @@ export class GithubRepoProvider extends BaseRepoProvider {
    * @private
    */
   _applyCredentialProxy(url, { proxy, apiRequest }) {
+    // API 请求从不走代理（凭据池里的代理与历史上的 gh_proxy 都不作用于 API）
+    if (apiRequest) return url;
+
     if (proxy) {
       const base = String(proxy).trim().replace(/\/+$/, "");
       return `${base}/${url}`;
     }
-    // API 请求从不走历史上的 gh_proxy（它一直只作用于源码下载），保持不变
-    if (apiRequest) return url;
     return this._applyGhProxy(url);
   }
 
@@ -1194,19 +1413,27 @@ export class GithubRepoProvider extends BaseRepoProvider {
    * 把一次失败归因到具体的凭据上，让后续请求自动避开（修改点：第 3 期 3-B）
    *
    * 归因规则刻意保守：
-   * - 网络层失败 + 走了代理  -> 认为这个代理节点有问题，短时间避开
-   * - 401                  -> 这个 Token 明确失效，较长时间避开
-   * - 限流                 -> **不在这里处理**：它由账本里的 remaining/resetAt 表达，
-   *                           再记一份冷却就等于两套状态互相打架
-   * - 404 / 其它 4xx       -> 是仓库或权限的问题，不是凭据的问题，不避开
+   * - 网络层失败 + **本次真的走了代理**  -> 认为这个代理节点有问题，短时间避开
+   * - 401                              -> 这个 Token 明确失效，较长时间避开
+   * - 限流                             -> **不在这里处理**：它由账本里的 remaining/resetAt 表达，
+   *                                       再记一份冷却就等于两套状态互相打架
+   * - 403 非限流                        -> 多半是「这个 Token 对这个仓库权限不足」，
+   *                                       是仓库与 Token 的组合问题而不是 Token 本身失效。
+   *                                       写长冷却会误伤它在其他仓库的正常使用，
+   *                                       因此只在本轮排除（见 _fetchWithRetry），不落库
+   * - 404 / 其它 4xx                    -> 是仓库或权限的问题，不是凭据的问题，不避开
+   *
+   * 修改点（审计修复 1 配套）：代理冷却必须以 proxyApplied 为准，不能只看
+   * credential.proxy 是否存在 —— API 请求已经不走代理了，若仍按「挑到了代理」归因，
+   * 一次 API 网络抖动会把一个根本没参与请求的代理节点冷却掉。
    *
    * @private
    */
-  async _noteCredentialFailure(credential, { networkError = false, status = null } = {}) {
+  async _noteCredentialFailure(credential, { networkError = false, status = null, proxyApplied = false } = {}) {
     if (!this._db || !credential) return;
     const nowMs = Date.now();
 
-    if (networkError && credential.proxy && credential.proxyScopeId) {
+    if (networkError && proxyApplied && credential.proxyScopeId) {
       await markScopeCooldown(
         this._db,
         credential.proxyScopeId,

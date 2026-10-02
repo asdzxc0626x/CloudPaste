@@ -80,7 +80,7 @@ codeRepositoryRoutes.get("/api/admin/repo-backup/repositories", requireAdmin, as
  * 不含明文的审计日志 —— 明文只在管理员显式请求时出现。
  */
 codeRepositoryRoutes.get("/api/admin/repo-backup/credentials", requireAdmin, async (c) => {
-  const { db, encryptionSecret, env } = resolveContext(c);
+  const { db, encryptionSecret } = resolveContext(c);
   const identity = resolvePrincipal(c, { allowedTypes: [UserType.ADMIN] });
 
   const reveal = c.req.query("reveal");
@@ -108,7 +108,7 @@ codeRepositoryRoutes.get("/api/admin/repo-backup/credentials", requireAdmin, asy
  * - 前端每次提交完整的池；掩码值会被还原成原值，不会因为「只改备注」而抹掉 Token
  */
 codeRepositoryRoutes.put("/api/admin/repo-backup/credentials", requireAdmin, async (c) => {
-  const { db, encryptionSecret, env } = resolveContext(c);
+  const { db, encryptionSecret } = resolveContext(c);
   resolvePrincipal(c, { allowedTypes: [UserType.ADMIN] });
 
   const body = await c.req.json().catch(() => ({}));

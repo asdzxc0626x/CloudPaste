@@ -285,12 +285,6 @@ export function isScopeBlocked(state, { nowMs, reserve = 0 } = {}) {
   return false;
 }
 
-/** 该分区最早可能恢复的时间（用于算「全都不可用时该等到什么时候」） */
-export function scopeRecoverAtMs(state) {
-  if (!state) return 0;
-  return Math.max(Number(state.cooldownUntilMs) || 0, Number(state.resetAtMs) || 0);
-}
-
 /**
  * 把某个分区标记为「暂时避开」
  *
@@ -873,7 +867,6 @@ export default {
   readScopeStates,
   resolveScopeState,
   isScopeBlocked,
-  scopeRecoverAtMs,
   markScopeCooldown,
   runCoalesced,
   clearCoalescedCache,

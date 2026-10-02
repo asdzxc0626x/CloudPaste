@@ -30,7 +30,7 @@ const MIN_HANDLER_DEFER_MS = 30 * 1000;
  * @param {any} handlerResult handler.run() 的返回值
  * @returns {string|null} 覆盖用的 next_run_after（ISO 字符串），无覆盖时为 null
  */
-function resolveNextRunOverride(handlerResult) {
+export function resolveNextRunOverride(handlerResult) {
   if (!handlerResult || typeof handlerResult !== "object") return null;
 
   const nowMs = Date.now();
@@ -87,7 +87,7 @@ async function tryAcquireLock(db, taskId, nowIso, lockTimeoutSec) {
  *        nextRunAfterOverride（修改点：第 2 期 延迟重试）非空时直接作为下次执行时间
  * @returns {{ nextRunAfter: string | null, enabled: number, runCountDelta: number, failureCountDelta: number }}
  */
-function computeNextSchedule(row, ctx) {
+export function computeNextSchedule(row, ctx) {
   const scheduleType = (row.schedule_type || "interval").toLowerCase();
   const enabledNum =
     typeof row.enabled === "boolean"
@@ -205,7 +205,7 @@ function computeNextSchedule(row, ctx) {
  * @param {any} row - scheduled_jobs 行
  * @param {{ status: 'success' | 'failure' | 'skipped', nowIso: string, startedAt?: string, finishedAt?: string, nextRunAfterOverride?: string|null }} ctx
  */
-async function updateTaskSchedule(db, row, ctx) {
+export async function updateTaskSchedule(db, row, ctx) {
   const { nextRunAfter, enabled, runCountDelta, failureCountDelta } = computeNextSchedule(
     row,
     ctx,
@@ -228,8 +228,38 @@ async function updateTaskSchedule(db, row, ctx) {
   }
 
   if (nextRunAfter !== undefined) {
-    sets.push("next_run_after = ?");
-    binds.push(nextRunAfter);
+    if (nextRunAfter === null) {
+      // 一次性任务结束 / 配置异常被禁用：直接清空，不需要保护
+      sets.push("next_run_after = NULL");
+    } else {
+      /**
+       * 修改点（审计修复 4）：不要覆盖「已经被主动前移到未来」的 next_run_after。
+       *
+       * 竞态场景（仓库备份的限流延迟重试）：
+       *   1. tick 选中到期的计划行 -> ScheduledRepoBackupTask 创建编排任务后立即返回
+       *   2. 本函数把 next_run_after 推到下一个正常周期（默认 6 小时后）
+       *   3. 编排任务真正执行时撞上限流 -> deferRepositoryBackupSchedule 把它前移到
+       *      「额度恢复时间」（比如 20 分钟后）
+       * 正常情况下 2 先于 3，前移生效。但编排任务可能跑得极快就撞限流
+       * （额度预检根本不发请求，几毫秒就返回），这时 3 先于 2，
+       * 前移会被第 2 步的正常周期覆盖 —— 这一轮的延迟重试就丢了，白等一个完整周期。
+       *
+       * 保护判据（三条同时成立才保留现值）：
+       *   a. 现值非 NULL
+       *   b. 现值在未来（> nowIso）：行被选中执行时它一定是过去时间，
+       *      所以「现在是未来」只可能是执行期间有人主动前移过
+       *   c. 现值比本次要写的更早：取两者里更早的那个，不漏检
+       * 否则照常写入本次算出的时间，周期推进语义不变。
+       *
+       * 时间列存的是 toISOString() 字符串（UTC、固定毫秒精度），字典序即时间序，
+       * 与 deferRepositoryBackupSchedule 里既有的字符串比较保持同一套假设。
+       */
+      sets.push(`next_run_after = CASE
+        WHEN next_run_after IS NOT NULL AND next_run_after > ? AND next_run_after < ? THEN next_run_after
+        ELSE ?
+      END`);
+      binds.push(ctx.nowIso, nextRunAfter, nextRunAfter);
+    }
   }
 
   if (enabled !== undefined) {
