@@ -178,6 +178,62 @@ export function getSecretPoolFields(provider) {
 }
 
 /**
+ * 旧版「单值字段 -> 多值池字段」的对应关系（修改点：Token / 代理统一为多值字段）
+ *
+ * 背景：历史上 github 只有单个 `token` 与单个 `gh_proxy`；后来引入了
+ * `tokens` / `proxies` 两个池，于是界面上同一件事出现了两个输入框
+ * （一个单值 + 一个池），既重复又容易填错。现在统一成只保留池字段，
+ * 旧配置里的单值必须继续可用，因此在**解析阶段**把它们折进池里：
+ * 界面只呈现一个字段，老配置不丢，运行期语义也不变。
+ *
+ * 注意 gh_proxy 折进 proxies 是安全的：自「API 请求一律不走代理」之后，
+ * gh_proxy 与池里的代理一样只作用于源码归档下载，两者语义已经完全一致。
+ */
+const LEGACY_POOL_FIELD_MAP = {
+  github: { token: "tokens", gh_proxy: "proxies" },
+};
+
+/**
+ * 折叠出来的旧条目的固定 id
+ * - token 沿用 GithubRepoProvider 里既有的 "tk_legacy"，保证两边认定为同一条
+ * - 固定 id 还有个关键作用：前端「未改动」时会回传掩码串，
+ *   mergeEntryList 靠 id 命中原值才能还原，随机 id 会让每次保存都覆盖成掩码
+ */
+const LEGACY_ENTRY_IDS = { token: "tk_legacy", gh_proxy: "px_legacy" };
+
+/**
+ * 把旧版单值字段折进对应的池字段（修改点：Token / 代理统一为多值字段）
+ *
+ * - 只在池里没有任何「有值条目」时才折叠：池已经配了就以池为准，避免同一份凭据出现两次
+ *   （与 GithubRepoProvider 构造时的兼容规则保持一致）
+ * - 在传进来的 config 上原地修改并返回，调用方拿到的就是统一形态
+ * - 幂等：折叠后池里已有该条，再次调用不会重复添加
+ *
+ * @param {string} provider
+ * @param {Object} config 已解密的配置
+ * @returns {Object} 同一个 config 对象
+ */
+export function foldLegacyPoolFields(provider, config) {
+  const map = LEGACY_POOL_FIELD_MAP[provider];
+  if (!map || !config || typeof config !== "object") return config;
+
+  for (const [legacyKey, poolKey] of Object.entries(map)) {
+    const legacyValue = config[legacyKey];
+    if (legacyValue === undefined || legacyValue === null || String(legacyValue).trim() === "") continue;
+
+    const entries = Array.isArray(config[poolKey]) ? config[poolKey] : [];
+    if (entries.some((entry) => String(entry?.value ?? "").trim() !== "")) continue;
+
+    config[poolKey] = [
+      { id: LEGACY_ENTRY_IDS[legacyKey] || `${legacyKey}_legacy`, label: "", value: String(legacyValue), enabled: true },
+      ...entries,
+    ];
+  }
+
+  return config;
+}
+
+/**
  * 解析 config_json 为运行时配置（敏感字段解密）
  * @param {string} provider
  * @param {string|null|undefined} configJson
@@ -207,7 +263,9 @@ export async function parseProviderConfig(provider, configJson, encryptionSecret
     if (result[field] === undefined || result[field] === null) continue;
     result[field] = await decryptEntryList(result[field], encryptionSecret, field);
   }
-  return result;
+  // 修改点（Token / 代理统一为多值字段）：旧配置的单个 token / gh_proxy 折进池，
+  // 让「前端视图」与「保存时的合并基线」都看到同一份统一形态
+  return foldLegacyPoolFields(provider, result);
 }
 
 /**
@@ -305,6 +363,9 @@ export function mergeProviderConfig(provider, existingConfig = {}, incomingConfi
   const secretFields = new Set(getSecretFields(provider));
   // 修改点（第 3 期 3-B）：凭据池字段单独处理（按 id 增删改，而不是整体覆盖）
   const poolFields = new Set(getSecretPoolFields(provider));
+  // 修改点（Token / 代理统一为多值字段）：记录本次真正提交了哪些池，
+  // 保存后据此清理已折进池里的旧版单值字段
+  const providedPools = new Set();
 
   for (const [key, value] of Object.entries(incomingConfig || {})) {
     if (value === undefined) continue;
@@ -312,7 +373,10 @@ export function mergeProviderConfig(provider, existingConfig = {}, incomingConfi
     if (poolFields.has(key)) {
       // 只有明确传来数组才改动池：null / 非数组一律视为「本次不涉及池」，
       // 避免一次字段缺失就把整个池清空
-      if (Array.isArray(value)) merged[key] = mergeEntryList(merged[key], value, key);
+      if (Array.isArray(value)) {
+        merged[key] = mergeEntryList(merged[key], value, key);
+        providedPools.add(key);
+      }
       continue;
     }
 
@@ -335,6 +399,15 @@ export function mergeProviderConfig(provider, existingConfig = {}, incomingConfi
       continue;
     }
     merged[key] = value;
+  }
+
+  // 修改点（Token / 代理统一为多值字段）：池一旦被提交，旧版单值字段的值
+  // 已经在 parseProviderConfig 里折进池中（见 foldLegacyPoolFields），
+  // 这里把它删掉，避免 config_json 长期留着一份重复的旧值。
+  // 只在「本次确实提交了对应池」时删：否则一个只改 endpoint_url 的提交会误清旧值。
+  const legacyMap = LEGACY_POOL_FIELD_MAP[provider] || {};
+  for (const [legacyKey, poolKey] of Object.entries(legacyMap)) {
+    if (providedPools.has(poolKey)) delete merged[legacyKey];
   }
 
   return merged;

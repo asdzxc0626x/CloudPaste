@@ -33,6 +33,9 @@ export default {
       scheduleCron: "cron {cron}",
       scheduleNext: "next",
       scheduleLastFailed: "last run failed",
+      // 修改点（第 4 期 检测状态持久化）：逐引用的检测进度（持久化，重启后仍在）
+      nextDetect: "Next check",
+      detectedAt: "Checked",
     },
 
     status: {
@@ -60,6 +63,14 @@ export default {
       partialFailed: "({count} branches failed to check)",
       refHasUpdate: "This branch has an unbacked version",
       refUpToDate: "This branch is up to date",
+      // 修改点（第 4 期 检测状态持久化）：限流/上游抽风属于「稍后自动重试」，不是失败
+      deferred: "Upstream is rate limiting or temporarily unavailable; a retry is scheduled",
+      partialDeferred: "({count} branches scheduled for retry)",
+      refDeferred: "Scheduled for retry after upstream rate limiting",
+      refError: "This branch failed to check",
+      persistedPending: "Not checked yet",
+      persistedDeferred: "Awaiting automatic retry",
+      persistedError: "Check failed",
     },
 
     actions: {
@@ -159,7 +170,18 @@ export default {
       globalSubtitle: "Tokens and proxies shared by every repository that does not define its own",
       tokenPlaceholder: "ghp_xxx",
       proxyPlaceholder: "https://ghproxy.example.com",
-      // 修改点（第 3 期 3-B 交互重做）：单框连续录入的提示与各项 title
+      // 修改点（全局凭据恢复原样）：卡片式（一条一张卡片）所需的文案，
+      // 全局凭据弹窗使用这一套
+      tokenEntry: "Token label (optional)",
+      proxyEntry: "Proxy label (optional)",
+      entryLabel: "Label",
+      add: "Add entry",
+      addToken: "Add token",
+      addProxy: "Add proxy",
+      remove: "Remove",
+      enabled: "Enabled",
+      empty: "No entries configured yet",
+      // 修改点（第 3 期 3-B 交互重做）：仓库表单的标签式录入所需文案
       valuePlaceholder: "Credential value",
       inputHint:
         "Press Enter, comma or newline to confirm, and paste several at once (separated by spaces, commas or newlines). Click an entry to reveal it, click the dot on the left to enable or disable it, click × to remove it.",
@@ -182,11 +204,11 @@ export default {
 
     fields: {
       github: {
-        token: "GitHub token (optional)",
-        gh_proxy: "Acceleration proxy (optional)",
-        // 修改点（第 3 期 3-B）
-        tokens: "Repository token pool (optional)",
-        proxies: "Repository proxy pool (optional)",
+        // 修改点（Token / 代理统一为多值字段）：原来的「GitHub Token」与「加速代理」
+        // 各自只有一个输入框，现在它们本身就是多值字段（可填多个），
+        // 因此不再存在「单值 + 池」两个重复的字段
+        tokens: "GitHub token (optional, multiple allowed)",
+        proxies: "Acceleration proxy (optional, multiple allowed)",
         endpoint_url: "API endpoint (optional)",
       },
     },
@@ -204,9 +226,9 @@ export default {
         token:
           "Not needed for public repositories. Providing one raises the GitHub API rate limit so frequent checks are not throttled",
         tokens:
-          "Leave empty to fall back to the global credential pool; if that is empty too, the anonymous quota is used. With several tokens the scheduler picks dynamically by quota and rate-limit state, so one being throttled does not affect the others",
+          "Not needed for public repositories. Providing one raises the GitHub API rate limit so frequent checks are not throttled. Leave empty to fall back to the global credential pool; if that is empty too, the anonymous quota is used. With several tokens the scheduler picks dynamically by quota and rate-limit state, so one being throttled does not affect the others",
         proxies:
-          "Kept separate from the token pool and combined dynamically at request time rather than pinned together. A failing node is avoided temporarily; when none is usable the request goes direct",
+          "Prepended to the source archive download URL to accelerate downloads. Several can be configured and are combined dynamically at request time rather than pinned together. A failing node is avoided temporarily; when none is usable the request goes direct",
         gh_proxy: "Prepended to the download URL to accelerate source archive downloads",
         endpoint_url: "GitHub Enterprise or self-hosted API endpoint, defaults to https://api.github.com",
       },

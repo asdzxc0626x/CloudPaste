@@ -159,21 +159,11 @@ RepoProviderFactory.registerProvider(RepoProviderFactory.SUPPORTED_TYPES.GITHUB,
   configSchema: {
     fields: [
       {
-        // 修改点（第 3 期 3-B）：单个 Token 保留为「快速填写」入口，
-        // 真正参与调度的是下面的 tokens 池（该字段会被当作池里的第一条）
-        name: "token",
-        type: "secret",
-        required: false,
-        labelKey: "admin.repoBackup.fields.github.token",
-        ui: {
-          fullWidth: true,
-          placeholderKey: "admin.repoBackup.placeholder.github.token",
-          descriptionKey: "admin.repoBackup.description.github.token",
-        },
-      },
-      {
-        // 修改点（第 3 期 3-B）：仓库级 Token 池。
-        // 留空则自动使用全局池；全局池也没有时按匿名额度调度。
+        // 修改点（Token / 代理统一为多值字段）：
+        // 原来「GitHub Token」单值字段 + 新增的 token 池是两个字段，本质重复。
+        // 现在只保留这一个多值字段（字段名沿用存储层的 tokens），
+        // 旧配置里的单值 config.token 会在解析时折进这里（见 repobackup/config.js
+        // 的 foldLegacyPoolFields），因此老配置不会丢、界面也不用填两次。
         name: "tokens",
         type: "secretPool",
         required: false,
@@ -181,13 +171,13 @@ RepoProviderFactory.registerProvider(RepoProviderFactory.SUPPORTED_TYPES.GITHUB,
         ui: {
           fullWidth: true,
           descriptionKey: "admin.repoBackup.description.github.tokens",
-          // 修改点（第 3 期 3-B 交互重做）：单框连续录入，只保留占位符文案
+          // 单框连续录入，只需要占位符文案
           valuePlaceholderKey: "admin.repoBackup.pool.tokenPlaceholder",
         },
       },
       {
-        // 修改点（第 3 期 3-B）：仓库级加速代理池。
-        // 与 Token 池相互独立，调度时动态组合，不固定绑定。
+        // 修改点（Token / 代理统一为多值字段）：
+        // 同理，原来的 gh_proxy 单值字段与 proxies 池合并成这一个多值字段。
         name: "proxies",
         type: "secretPool",
         required: false,
@@ -195,20 +185,8 @@ RepoProviderFactory.registerProvider(RepoProviderFactory.SUPPORTED_TYPES.GITHUB,
         ui: {
           fullWidth: true,
           descriptionKey: "admin.repoBackup.description.github.proxies",
-          // 修改点（第 3 期 3-B 交互重做）：单框连续录入，只保留占位符文案
+          // 单框连续录入，只需要占位符文案
           valuePlaceholderKey: "admin.repoBackup.pool.proxyPlaceholder",
-        },
-      },
-      {
-        name: "gh_proxy",
-        type: "string",
-        required: false,
-        labelKey: "admin.repoBackup.fields.github.gh_proxy",
-        validation: { rule: "url" },
-        ui: {
-          fullWidth: true,
-          placeholderKey: "admin.repoBackup.placeholder.github.gh_proxy",
-          descriptionKey: "admin.repoBackup.description.github.gh_proxy",
         },
       },
       {
@@ -230,7 +208,7 @@ RepoProviderFactory.registerProvider(RepoProviderFactory.SUPPORTED_TYPES.GITHUB,
         {
           name: "advanced",
           titleKey: "admin.repoBackup.groups.advanced",
-          fields: ["token", "tokens", "proxies", "gh_proxy", "endpoint_url"],
+          fields: ["tokens", "proxies", "endpoint_url"],
         },
       ],
     },

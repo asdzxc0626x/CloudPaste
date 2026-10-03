@@ -44,6 +44,7 @@
               v-model="pool.tokens"
               :field="tokenField"
               :dark-mode="darkMode"
+              variant="cards"
               :reveal="revealAll"
             />
           </section>
@@ -57,6 +58,7 @@
               v-model="pool.proxies"
               :field="proxyField"
               :dark-mode="darkMode"
+              variant="cards"
               :reveal="revealAll"
             />
           </section>
@@ -117,13 +119,23 @@ const pool = reactive({ tokens: [], proxies: [] });
 
 /**
  * 复用 configSchema 里的文案 key，避免全局/仓库两处各写一套翻译
- * 修改点（第 3 期 3-B 交互重做）：池字段改为单框连续录入，只需要占位符
+ * 修改点（全局凭据恢复原样）：全局弹窗用卡片式（默认 variant），
+ * 每条有「备注 + 启用 + 值 + 删除」，因此这里还要给出备注占位与新增按钮文案，
+ * 且 Token / 代理各有各的措辞。
  */
 const tokenField = {
-  ui: { valuePlaceholderKey: "admin.repoBackup.pool.tokenPlaceholder" },
+  ui: {
+    valuePlaceholderKey: "admin.repoBackup.pool.tokenPlaceholder",
+    entryLabelKey: "admin.repoBackup.pool.tokenEntry",
+    addLabelKey: "admin.repoBackup.pool.addToken",
+  },
 };
 const proxyField = {
-  ui: { valuePlaceholderKey: "admin.repoBackup.pool.proxyPlaceholder" },
+  ui: {
+    valuePlaceholderKey: "admin.repoBackup.pool.proxyPlaceholder",
+    entryLabelKey: "admin.repoBackup.pool.proxyEntry",
+    addLabelKey: "admin.repoBackup.pool.addProxy",
+  },
 };
 
 const normalize = (value) => (Array.isArray(value) ? value : []);

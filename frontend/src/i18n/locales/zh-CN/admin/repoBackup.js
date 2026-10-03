@@ -33,6 +33,9 @@ export default {
       scheduleCron: "cron {cron}",
       scheduleNext: "下次",
       scheduleLastFailed: "上次调度失败",
+      // 修改点（第 4 期 检测状态持久化）：逐引用的检测进度（持久化，重启后仍在）
+      nextDetect: "下次检测",
+      detectedAt: "检测于",
     },
 
     status: {
@@ -60,6 +63,15 @@ export default {
       partialFailed: "（{count} 个分支检查失败）",
       refHasUpdate: "该分支有新版本待备份",
       refUpToDate: "该分支已是最新备份",
+      // 修改点（第 4 期 检测状态持久化）：限流/上游抽风属于「稍后自动重试」，不是失败
+      deferred: "上游限流或暂时不可用，已安排自动重试",
+      partialDeferred: "（{count} 个分支已安排自动重试）",
+      refDeferred: "该分支因上游限流/暂时不可用已安排自动重试",
+      refError: "该分支检测失败",
+      // 持久化的检测进度（跨会话可见，不只本次检查结果）
+      persistedPending: "尚未检测",
+      persistedDeferred: "等待自动重试",
+      persistedError: "检测失败",
     },
 
     actions: {
@@ -157,7 +169,18 @@ export default {
       globalSubtitle: "配置全局的 Token 与加速代理；仓库未单独配置时自动使用这里的配置",
       tokenPlaceholder: "ghp_xxx",
       proxyPlaceholder: "https://ghproxy.example.com",
-      // 修改点（第 3 期 3-B 交互重做）：单框连续录入的提示与各项 title
+      // 修改点（全局凭据恢复原样）：卡片式（一条一张卡片）所需的文案，
+      // 全局凭据弹窗使用这一套
+      tokenEntry: "Token 备注（可选）",
+      proxyEntry: "代理备注（可选）",
+      entryLabel: "备注",
+      add: "添加一条",
+      addToken: "添加 Token",
+      addProxy: "添加代理",
+      remove: "删除",
+      enabled: "启用",
+      empty: "还没有配置任何条目",
+      // 修改点（第 3 期 3-B 交互重做）：仓库表单的标签式录入所需文案
       valuePlaceholder: "凭据值",
       inputHint:
         "回车、逗号或换行确认，可一次粘贴多个（空格 / 逗号 / 换行分隔）；点击条目查看明文，点击左侧圆点启用或禁用，点击 × 删除",
@@ -179,11 +202,11 @@ export default {
 
     fields: {
       github: {
-        token: "GitHub Token（可选）",
-        // 修改点（第 3 期 3-B）
-        tokens: "仓库专属 Token 池（可选）",
-        proxies: "仓库专属加速代理池（可选）",
-        gh_proxy: "加速代理（可选）",
+        // 修改点（Token / 代理统一为多值字段）：原来的「GitHub Token」与「加速代理」
+        // 各自只有一个输入框，现在它们本身就是多值字段（可填多个），
+        // 因此不再存在「单值 + 池」两个重复的字段
+        tokens: "GitHub Token（可选，可填多个）",
+        proxies: "加速代理（可选，可填多个）",
         endpoint_url: "API 地址（可选）",
       },
     },
@@ -199,8 +222,8 @@ export default {
     description: {
       github: {
         token: "公开仓库无需填写。填写后可提高 GitHub API 速率上限，避免频繁检查时被限流",
-        tokens: "留空则自动使用全局凭据池；全局也没有时按匿名额度调度。配置多个 Token 时，调度器会按额度与限流状态动态挑选，某个被限流不会影响其他",
-        proxies: "与 Token 池相互独立，调度时动态组合、不固定绑定。某个节点失败会被暂时避开；全部不可用时自动直连",
+        tokens: "公开仓库无需填写；填写后可提高 GitHub API 速率上限，避免频繁检查时被限流。留空则自动使用全局凭据池，全局也没有时按匿名额度调度。配置多个 Token 时，调度器会按额度与限流状态动态挑选，某个被限流不会影响其他",
+        proxies: "作为前缀拼接到源码归档下载地址前，用于加速下载。可配置多个，调度时动态组合、不固定绑定；某个节点失败会被暂时避开，全部不可用时自动直连",
         gh_proxy: "作为前缀拼接到下载地址前，用于加速源码归档下载",
         endpoint_url: "GitHub Enterprise 或自建 API 地址，默认 https://api.github.com",
       },

@@ -820,12 +820,15 @@ onBeforeUnmount(() => document.removeEventListener("keydown", onEscClose));
                   <span v-if="field.required" class="text-red-500">*</span>
                 </label>
 
-                <!-- secretPool 类型（修改点：第 3 期 3-B）：可增删的多条 Token / 代理 -->
+                <!-- secretPool 类型（修改点：第 3 期 3-B）：可增删的多条 Token / 代理
+                     修改点：仓库表单固定用标签式（单框连续录入，与「多分支」一致），
+                     全局凭据弹窗用默认的卡片式，两者不再是同一种版式 -->
                 <CredentialPoolField
                   v-if="field.type === 'secretPool'"
                   :model-value="getPoolValue(field.name)"
                   :field="field"
                   :dark-mode="darkMode"
+                  variant="tags"
                   :reveal="() => revealRepoPool(field.name)"
                   @update:model-value="setConfigValue(field.name, $event)"
                 />
