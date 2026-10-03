@@ -24,8 +24,11 @@
         </button>
       </div>
 
-      <!-- 正文 -->
-      <div class="flex-1 overflow-y-auto px-4 py-3 space-y-4">
+      <!-- 正文：修改点（限制弹窗高度）——补上 min-h-0。
+           卡片本身已有 max-h-[88vh]，但 flex 子项默认 min-height:auto，
+           不加 min-h-0 时它的最小高度被内容撑住，凭据一多就把卡片顶出 max-h、
+           底部「保存」被推出视口。与 RepoBackupForm / RepoBackupHistory 的正文写法保持一致。 -->
+      <div class="flex-1 min-h-0 overflow-y-auto px-4 py-3 space-y-4">
         <div v-if="loadError" class="px-3 py-2 rounded text-sm break-words bg-red-50 text-red-700 dark:bg-red-900/30 dark:text-red-300">
           {{ loadError }}
         </div>
@@ -34,33 +37,72 @@
           {{ $t("admin.repoBackup.pool.loading") }}
         </div>
 
+        <!-- 修改点（全局凭据分组可折叠）：Token / 代理各自成组，默认折叠。
+             单组最多 20 条（后端 MAX_POOL_ENTRIES），一屏铺开几十张卡片既难定位，
+             也会把「保存」按钮顶到很下面，所以折叠态只留一行标题 + 条数角标。
+             正文用 v-show 而非 v-if：子组件内部按条目 id 记着「哪些条目已展开明文」，
+             卸载再挂载会把这些状态清空，用户刚输入的 Token 会在收起/展开后变回掩码。 -->
         <template v-else>
           <section :class="cardClass">
-            <div>
-              <div :class="sectionTitleClass">{{ $t("admin.repoBackup.fields.github.tokens") }}</div>
-              <p :class="hintClass">{{ $t("admin.repoBackup.description.github.tokens") }}</p>
+            <button
+              type="button"
+              class="w-full flex items-start gap-2 text-left"
+              :title="$t(collapsed.tokens ? 'admin.repoBackup.pool.expandSection' : 'admin.repoBackup.pool.collapseSection')"
+              :aria-expanded="!collapsed.tokens"
+              @click="toggleSection('tokens')"
+            >
+              <IconChevronRight
+                class="mt-0.5 h-4 w-4 shrink-0 transition-transform duration-200"
+                :class="collapsed.tokens ? '' : 'rotate-90'"
+                aria-hidden="true"
+              />
+              <span class="min-w-0 flex-1">
+                <span :class="sectionTitleClass">{{ $t("admin.repoBackup.fields.github.tokens") }}</span>
+                <span :class="countBadgeClass">{{ $t("admin.repoBackup.pool.entryCount", { count: pool.tokens.length }) }}</span>
+              </span>
+            </button>
+
+            <div v-show="!collapsed.tokens" class="space-y-2.5">
+              <p :class="bodyHintClass">{{ $t("admin.repoBackup.description.github.tokens") }}</p>
+              <CredentialPoolField
+                v-model="pool.tokens"
+                :field="tokenField"
+                :dark-mode="darkMode"
+                variant="cards"
+                :reveal="revealAll"
+              />
             </div>
-            <CredentialPoolField
-              v-model="pool.tokens"
-              :field="tokenField"
-              :dark-mode="darkMode"
-              variant="cards"
-              :reveal="revealAll"
-            />
           </section>
 
           <section :class="cardClass">
-            <div>
-              <div :class="sectionTitleClass">{{ $t("admin.repoBackup.fields.github.proxies") }}</div>
-              <p :class="hintClass">{{ $t("admin.repoBackup.description.github.proxies") }}</p>
+            <button
+              type="button"
+              class="w-full flex items-start gap-2 text-left"
+              :title="$t(collapsed.proxies ? 'admin.repoBackup.pool.expandSection' : 'admin.repoBackup.pool.collapseSection')"
+              :aria-expanded="!collapsed.proxies"
+              @click="toggleSection('proxies')"
+            >
+              <IconChevronRight
+                class="mt-0.5 h-4 w-4 shrink-0 transition-transform duration-200"
+                :class="collapsed.proxies ? '' : 'rotate-90'"
+                aria-hidden="true"
+              />
+              <span class="min-w-0 flex-1">
+                <span :class="sectionTitleClass">{{ $t("admin.repoBackup.fields.github.proxies") }}</span>
+                <span :class="countBadgeClass">{{ $t("admin.repoBackup.pool.entryCount", { count: pool.proxies.length }) }}</span>
+              </span>
+            </button>
+
+            <div v-show="!collapsed.proxies" class="space-y-2.5">
+              <p :class="bodyHintClass">{{ $t("admin.repoBackup.description.github.proxies") }}</p>
+              <CredentialPoolField
+                v-model="pool.proxies"
+                :field="proxyField"
+                :dark-mode="darkMode"
+                variant="cards"
+                :reveal="revealAll"
+              />
             </div>
-            <CredentialPoolField
-              v-model="pool.proxies"
-              :field="proxyField"
-              :dark-mode="darkMode"
-              variant="cards"
-              :reveal="revealAll"
-            />
           </section>
 
           <p :class="hintClass">{{ $t("admin.repoBackup.pool.priorityHint") }}</p>
@@ -99,7 +141,7 @@
  */
 import { computed, onMounted, reactive, ref } from "vue";
 import { useI18n } from "vue-i18n";
-import { IconClose } from "@/components/icons";
+import { IconChevronRight, IconClose } from "@/components/icons";
 import CredentialPoolField from "./CredentialPoolField.vue";
 import { getGlobalCredentials, saveGlobalCredentials } from "@/api/services/repoBackupService";
 
@@ -116,6 +158,28 @@ const saving = ref(false);
 const loadError = ref("");
 
 const pool = reactive({ tokens: [], proxies: [] });
+
+/**
+ * 修改点（全局凭据分组可折叠）：Token / 代理两个分组的折叠状态
+ *
+ * 默认折叠 —— 凭据列表可能很长，弹窗一打开就铺满卡片会盖住「保存」按钮。
+ * 首次加载完成后会按「该分组是否已有条目」再定一次：空分组没什么可折叠的，
+ * 直接展开省掉一次多余点击；但用户手动点过之后就不再自动改动（collapsedTouched），
+ * 免得用户刚展开又被数据刷新折叠回去。
+ */
+const collapsed = reactive({ tokens: true, proxies: true });
+const collapsedTouched = reactive({ tokens: false, proxies: false });
+
+function toggleSection(key) {
+  collapsed[key] = !collapsed[key];
+  collapsedTouched[key] = true;
+}
+
+/** 只在用户没有手动切换过时生效，避免与用户操作打架 */
+function initCollapsed(key, list) {
+  if (collapsedTouched[key]) return;
+  collapsed[key] = normalize(list).length > 0;
+}
 
 /**
  * 复用 configSchema 里的文案 key，避免全局/仓库两处各写一套翻译
@@ -147,6 +211,10 @@ async function load() {
     const resp = await getGlobalCredentials();
     pool.tokens = normalize(resp?.data?.tokens);
     pool.proxies = normalize(resp?.data?.proxies);
+    // 修改点（全局凭据分组可折叠）：拿到数据后再定初始折叠状态——
+    // 已有条目的分组折叠，空分组展开（空分组没有可折叠的内容，展开省一次点击）
+    initCollapsed("tokens", pool.tokens);
+    initCollapsed("proxies", pool.proxies);
   } catch (e) {
     loadError.value = e?.message || t("admin.repoBackup.pool.loadFailed");
   } finally {
@@ -186,4 +254,14 @@ const sectionTitleClass = computed(() =>
   props.darkMode ? "text-xs font-semibold text-gray-300 uppercase tracking-wide" : "text-xs font-semibold text-gray-500 uppercase tracking-wide",
 );
 const hintClass = computed(() => (props.darkMode ? "mt-1 text-[11px] leading-4 text-gray-500" : "mt-1 text-[11px] leading-4 text-gray-400"));
+
+/** 修改点（全局凭据分组可折叠）：说明文字被收进折叠正文区，不再紧跟标题，去掉原本的 mt-1 */
+const bodyHintClass = computed(() => (props.darkMode ? "text-[11px] leading-4 text-gray-500" : "text-[11px] leading-4 text-gray-400"));
+
+/** 修改点（全局凭据分组可折叠）：折叠态标题右侧的条数角标，收起后也能看出分组里有多少条 */
+const countBadgeClass = computed(() =>
+  props.darkMode
+    ? "ml-1.5 inline-block align-middle text-[11px] px-1.5 py-0.5 rounded-full bg-gray-700 text-gray-300"
+    : "ml-1.5 inline-block align-middle text-[11px] px-1.5 py-0.5 rounded-full bg-gray-200 text-gray-600",
+);
 </script>

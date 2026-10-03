@@ -84,7 +84,7 @@ export function isMaskedPlaceholder(text) {
 
 /**
  * 归一化一个条目数组
- * - 丢弃非对象项、补 id、去重 id、统一字段类型、截断到上限
+ * - 丢弃非对象项、补 id、去重 id、**按值去重**、统一字段类型、截断到上限
  * @param {any} raw
  * @param {'tokens'|'proxies'} kind
  */
@@ -94,12 +94,35 @@ function normalizeEntries(raw, kind) {
   const result = [];
   const seenIds = new Set();
 
+  /**
+   * 修改点（凭据去重）：同一个池里不允许出现重复的**值**
+   *
+   * 重复的 Token / 代理在调度器里会各占一个候选位（listCredentialCandidates 按条目展开），
+   * 被限流时还会被共享账本按「值 + 角色」记成两份互不相干的冷却状态，
+   * 结果是「同一个 Token 被连着撞两次」。因此写入时按值去重，保留最先出现的一条。
+   *
+   * 两条边界：
+   * - **掩码串不参与去重**。掩码是「保留末 4 位」的投影，两个不同的 Token 完全可能
+   *   长得一模一样（****abcd）；拿它当身份会误删真实条目。掩码只会出现在
+   *   「前端回传且未做修改、又没在现有池里按 id 命中」的条目上。
+   * - **备注（label）不去重**。不同值的两条凭据完全可能共用同一个备注，
+   *   按备注丢弃会直接删掉用户真实配置的凭据，属于数据损坏，这里不做。
+   *   备注的唯一性由前端表单提示，不在这里静默处理。
+   */
+  const seenValues = new Set();
+
   for (const item of raw) {
     if (result.length >= MAX_POOL_ENTRIES) break;
     if (!item || typeof item !== "object") continue;
 
     const value = item.value === null || item.value === undefined ? "" : String(item.value).trim();
     const label = item.label === null || item.label === undefined ? "" : String(item.label).trim();
+
+    // 空值代表「还没填」，多条空值不应互相判重
+    if (value && !isMaskedPlaceholder(value)) {
+      if (seenValues.has(value)) continue;
+      seenValues.add(value);
+    }
 
     let id = item.id === null || item.id === undefined ? "" : String(item.id).trim();
     // id 缺失或重复都重新生成：id 只用于前端定位，重生成不影响任何已有状态

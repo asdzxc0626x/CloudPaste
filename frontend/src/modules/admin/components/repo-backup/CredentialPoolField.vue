@@ -11,6 +11,7 @@
           :class="[inputClass, 'flex-1 min-w-0']"
           :placeholder="labelPlaceholder"
           @input="updateEntry(index, { label: $event.target.value })"
+          @blur="revertIfDuplicate(index, 'label', $event)"
         />
         <label class="inline-flex items-center gap-1 shrink-0 cursor-pointer" :title="$t('admin.repoBackup.pool.enabled')">
           <input
@@ -41,6 +42,7 @@
           autocomplete="off"
           spellcheck="false"
           @input="updateEntry(index, { value: $event.target.value })"
+          @blur="revertIfDuplicate(index, 'value', $event)"
         />
         <button
           type="button"
@@ -51,6 +53,10 @@
           {{ isRevealed(entry) ? $t("admin.repoBackup.form.hide") : $t("admin.repoBackup.form.show") }}
         </button>
       </div>
+
+      <!-- 修改点（凭据去重）：提示就贴出错的那张卡片 —— 条目多时，
+           列表底部的统一提示离正在编辑的那条太远，用户看不到 -->
+      <p v-if="duplicateIndex === index && duplicateMessage" :class="[errorTextClass, 'mt-1.5']">{{ duplicateMessage }}</p>
     </div>
 
     <p v-if="entries.length === 0" :class="hintClass">{{ $t("admin.repoBackup.pool.empty") }}</p>
@@ -122,6 +128,7 @@
       />
     </div>
 
+    <p v-if="duplicateMessage" :class="errorTextClass">{{ duplicateMessage }}</p>
     <p :class="hintClass">{{ hintText }}</p>
   </div>
 </template>
@@ -234,9 +241,97 @@ function patchById(id, patch) {
   emitEntries(entries.value.map((entry) => (entry.id === id ? { ...entry, ...patch } : entry)));
 }
 
+// ==================== 修改点（凭据去重）====================
+/**
+ * 同一个池里「备注 / 值」都不允许重复 —— 重复填写本身没有意义：
+ * 同一个 Token 或代理填两遍，在调度器里会各占一个候选位，
+ * 被限流时还会被共享账本记成两份互不相干的冷却状态，表现为「同一个 Token 连着撞两次」。
+ *
+ * 处理方式是**直接拒绝这次输入**并提示重填，而不是静默丢弃或事后标红：
+ * 静默丢弃会让用户以为填进去了，事后标红则允许中间态落库。被拒绝的编辑不会写进
+ * modelValue，输入框在失焦时回退到上一次的值，用户必须换一个不重复的内容才能提交。
+ */
+const duplicateField = ref("");
+/** 出错条目在数组里的下标；-1 表示「不属于某一条」（标签式的新增被判重） */
+const duplicateIndex = ref(-1);
+const duplicateMessage = computed(() => {
+  if (duplicateField.value === "value") return t("admin.repoBackup.pool.duplicateValue");
+  if (duplicateField.value === "label") return t("admin.repoBackup.pool.duplicateLabel");
+  return "";
+});
+
+/** 记下重复冲突（字段 + 具体哪一条），卡片式据此把提示渲染到出错的那张卡片下面 */
+function markDuplicate(field, index = -1) {
+  duplicateField.value = field;
+  duplicateIndex.value = index;
+}
+
+function clearDuplicate() {
+  duplicateField.value = "";
+  duplicateIndex.value = -1;
+}
+
+/** 比较用归一化：只去首尾空白；Token 与 URL 都区分大小写，不能擅自放宽 */
+function normalizeForCompare(raw) {
+  return String(raw ?? "").trim();
+}
+
+/**
+ * 是否与同组内其他条目的值重复
+ * - 空值不参与：卡片式允许先加一条空行再慢慢填，多条空行之间不应互相判重
+ * - 掩码值原样比较，但不会产生误判：用户当前输入的一定是明文，不会以 * 开头
+ * @param {{ value: string }} candidate 待校验的条目
+ * @param {number} selfIndex 该条目在数组里的下标（新增时传 -1）
+ */
+function isDuplicateValue(candidate, selfIndex) {
+  const target = normalizeForCompare(candidate?.value);
+  if (!target) return false;
+  return entries.value.some((entry, i) => i !== selfIndex && normalizeForCompare(entry?.value) === target);
+}
+
+/** 是否与同组内其他条目的备注重复；备注可以留空，空备注不参与判重 */
+function isDuplicateLabel(candidate, selfIndex) {
+  const target = normalizeForCompare(candidate?.label);
+  if (!target) return false;
+  return entries.value.some((entry, i) => i !== selfIndex && normalizeForCompare(entry?.label) === target);
+}
+
+/**
+ * 失焦时把仍然重复的输入框回退到已提交的值
+ *
+ * 输入框绑的是 `:value` 而不是 v-model：编辑被拒绝时不会 emit，Vue 也就不会重绘，
+ * 输入框里会留着用户刚敲的重复内容。这里把它手动退回旧值，
+ * 避免「界面上显示的」和「实际会保存的」不一致。
+ */
+function revertIfDuplicate(index, field, event) {
+  if (duplicateField.value !== field || duplicateIndex.value !== index) return;
+  clearDuplicate();
+  const entry = entries.value[index];
+  if (!entry) return;
+  event.target.value = String(entry[field] ?? "");
+}
+
 /** 按数组下标改一条（卡片式输入框绑定用，与 patchById 等价但更直接） */
 function updateEntry(index, patch) {
-  emitEntries(entries.value.map((entry, i) => (i === index ? { ...entry, ...patch } : entry)));
+  const current = entries.value[index];
+  if (!current) return;
+  const nextEntry = { ...current, ...patch };
+
+  // 只校验本次真正被改动的字段，免得「改备注」被自己那条重复的值挡住
+  if (Object.prototype.hasOwnProperty.call(patch, "value") && isDuplicateValue(nextEntry, index)) {
+    markDuplicate("value", index);
+    return;
+  }
+  if (Object.prototype.hasOwnProperty.call(patch, "label") && isDuplicateLabel(nextEntry, index)) {
+    markDuplicate("label", index);
+    return;
+  }
+
+  // 本次改动被接受：清掉该字段上的旧提示（其他字段的提示保持不动）
+  if (duplicateField.value && Object.prototype.hasOwnProperty.call(patch, duplicateField.value)) {
+    clearDuplicate();
+  }
+  emitEntries(entries.value.map((entry, i) => (i === index ? nextEntry : entry)));
 }
 
 function toggleEnabled(index) {
@@ -251,6 +346,8 @@ function removeEntry(index) {
     delete localPlain[target.id];
     delete revealing[target.id];
   }
+  // 删掉重复的那条，冲突自然消失，提示一并收起
+  clearDuplicate();
   emitEntries(entries.value.filter((_, i) => i !== index));
 }
 
@@ -307,8 +404,13 @@ async function toggleReveal(entry) {
 function addEntry(raw) {
   const text = String(raw ?? "").trim();
   if (!text || atLimit.value) return;
-  // 已有的掩码条目无法比较明文，这里只拦完全相同的值（含重复粘贴）
-  if (entries.value.some((entry) => String(entry.value || "") === text)) return;
+  // 修改点（凭据去重）：与同组内已有条目重复时不再静默忽略，而是提示用户换一个值。
+  // 这里只「置位」不「清除」——清除交给 commitDraft，好让整批粘贴里
+  // 只要有一个重复，提示就不会被同批后面的成功条目抹掉。
+  if (isDuplicateValue({ value: text }, -1)) {
+    markDuplicate("value");
+    return;
+  }
 
   const entry = { id: makeTempId(), label: "", value: text, enabled: true };
   localPlain[entry.id] = true;
@@ -320,6 +422,8 @@ function addEntry(raw) {
 /** 卡片式：新增一条空行，由用户自己填备注与值 */
 function addEmptyEntry() {
   if (atLimit.value) return;
+  // 空行不参与判重，冲突提示随之清掉
+  clearDuplicate();
   const entry = { id: makeTempId(), label: "", value: "", enabled: true };
   // 空行必然是明文（用户马上要输入），先把显示状态打开，免得输入内容被密码框遮住
   localPlain[entry.id] = true;
@@ -332,6 +436,8 @@ function commitDraft() {
   const raw = draft.value;
   if (!raw) return;
   draft.value = "";
+  // 修改点（凭据去重）：一次粘贴多个时先清掉上一次的提示
+  clearDuplicate();
   // 与分支录入一致：空格、逗号（中英文）、换行都视为分隔符
   raw
     .split(/[,，\s]+/)
@@ -395,4 +501,7 @@ const dotOnClass = "bg-green-500 hover:bg-green-400";
 const dotOffClass = computed(() => (props.darkMode ? "bg-gray-500 hover:bg-gray-400" : "bg-gray-400 hover:bg-gray-500"));
 
 const hintClass = computed(() => (props.darkMode ? "text-[11px] leading-4 text-gray-500" : "text-[11px] leading-4 text-gray-400"));
+
+/** 修改点（凭据去重）：重复提示的样式，与普通说明文字区分开 */
+const errorTextClass = computed(() => (props.darkMode ? "text-[11px] leading-4 text-red-400" : "text-[11px] leading-4 text-red-500"));
 </script>

@@ -49,6 +49,31 @@ export default {
       partial: "部分成功",
       failed: "失败",
       skipped: "已跳过",
+      // 修改点（状态显示不一致修复）：限流/上游暂时不可用是「已安排重试」，
+      // 与「无需备份（已跳过）」和「失败」都不相同，必须有自己的状态
+      deferred: "已延迟重试",
+    },
+
+    /**
+     * 统一结果词汇（修改点：状态显示不一致修复）
+     *
+     * 后端 repobackup/status.js 的 outcome 值 → 文案。仓库管理列表、备份历史、
+     * 任务详情三处都读这一套，保证同一件事在哪儿都叫同一个名字。
+     */
+    outcome: {
+      pending: "尚未备份",
+      running: "进行中",
+      success: "成功完成",
+      partial: "部分成功",
+      up_to_date: "已是最新",
+      update_available: "有新版本待备份",
+      deferred: "已延迟重试",
+      blocked: "已被阻止",
+      failed: "失败",
+    },
+    state: {
+      retryAt: "重试时间 {time}",
+      activeJobs: "有 {count} 个任务正在执行",
     },
 
     trackMode: {
@@ -58,7 +83,9 @@ export default {
 
     check: {
       hasUpdate: "检测到新版本，可以备份",
-      upToDate: "最新版本已备份",
+      // 修改点（无更新反馈）：明确表达「检查完成且已是最新」，这是一个成功结果，
+      // 不是失败也不是空结果。原文案「最新版本已备份」没说清检测有没有跑完。
+      upToDate: "检查完成，当前已是最新版本",
       allFailed: "全部跟踪分支检查失败",
       partialFailed: "（{count} 个分支检查失败）",
       refHasUpdate: "该分支有新版本待备份",
@@ -174,12 +201,19 @@ export default {
       tokenEntry: "Token 备注（可选）",
       proxyEntry: "代理备注（可选）",
       entryLabel: "备注",
+      // 修改点（凭据去重）：备注与值都不允许重复，重复时提示重填
+      duplicateValue: "这个值已经填过了，请换一个（重复的凭据没有意义）",
+      duplicateLabel: "这个备注已经用过了，请换一个",
       add: "添加一条",
       addToken: "添加 Token",
       addProxy: "添加代理",
       remove: "删除",
       enabled: "启用",
       empty: "还没有配置任何条目",
+      // 修改点（全局凭据分组可折叠）：折叠标题右侧的条数角标 + 折叠按钮的悬停提示
+      entryCount: "{count} 条",
+      expandSection: "展开该分组",
+      collapseSection: "收起该分组",
       // 修改点（第 3 期 3-B 交互重做）：仓库表单的标签式录入所需文案
       valuePlaceholder: "凭据值",
       inputHint:
@@ -250,6 +284,8 @@ export default {
         failed: "失败",
         running: "进行中",
         skipped: "已跳过",
+        // 修改点（状态显示不一致修复）：延迟重试单独一档，不再和「已跳过」混在一起
+        deferred: "延迟重试",
       },
       downloadArchive: "下载快照",
       downloadTarget: "下载 #{index}",

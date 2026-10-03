@@ -49,6 +49,31 @@ export default {
       partial: "Partial",
       failed: "Failed",
       skipped: "Skipped",
+      // 修改点（状态显示不一致修复）：限流/上游暂时不可用是「已安排重试」，
+      // 与「无需备份（已跳过）」和「失败」都不相同，必须有自己的状态
+      deferred: "Retry scheduled",
+    },
+
+    /**
+     * 统一结果词汇（修改点：状态显示不一致修复）
+     *
+     * 后端 repobackup/status.js 的 outcome 值 → 文案。仓库管理列表、备份历史、
+     * 任务详情三处都读这一套，保证同一件事在哪儿都叫同一个名字。
+     */
+    outcome: {
+      pending: "Not backed up yet",
+      running: "Running",
+      success: "Completed",
+      partial: "Partially completed",
+      up_to_date: "Up to date",
+      update_available: "New version ready to back up",
+      deferred: "Retry scheduled",
+      blocked: "Blocked",
+      failed: "Failed",
+    },
+    state: {
+      retryAt: "Retry at {time}",
+      activeJobs: "{count} jobs currently running",
     },
 
     trackMode: {
@@ -58,7 +83,9 @@ export default {
 
     check: {
       hasUpdate: "New version detected, ready to back up",
-      upToDate: "Latest version already backed up",
+      // 修改点（无更新反馈）：明确表达「检查完成且已是最新」，这是一个成功结果，
+      // 不是失败也不是空结果。原文案「最新版本已备份」没说清检测有没有跑完。
+      upToDate: "Check complete — already up to date",
       allFailed: "All tracked branches failed to check",
       partialFailed: "({count} branches failed to check)",
       refHasUpdate: "This branch has an unbacked version",
@@ -175,12 +202,19 @@ export default {
       tokenEntry: "Token label (optional)",
       proxyEntry: "Proxy label (optional)",
       entryLabel: "Label",
+      // 修改点（凭据去重）：备注与值都不允许重复，重复时提示重填
+      duplicateValue: "This value is already in the list — enter a different one (a duplicate credential has no effect)",
+      duplicateLabel: "This label is already in use — pick another",
       add: "Add entry",
       addToken: "Add token",
       addProxy: "Add proxy",
       remove: "Remove",
       enabled: "Enabled",
       empty: "No entries configured yet",
+      // 修改点（全局凭据分组可折叠）：折叠标题右侧的条数角标 + 折叠按钮的悬停提示
+      entryCount: "{count} configured",
+      expandSection: "Expand this section",
+      collapseSection: "Collapse this section",
       // 修改点（第 3 期 3-B 交互重做）：仓库表单的标签式录入所需文案
       valuePlaceholder: "Credential value",
       inputHint:
@@ -254,6 +288,8 @@ export default {
         failed: "Failed",
         running: "Running",
         skipped: "Skipped",
+        // 修改点（状态显示不一致修复）：延迟重试单独一档，不再和「已跳过」混在一起
+        deferred: "Deferred",
       },
       downloadArchive: "Download snapshot",
       downloadTarget: "Download #{index}",
