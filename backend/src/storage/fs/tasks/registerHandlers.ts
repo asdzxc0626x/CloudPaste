@@ -4,6 +4,8 @@ import { FsIndexRebuildTaskHandler } from './handlers/FsIndexRebuildTaskHandler.
 import { FsIndexApplyDirtyTaskHandler } from './handlers/FsIndexApplyDirtyTaskHandler.js';
 // 修改点（代码仓库备份功能）
 import { RepoBackupTaskHandler } from './handlers/RepoBackupTaskHandler.js';
+// 修改点（第 4 期 检测状态持久化）：版本检测任务
+import { RepoBackupCheckTaskHandler } from './handlers/RepoBackupCheckTaskHandler.js';
 
 /**
  * 注册所有任务处理器
@@ -39,6 +41,11 @@ export function registerTaskHandlers(): void {
 
   // 修改点（代码仓库备份功能）：注册代码仓库备份任务处理器
   taskRegistry.register(new RepoBackupTaskHandler());
+
+  // 修改点（第 4 期 检测状态持久化）：注册版本检测任务处理器。
+  // 必须在 RepoBackupTaskHandler 之后 —— 检测任务会在运行期 createJob("repo_backup")，
+  // 而 createJob 要先从 TaskRegistry 取到 repo_backup 的 handler 做 validate
+  taskRegistry.register(new RepoBackupCheckTaskHandler());
 
   // 未来扩展 (零核心代码修改):
   // taskRegistry.register(new ScheduledSyncTaskHandler());

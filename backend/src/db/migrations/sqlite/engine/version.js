@@ -5,7 +5,8 @@
 
 // 修改点（仓库备份优化）：35 -> 36，多分支 / 多备份目标 / 版本保留数 + code_repository_backup_targets
 // 修改点（仓库备份优化）：36 -> 37，为存量代码仓库回填各自的备份计划（scheduled_jobs 行）
-export const APP_SCHEMA_VERSION = 37;
+// 修改点（第 4 期 检测状态持久化）：37 -> 38，新增 repo_detect_states 并从既有备份记录回填备份水位
+export const APP_SCHEMA_VERSION = 38;
 
 // 兼容命名：历史代码中使用 DB_SCHEMA_VERSION
 export const DB_SCHEMA_VERSION = APP_SCHEMA_VERSION;

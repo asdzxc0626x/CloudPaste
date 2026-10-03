@@ -151,6 +151,9 @@ export class CodeRepositoryRepository extends BaseRepository {
       await this.deleteBackupTargetsByBackup(backupId);
     }
     await this.deleteWhere(DbTables.CODE_REPOSITORY_BACKUPS, { repository_id: id });
+    // 修改点（第 4 期 检测状态持久化）：检测状态同样是仓库的从属数据，一并清理，
+    // 否则仓库删除重建后会沿用旧水位，导致「有新版本却不备份」
+    await this.deleteDetectStatesByRepository(id);
     await super.delete(DbTables.CODE_REPOSITORIES, id);
   }
 
@@ -510,5 +513,259 @@ export class CodeRepositoryRepository extends BaseRepository {
       map.get(key).push(row);
     }
     return map;
+  }
+
+  // ==================== repo_detect_states（修改点：第 4 期 检测状态持久化）====================
+
+  /**
+   * 取某仓库的全部检测状态
+   * @param {string} repositoryId
+   * @returns {Promise<Object[]>}
+   */
+  async findDetectStates(repositoryId) {
+    if (!repositoryId) return [];
+    const sql = `
+      SELECT * FROM ${DbTables.REPO_DETECT_STATES}
+      WHERE repository_id = ?
+      ORDER BY ref_type ASC, ref ASC
+    `;
+    const result = await this.query(sql, [repositoryId]);
+    return result.results || [];
+  }
+
+  /**
+   * 批量取多个仓库的检测状态（列表接口用，避免 N+1）
+   * @param {string[]} repositoryIds
+   * @returns {Promise<Map<string, Object[]>>} key = repository_id
+   */
+  async findDetectStatesByRepositories(repositoryIds) {
+    const map = new Map();
+    const ids = (repositoryIds || []).filter(Boolean);
+    if (ids.length === 0) return map;
+
+    const placeholders = ids.map(() => "?").join(", ");
+    const sql = `
+      SELECT * FROM ${DbTables.REPO_DETECT_STATES}
+      WHERE repository_id IN (${placeholders})
+      ORDER BY ref_type ASC, ref ASC
+    `;
+    const result = await this.query(sql, ids);
+    for (const row of result.results || []) {
+      const key = String(row.repository_id);
+      if (!map.has(key)) map.set(key, []);
+      map.get(key).push(row);
+    }
+    return map;
+  }
+
+  /**
+   * 取某仓库「已到期、需要检测」的引用
+   *
+   * next_detect_after IS NULL 视为到期（与 scheduled_jobs.next_run_after 同一约定：
+   * 新建行与迁移回填行都留 NULL，表示「还没排过期，立刻可检测」）。
+   *
+   * 按 next_detect_after 升序取，等得最久的先检测；配合 limit 就是
+   * 「一轮只处理前 N 个引用」的削峰闸门（剩下的下一轮自然排在前面）。
+   *
+   * @param {string} repositoryId
+   * @param {string} nowIso
+   * @param {number} limit 本轮最多返回多少个引用
+   * @returns {Promise<Object[]>}
+   */
+  async findDueDetectStates(repositoryId, nowIso, limit = 20) {
+    if (!repositoryId) return [];
+    const max = Math.max(1, Math.trunc(Number(limit) || 1));
+    const sql = `
+      SELECT * FROM ${DbTables.REPO_DETECT_STATES}
+      WHERE repository_id = ?
+        AND (next_detect_after IS NULL OR next_detect_after <= ?)
+      ORDER BY (next_detect_after IS NULL) DESC, next_detect_after ASC
+      LIMIT ?
+    `;
+    const result = await this.query(sql, [repositoryId, nowIso, max]);
+    return result.results || [];
+  }
+
+  /**
+   * 统计某仓库还有多少个引用到期未检测（用于判断「本轮没处理完，要不要早点再来」）
+   * @param {string} repositoryId
+   * @param {string} nowIso
+   * @returns {Promise<number>}
+   */
+  async countDueDetectStates(repositoryId, nowIso) {
+    if (!repositoryId) return 0;
+    const sql = `
+      SELECT COUNT(*) AS count FROM ${DbTables.REPO_DETECT_STATES}
+      WHERE repository_id = ?
+        AND (next_detect_after IS NULL OR next_detect_after <= ?)
+    `;
+    const row = await this.queryFirst(sql, [repositoryId, nowIso]);
+    return Number(row?.count) || 0;
+  }
+
+  /**
+   * 为一组引用补建检测状态行（幂等）
+   *
+   * 用 INSERT ... ON CONFLICT DO NOTHING：已存在的行**一个字段都不碰**，
+   * 这样「用户在仓库表单里增删分支」不会把已有分支的水位与进度冲掉。
+   *
+   * @param {string} repositoryId
+   * @param {Array<{refType: string, ref: string}>} refs
+   * @returns {Promise<number>} 实际新建了几行
+   */
+  async ensureDetectStates(repositoryId, refs) {
+    if (!repositoryId || !Array.isArray(refs) || refs.length === 0) return 0;
+
+    const now = new Date().toISOString();
+    let created = 0;
+
+    for (const item of refs) {
+      const refType = String(item?.refType || "branch");
+      const ref = item?.ref === null || item?.ref === undefined ? "" : String(item.ref);
+      const sql = `
+        INSERT INTO ${DbTables.REPO_DETECT_STATES}
+          (id, repository_id, ref_type, ref, detect_status, next_detect_after, created_at, updated_at)
+        VALUES (?, ?, ?, ?, 'pending', NULL, ?, ?)
+        ON CONFLICT(repository_id, ref_type, ref) DO NOTHING
+      `;
+      const result = await this.execute(sql, [crypto.randomUUID(), repositoryId, refType, ref, now, now]);
+      const changes = result?.meta?.changes ?? result?.changes ?? 0;
+      created += Number(changes) || 0;
+    }
+
+    return created;
+  }
+
+  /**
+   * 更新某个引用的检测状态（只更新显式传入的字段）
+   * @param {string} repositoryId
+   * @param {string} refType
+   * @param {string} ref
+   * @param {Object} data
+   * @returns {Promise<boolean>} 是否命中了行
+   */
+  async updateDetectState(repositoryId, refType, ref, data = {}) {
+    if (!repositoryId) return false;
+
+    const sets = [];
+    const binds = [];
+    const put = (column, value) => {
+      sets.push(`${column} = ?`);
+      binds.push(value);
+    };
+
+    if (data.detect_status !== undefined) put("detect_status", data.detect_status);
+    if (data.commit_sha !== undefined) put("commit_sha", data.commit_sha);
+    if (data.version !== undefined) put("version", data.version);
+    if (data.published_at !== undefined) put("published_at", data.published_at);
+    if (data.backed_up_commit_sha !== undefined) put("backed_up_commit_sha", data.backed_up_commit_sha);
+    if (data.backed_up_at !== undefined) put("backed_up_at", data.backed_up_at);
+    if (data.last_detect_at !== undefined) put("last_detect_at", data.last_detect_at);
+    if (data.last_success_detect_at !== undefined) put("last_success_detect_at", data.last_success_detect_at);
+    if (data.next_detect_after !== undefined) put("next_detect_after", data.next_detect_after);
+    if (data.last_error !== undefined) put("last_error", data.last_error);
+    if (data.last_error_kind !== undefined) put("last_error_kind", data.last_error_kind);
+    if (data.consecutive_error_count !== undefined) put("consecutive_error_count", data.consecutive_error_count);
+    if (data.consecutive_unchanged_count !== undefined) {
+      put("consecutive_unchanged_count", data.consecutive_unchanged_count);
+    }
+
+    if (sets.length === 0) return false;
+
+    put("updated_at", new Date().toISOString());
+
+    const sql = `
+      UPDATE ${DbTables.REPO_DETECT_STATES}
+      SET ${sets.join(", ")}
+      WHERE repository_id = ? AND ref_type = ? AND ref = ?
+    `;
+    binds.push(repositoryId, String(refType || "branch"), ref === null || ref === undefined ? "" : String(ref));
+
+    const result = await this.execute(sql, binds);
+    const changes = result?.meta?.changes ?? result?.changes ?? 0;
+    return (Number(changes) || 0) > 0;
+  }
+
+  /**
+   * 统计某仓库当前还有多少个「未结束」的编排作业（修改点：第 4 期）
+   *
+   * 用途：挡住「同一仓库被重复创建并发检测任务」。
+   * 原先的 countRunningBackupsSince 看的是 code_repository_backups 里的 running 记录，
+   * 它只能挡备份 —— 检测任务根本不写那张表，所以检测需要自己的守卫。
+   *
+   * 为什么查 tasks 表而不是新建一张「正在检测」的状态表：
+   * - tasks 表就是编排作业的真相来源，status 由编排器维护（含崩溃后的终态回写），
+   *   再维护一份「正在检测」的标记必然出现漂移（任务被杀 → 标记永远留着 → 该仓库再也不检测）
+   * - (task_type, status) 上已有索引 idx_tasks_type_status，先按它收敛到很小的结果集，
+   *   再用 payload LIKE 过滤仓库，代价可以忽略
+   *
+   * payload 里的 repositoryId 由 crypto.randomUUID() 生成（只含十六进制与短横线），
+   * 不含 % 或 _，因此可以直接拼进 LIKE 而不需要转义。
+   *
+   * @param {string} repositoryId
+   * @param {string[]} taskTypes 例如 ["repo_backup_check"]
+   * @param {number} staleBeforeMs 早于这个时间戳创建的未结束作业视为残留，不计入
+   * @returns {Promise<number>}
+   */
+  async countActiveRepoJobs(repositoryId, taskTypes, staleBeforeMs) {
+    if (!repositoryId) return 0;
+    const types = (taskTypes || []).filter(Boolean);
+    if (types.length === 0) return 0;
+
+    const typePlaceholders = types.map(() => "?").join(", ");
+    const sql = `
+      SELECT COUNT(*) AS count FROM ${DbTables.TASKS}
+      WHERE task_type IN (${typePlaceholders})
+        AND status IN ('pending', 'running')
+        AND created_at >= ?
+        AND payload LIKE ?
+    `;
+    const binds = [...types, Number(staleBeforeMs) || 0, `%"repositoryId":"${repositoryId}"%`];
+    const row = await this.queryFirst(sql, binds);
+    return Number(row?.count) || 0;
+  }
+
+  /**
+   * 删除某仓库的全部检测状态（删除仓库时调用）
+   * @param {string} repositoryId
+   * @returns {Promise<void>}
+   */
+  async deleteDetectStatesByRepository(repositoryId) {
+    if (!repositoryId) return;
+    await this.deleteWhere(DbTables.REPO_DETECT_STATES, { repository_id: repositoryId });
+  }
+
+  /**
+   * 清理「已经不再跟踪」的引用状态
+   *
+   * 用户把某个分支从仓库配置里移除后，它的状态行就是垃圾数据：
+   * 既会出现在「下次检测时间」的展示里，也会被 findDueDetectStates 选中，
+   * 白白消耗检测配额。保存仓库时调一次即可。
+   *
+   * keepRefs 为空时不做任何事（防御：避免配置读取异常导致全量清空）。
+   *
+   * @param {string} repositoryId
+   * @param {Array<{refType: string, ref: string}>} keepRefs 仍在跟踪的引用
+   * @returns {Promise<number>} 删掉了几行
+   */
+  async pruneDetectStates(repositoryId, keepRefs) {
+    if (!repositoryId) return 0;
+    const keep = Array.isArray(keepRefs) ? keepRefs : [];
+    if (keep.length === 0) return 0;
+
+    const conditions = keep.map(() => "(ref_type = ? AND ref = ?)").join(" OR ");
+    const binds = [repositoryId];
+    for (const item of keep) {
+      binds.push(String(item?.refType || "branch"));
+      binds.push(item?.ref === null || item?.ref === undefined ? "" : String(item.ref));
+    }
+
+    const sql = `
+      DELETE FROM ${DbTables.REPO_DETECT_STATES}
+      WHERE repository_id = ? AND NOT (${conditions})
+    `;
+    const result = await this.execute(sql, binds);
+    const changes = result?.meta?.changes ?? result?.changes ?? 0;
+    return Number(changes) || 0;
   }
 }

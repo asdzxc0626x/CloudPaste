@@ -99,12 +99,73 @@ const refCheckMap = (repo) => {
   return map;
 };
 
+/**
+ * 逐分支的持久化检测状态（修改点：第 4 期 检测状态持久化）
+ *
+ * 与 refCheckMap 的区别：refCheckMap 只保存「本次会话点过检查更新」的结果，
+ * 刷新页面就没了；这份来自 repo.detectStates，是落库的检测进度，
+ * 因此重启/换浏览器后仍能看到每个分支检测到哪个 commit、下次什么时候检测。
+ */
+const detectStateMap = (repo) => {
+  const states = Array.isArray(repo.detectStates) ? repo.detectStates : [];
+  const map = {};
+  for (const item of states) {
+    // 与 trackRefs 的 key 对齐：release 模式「最新」在两侧都用 null 表示
+    map[item.ref === null || item.ref === undefined ? "" : String(item.ref)] = item;
+  }
+  return map;
+};
+
+/** 分支 chip 上要展示的状态：优先用本次检查结果，没有则回落到持久化状态 */
+const refStatus = (repo, ref) => {
+  const session = refCheckMap(repo)[ref];
+  if (session) {
+    return {
+      kind: session.error ? (session.detectStatus === "deferred" ? "deferred" : "error") : "ok",
+      hasUpdate: Boolean(session.hasUpdate),
+      message: session.error || (session.hasUpdate ? t("admin.repoBackup.check.refHasUpdate") : t("admin.repoBackup.check.refUpToDate")),
+    };
+  }
+
+  const persisted = detectStateMap(repo)[ref === null || ref === undefined ? "" : String(ref)];
+  if (!persisted) return null;
+
+  if (persisted.detectStatus === "error") {
+    return { kind: "error", hasUpdate: false, message: persisted.lastError || t("admin.repoBackup.check.refError") };
+  }
+  if (persisted.detectStatus === "deferred") {
+    return { kind: "deferred", hasUpdate: false, message: persisted.lastError || t("admin.repoBackup.check.refDeferred") };
+  }
+  if (persisted.detectStatus === "pending") {
+    return { kind: "pending", hasUpdate: false, message: t("admin.repoBackup.check.persistedPending") };
+  }
+  return {
+    kind: "ok",
+    hasUpdate: Boolean(persisted.hasUpdate),
+    message: persisted.hasUpdate
+      ? t("admin.repoBackup.check.refHasUpdate")
+      : t("admin.repoBackup.check.refUpToDate"),
+  };
+};
+
+/** 是否存在任何已落库的检测状态（决定要不要显示「下次检测」） */
+const hasDetectStates = (repo) => Array.isArray(repo.detectStates) && repo.detectStates.length > 0;
+
+/** 所有分支里最早的下次检测时间（列表里只展示一个，避免堆一长串） */
+const nextDetectAt = (repo) => {
+  const states = (repo.detectStates || []).filter((s) => s.nextDetectAfter);
+  if (states.length === 0) return null;
+  return states.map((s) => s.nextDetectAfter).sort()[0];
+};
+
 const checkSummary = (repo) => {
   const result = props.checkResults[repo.id];
   if (!result) return null;
   return {
     hasUpdate: result.hasUpdate,
     failedCount: result.failedCount || 0,
+    // 修改点（第 4 期）：限流/暂时性故障是「已安排重试」，不是失败，必须分开显示
+    deferredCount: result.deferredCount || 0,
     allFailed: Boolean(result.allFailed),
   };
 };
@@ -214,6 +275,10 @@ const scheduleFailed = (repo) => repo.schedule?.enabled === true && repo.schedul
                 <span v-if="checkSummary(repo).failedCount > 0" class="text-amber-600 dark:text-amber-400 ml-1">
                   {{ $t("admin.repoBackup.check.partialFailed", { count: checkSummary(repo).failedCount }) }}
                 </span>
+                <!-- 修改点（第 4 期）：限流/暂时性故障单独提示，避免被读成「检查失败」 -->
+                <span v-if="checkSummary(repo).deferredCount > 0" class="text-amber-600 dark:text-amber-400 ml-1">
+                  {{ $t("admin.repoBackup.check.partialDeferred", { count: checkSummary(repo).deferredCount }) }}
+                </span>
               </div>
             </td>
 
@@ -230,16 +295,27 @@ const scheduleFailed = (repo) => repo.schedule?.enabled === true && repo.schedul
                   :class="chipClass"
                 >
                   {{ ref }}
-                  <template v-if="refCheckMap(repo)[ref]">
+                  <!-- 修改点（第 4 期）：优先用本次检查结果，没有则用落库的检测状态 -->
+                  <template v-if="refStatus(repo, ref)">
                     <span
-                      v-if="refCheckMap(repo)[ref].error"
+                      v-if="refStatus(repo, ref).kind === 'error'"
                       class="text-red-500"
-                      :title="refCheckMap(repo)[ref].error"
+                      :title="refStatus(repo, ref).message"
                     >!</span>
                     <span
+                      v-else-if="refStatus(repo, ref).kind === 'deferred'"
+                      class="text-amber-500"
+                      :title="refStatus(repo, ref).message"
+                    >↻</span>
+                    <span
+                      v-else-if="refStatus(repo, ref).kind === 'pending'"
+                      class="text-gray-400"
+                      :title="refStatus(repo, ref).message"
+                    >·</span>
+                    <span
                       v-else
-                      :class="refCheckMap(repo)[ref].hasUpdate ? 'text-blue-500' : 'text-green-500'"
-                      :title="refCheckMap(repo)[ref].hasUpdate ? $t('admin.repoBackup.check.refHasUpdate') : $t('admin.repoBackup.check.refUpToDate')"
+                      :class="refStatus(repo, ref).hasUpdate ? 'text-blue-500' : 'text-green-500'"
+                      :title="refStatus(repo, ref).message"
                     >•</span>
                   </template>
                 </span>
@@ -247,6 +323,15 @@ const scheduleFailed = (repo) => repo.schedule?.enabled === true && repo.schedul
               </div>
               <div v-if="repo.lastCheckedAt" class="text-[11px] mt-1" :class="darkMode ? 'text-gray-500' : 'text-gray-400'">
                 {{ $t("admin.repoBackup.table.checkedAt") }}: {{ formatTime(repo.lastCheckedAt) }}
+              </div>
+              <!-- 修改点（第 4 期）：下次检测时间取自落库的 repo_detect_states，
+                   它也是「重启后检测进度不丢」这一条对用户可见的体现 -->
+              <div
+                v-if="hasDetectStates(repo) && nextDetectAt(repo)"
+                class="text-[11px] mt-0.5"
+                :class="darkMode ? 'text-gray-500' : 'text-gray-400'"
+              >
+                {{ $t("admin.repoBackup.table.nextDetect") }}: {{ formatTime(nextDetectAt(repo)) }}
               </div>
             </td>
 

@@ -41,6 +41,8 @@ import {
   MAX_TARGET_MOUNTS,
 } from "../repobackup/config.js";
 import { normalizePathPrefix, buildRepoFolderName } from "../repobackup/paths.js";
+// 修改点（第 4 期 检测状态持久化）：手动「检查更新」与定时检测共用同一套检测实现
+import { prepareDetectRound, detectRefs, toDetectStateDto, resolveTrackedRefKeys } from "../repobackup/detect.js";
 // 修改点（第 3 期 3-B 凭据池）：全局池的读写与视图构建
 import {
   loadGlobalPool,
@@ -308,6 +310,9 @@ export async function listRepositories(db, repositoryFactory, encryptionSecret, 
   // 修改点（独立备份计划优化）：一次性取出全部备份计划，避免逐仓库查 scheduled_jobs
   const scheduleMap = await loadAllRepositorySchedules(db);
 
+  // 修改点（第 4 期）：一次性取出全部检测状态，避免逐仓库查 repo_detect_states
+  const detectStateMap = await codeRepo.findDetectStatesByRepositories(rows.map((row) => row.id));
+
   const result = [];
   for (const row of rows) {
     const targetMountIds = resolveTargetMountIds(row);
@@ -334,6 +339,8 @@ export async function listRepositories(db, repositoryFactory, encryptionSecret, 
         backupFolder,
         // 修改点（独立备份计划优化）：未配置计划时为 null，前端显示「未启用」
         schedule: scheduleMap.get(String(row.id)) || null,
+        // 修改点（第 4 期）：逐引用的检测状态（最近检测时间 / 下次检测时间 / 错误 / 是否有更新）
+        detectStates: (detectStateMap.get(String(row.id)) || []).map(toDetectStateDto),
         latestBackup: latestBackup ? toBackupDto(latestBackup, { targets: latestBackupTargets }) : null,
       }),
     );
@@ -374,6 +381,8 @@ export async function getRepository(db, repositoryFactory, encryptionSecret, id,
     missingMountIds: targetMountIds.filter((_, index) => !targetMounts[index]),
     // 修改点（独立备份计划优化）
     schedule: await loadRepositorySchedule(db, row.id),
+    // 修改点（第 4 期）：逐引用的检测状态
+    detectStates: (await codeRepo.findDetectStates(row.id)).map(toDetectStateDto),
     latestBackup: latestBackup ? toBackupDto(latestBackup, { targets: latestBackupTargets }) : null,
   });
 }
@@ -591,7 +600,37 @@ export async function createRepository(db, repositoryFactory, encryptionSecret, 
     existing: null,
   });
 
+  // 修改点（第 4 期）：为新仓库的每个跟踪引用建一行检测状态
+  // （next_detect_after 留 NULL = 立即可检测，首轮由备份计划触发）
+  await syncRepositoryDetectStates(codeRepo, await codeRepo.findRepositoryById(id));
+
   return await getRepository(db, factory, encryptionSecret, id, env);
+}
+
+/**
+ * 同步仓库的检测状态行（修改点：第 4 期）
+ *
+ * 在「保存仓库」时调用，做两件事：
+ *  1. 给新增的跟踪引用补建状态行（幂等，已有的一个字段都不碰 ——
+ *     否则用户加一个分支就会把其他分支的已备份水位和检测进度冲掉）
+ *  2. 删掉已经不再跟踪的引用的状态行（否则它们会继续占用检测配额，
+ *     并出现在「下次检测时间」的展示里）
+ *
+ * 失败只告警不抛：仓库本身已经保存成功了，状态行缺失会在首次检测时
+ * 由 prepareDetectRound 自动补建，不该因此让保存接口报错。
+ *
+ * @param {object} codeRepo CodeRepositoryRepository 实例
+ * @param {object|null} repoRow code_repositories 行
+ */
+async function syncRepositoryDetectStates(codeRepo, repoRow) {
+  if (!repoRow?.id) return;
+  try {
+    const tracked = resolveTrackedRefKeys(repoRow);
+    await codeRepo.ensureDetectStates(repoRow.id, tracked);
+    await codeRepo.pruneDetectStates(repoRow.id, tracked);
+  } catch (error) {
+    console.warn("[repoBackup] 同步检测状态失败（首次检测时会自动补建）:", error?.message || error);
+  }
 }
 
 /**
@@ -693,6 +732,9 @@ export async function updateRepository(db, repositoryFactory, encryptionSecret, 
     existing: existingSchedule,
   });
 
+  // 修改点（第 4 期）：跟踪引用可能被增删，同步检测状态行
+  await syncRepositoryDetectStates(codeRepo, await codeRepo.findRepositoryById(id));
+
   return await getRepository(db, factory, encryptionSecret, id, env);
 }
 
@@ -736,8 +778,17 @@ export async function deleteRepository(db, repositoryFactory, id, env = {}) {
 /**
  * 检查仓库是否有更新（只解析版本，不触发备份）
  *
- * 修改点（多分支优化）：branch 模式下逐个分支解析最新 commit，
- * 每个分支独立判断「是否已备份」，其中一个分支解析失败不影响其他分支。
+ * 修改点（第 4 期 检测状态持久化）：改为复用 repobackup/detect.js 的 detectRefs。
+ *
+ * 为什么必须复用而不是各写一份：
+ *   定时检测（repo_backup_check）与这个手动入口如果各算一套「是否有更新」，
+ *   就会出现「页面显示有新版本，定时任务却认为没有」这种矛盾 —— 第 1～3 期
+ *   原本就有这个隐患（这里查 findBackupByCommit，备份任务也查 findBackupByCommit，
+ *   但两者对 partial 状态的解释不同）。现在两边都只看 repo_detect_states 的水位。
+ *
+ * 与定时检测的唯一区别是 ignoreDue=true：用户按下按钮就是要立刻看结果，
+ * 不该被 next_detect_after 的退避挡住。代价是手动连点会多打几次 GitHub，
+ * 这由第 3 期的 GithubRequestScheduler（并发/间隔/额度账本）兜住。
  *
  * @returns {Promise<{
  *   repositoryId: string,
@@ -768,63 +819,43 @@ export async function checkRepository(db, repositoryFactory, encryptionSecret, i
     encryptionSecret,
   });
 
-  const trackMode = String(row.track_mode || "branch");
-  const trackRefs = resolveTrackRefs(row);
+  // 修改点（第 4 期）：补建/清理状态行并取出全部跟踪引用（ignoreDue=true 不受退避限制）
+  const round = await prepareDetectRound({ codeRepo, repoRow: row, ignoreDue: true });
 
-  const results = [];
-  let firstError = null;
+  // 修改点（第 4 期）：解析与落库走检测核心，这里不再自己判断「是否已备份」
+  const outcome = await detectRefs({ codeRepo, provider, repoRow: row, refs: round.refs });
 
-  for (const ref of trackRefs) {
-    try {
-      const latest = await provider.resolveLatestVersion({
-        repoIdentifier: row.repo_identifier,
-        trackMode,
-        trackRef: ref ?? null,
-        // 修改点（第 1 期请求数量优化）：把本轮要解析的引用总数告诉 provider，
-        // 多分支时它会改用 1 次 /branches 批量请求代替 N 次单分支请求
-        refCount: trackRefs.length,
-      });
+  // 逐引用结果：保持与改造前完全相同的字段形状，前端无需改动
+  const results = outcome.results.map((item) => ({
+    ref: item.ref,
+    refType: item.refType,
+    commitSha: item.commitSha,
+    shortCommitSha: item.shortCommitSha,
+    version: item.version,
+    publishedAt: item.publishedAt,
+    hasUpdate: item.hasUpdate,
+    alreadyBackedUp: item.alreadyBackedUp,
+    error: item.error,
+    // 修改点（第 4 期）：新增两个字段，让前端能区分「失败」和「已安排重检」
+    detectStatus: item.detectStatus,
+    errorKind: item.errorKind ?? null,
+    retryAt: item.retryAt ?? null,
+  }));
 
-      const existingBackup = await codeRepo.findBackupByCommit(row.id, latest.commitSha);
-      const alreadyBackedUp = Boolean(existingBackup && existingBackup.status === "success");
-
-      results.push({
-        ref: latest.ref ?? ref ?? null,
-        refType: latest.refType,
-        commitSha: latest.commitSha,
-        shortCommitSha: String(latest.commitSha || "").slice(0, 7),
-        version: latest.version ?? null,
-        publishedAt: latest.publishedAt ?? null,
-        // 修改点（多分支优化）：每个分支独立判断
-        hasUpdate: !alreadyBackedUp,
-        alreadyBackedUp,
-        error: null,
-      });
-    } catch (error) {
-      const message = error?.message || String(error);
-      if (!firstError) firstError = message;
-      results.push({
-        ref: ref ?? null,
-        refType: trackMode === "branch" ? "branch" : "tag",
-        commitSha: null,
-        shortCommitSha: null,
-        version: null,
-        publishedAt: null,
-        hasUpdate: false,
-        alreadyBackedUp: false,
-        error: message,
-      });
-    }
-  }
-
-  // 全部引用都失败才认为是整体失败（部分失败仍返回逐分支结果，便于前端展示）
-  const allFailed = results.length > 0 && results.every((item) => item.error);
-  const successCount = results.filter((item) => !item.error).length;
+  /**
+   * 「整体失败」的口径（修改点：第 4 期）
+   *
+   * 只有「全部引用都是永久性错误」才算整体失败。限流 / 暂时性故障不算 ——
+   * 它们是 deferred，第 2 期就定好了「这不是失败，是稍后再来」，
+   * 把它算进 allFailed 会让仓库在列表里标红，用户以为仓库配错了。
+   */
+  const allFailed = results.length > 0 && outcome.errorCount === results.length;
+  const successCount = outcome.successCount;
 
   await codeRepo.updateRepository(row.id, {
     last_checked_at: new Date().toISOString(),
     // 只有整体失败才把错误落到仓库上；部分失败不下发为仓库级错误，避免误导
-    last_error: allFailed ? firstError : null,
+    last_error: allFailed ? results.find((item) => item.error)?.error ?? null : null,
   });
 
   const lastSuccess = await codeRepo.findLatestSuccessBackup(row.id);
@@ -837,7 +868,10 @@ export async function checkRepository(db, repositoryFactory, encryptionSecret, i
     allFailed,
     checkedCount: results.length,
     successCount,
-    failedCount: results.length - successCount,
+    failedCount: outcome.errorCount,
+    // 修改点（第 4 期）：被延迟重检的引用数单独暴露，前端可提示「稍后自动重试」
+    deferredCount: outcome.deferredCount,
+    deferredUntil: outcome.deferredUntilMs ? new Date(outcome.deferredUntilMs).toISOString() : null,
     refs: results,
     latest: results.find((item) => !item.error) || null,
     lastKnownCommitSha: row.last_known_commit_sha ?? null,

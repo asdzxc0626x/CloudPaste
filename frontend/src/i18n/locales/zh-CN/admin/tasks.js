@@ -143,6 +143,9 @@ export default {
         manifest: '写入 manifest',
         pruning: '清理旧版本',
         finished: '已完成',
+        // 修改点（第 4 期 检测状态持久化）：版本检测任务的阶段
+        detecting: '检测版本中',
+        dispatching: '创建备份作业',
         unknown: '-',
       },
     },
@@ -216,6 +219,8 @@ export default {
       fs_index_rebuild: '索引重建',
       fs_index_apply_dirty: '索引增量应用',
       repo_backup: '代码仓库备份',
+      // 修改点（第 4 期 检测状态持久化）：版本检测任务
+      repo_backup_check: '代码仓库版本检测',
       unknown: '未知任务',
       unknownWithType: '未知任务（{type}）',
     },

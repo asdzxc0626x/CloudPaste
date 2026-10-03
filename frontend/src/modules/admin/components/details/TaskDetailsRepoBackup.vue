@@ -201,7 +201,11 @@ const isRunning = computed(() => props.task?.status === 'running' || props.task?
 
 /** 传输/清理这类耗时阶段给个转圈，让"还在跑"一眼可见 */
 const stageSpinning = computed(
-  () => isRunning.value && ['resolving', 'transferring', 'manifest', 'pruning'].includes(stage.value)
+  () =>
+    isRunning.value &&
+    // 修改点（第 4 期）：版本检测任务的 detecting / dispatching 也是耗时阶段，
+    // 这个详情组件同时给 repo_backup 与 repo_backup_check 两种任务用
+    ['resolving', 'transferring', 'manifest', 'pruning', 'detecting', 'dispatching'].includes(stage.value)
 )
 
 const stageText = computed(() => {

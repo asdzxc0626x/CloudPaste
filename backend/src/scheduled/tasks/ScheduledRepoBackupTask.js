@@ -14,10 +14,27 @@ import {
  *
  * - 每个代码仓库对应一行 scheduled_jobs（task_id = `repo_backup_<仓库ID>`，
  *   config_json = { repositoryId }），由「仓库管理」页在保存仓库时同步维护
- * - handler 只负责创建 taskType = "repo_backup" 的编排作业，
- *   真正的下载/上传/清理在任务系统里跑（与 ScheduledSyncCopyTask 的分工一致）：
- *   调度 tick 有锁超时，绝不能在这里做长耗时的 IO
- * - 一次作业内部会遍历该仓库的全部跟踪分支，所以这里一个仓库只建一个作业
+ * - handler 只负责创建编排作业，真正的网络 IO 在任务系统里跑
+ *   （与 ScheduledSyncCopyTask 的分工一致）：调度 tick 有锁超时，
+ *   绝不能在这里做长耗时的 IO
+ *
+ * 修改点（第 4 期 检测状态持久化）：创建的作业类型从 repo_backup 换成 repo_backup_check
+ *
+ * 换之前：tick → 直接创建 repo_backup → 备份任务内部解析版本 → 大多数时候发现
+ *         「没更新」然后记一条 skipped。于是每个周期每个仓库都要：
+ *           · 打一次 GitHub 版本 API（哪怕什么都没变）
+ *           · 建一条 tasks 行 + 构造 MountManager/FileSystem
+ *           · 在任务列表里留一条 skipped 噪音
+ *
+ * 换之后：tick → 创建 repo_backup_check → 检测任务解析版本并落库 →
+ *         **只有发现新版本时**才由它创建 repo_backup（并把已解析的
+ *         commitSha/version 一起传过去，备份任务不再问 GitHub）。
+ *
+ * 不变的部分（刻意不动）：
+ * - scheduled_jobs 仍是备份计划的唯一数据源，不新增表、不新增调度框架
+ * - 「上一次还在跑就跳过」的守卫仍在这里，且判据仍是 code_repository_backups
+ *   里的 running 记录 —— 它要挡的是「备份任务堆积」，和检测无关
+ * - 返回 deferMs 让 runDueScheduledJobs 覆盖本次 next_run_after 的机制不变
  */
 export class ScheduledRepoBackupTask {
   constructor() {
@@ -29,7 +46,7 @@ export class ScheduledRepoBackupTask {
 
     /** @type {string} 任务描述 */
     this.description =
-      "按每个代码仓库各自的备份计划创建源码备份作业；备份计划在「文件管理 → 仓库管理」中配置";
+      "按每个代码仓库各自的备份计划创建版本检测作业；只有检测到新版本才会创建备份作业。备份计划在「文件管理 → 仓库管理」中配置";
 
     /** @type {"maintenance" | "business"} 任务类别 */
     this.category = "business";
@@ -97,6 +114,32 @@ export class ScheduledRepoBackupTask {
       };
     }
 
+    /**
+     * 修改点（第 4 期）：检测任务的并发守卫
+     *
+     * 上面那个守卫看的是 code_repository_backups 里的 running 记录，检测任务不写那张表，
+     * 所以挡不住「检测任务还在跑，又创建了一个检测任务」。这种情况是真实存在的：
+     * 检测撞限流后会一直在任务里退避重试，耗时可能超过一个备份周期。
+     * 重复创建会让同一仓库的请求叠在一起，正好是需求 10 要避免的洪峰。
+     *
+     * 残留判定复用 STALE_RUNNING_BACKUP_SEC（6 小时）：任务进程被杀 / Workers 超时
+     * 留下的 pending 行不能永久阻塞该仓库的检测。
+     */
+    const activeCheckCount = await codeRepo.countActiveRepoJobs(
+      repositoryId,
+      ["repo_backup_check"],
+      Date.now() - STALE_RUNNING_BACKUP_SEC * 1000,
+    );
+    if (activeCheckCount > 0) {
+      return {
+        summary: `仓库「${repoLabel}」上一次版本检测仍在进行中（${activeCheckCount} 个作业），本次跳过`,
+        repositoryId,
+        activeCheckCount,
+        skipped: true,
+        deferMs: RUNNING_GUARD_RETRY_DELAY_MS,
+      };
+    }
+
     // 构造 FileSystem（与 ScheduledSyncCopyTask / JobWorkflow 保持一致）
     const mountManager = new MountManager(db, env?.ENCRYPTION_SECRET, repositoryFactory, { env });
     const fileSystem = new FileSystem(mountManager, env);
@@ -104,18 +147,25 @@ export class ScheduledRepoBackupTask {
     // 内部系统身份：定时备份是后台系统级操作，用管理员身份绕过挂载 ACL
     const systemUserId = "system-scheduled-repo-backup";
 
+    /**
+     * 修改点（第 4 期）：创建版本检测作业，而不是直接创建备份作业
+     *
+     * createBackup: true —— 检测到新版本时由检测任务自己创建 repo_backup，
+     *   并把解析出的 commitSha/version 一起传过去（需求 3 + 需求 4）
+     * ignoreDue 不传（即 false）—— 定时路径必须尊重 next_detect_after：
+     *   它既是「检测进度」的持久化载体（需求：重启不丢），
+     *   也是削峰闸门（需求 10）。手动「检查更新」才会用 ignoreDue。
+     */
     const job = await fileSystem.createJob(
-      "repo_backup",
-      // force=false：仍然按 commitSha 去重，没有新版本时任务内部会记 skipped
-      // 修改点（任务列表显示仓库名）：payload 带上 owner/repo，供任务列表直接显示
-      { repositoryId, repoIdentifier: repoRow.repo_identifier, force: false },
+      "repo_backup_check",
+      { repositoryId, repoIdentifier: repoRow.repo_identifier, createBackup: true },
       systemUserId,
       UserType.ADMIN,
       { triggerType: "scheduled", triggerRef: ctx?.scheduledJobId || this.id },
     );
 
     return {
-      summary: `已为仓库「${repoLabel}」创建定时备份作业（repo_backup 作业 ID=${job.jobId}）`,
+      summary: `已为仓库「${repoLabel}」创建版本检测作业（repo_backup_check 作业 ID=${job.jobId}）；只有检测到新版本才会继续创建备份作业`,
       repositoryId,
       repoIdentifier: repoRow.repo_identifier,
       jobId: job.jobId,

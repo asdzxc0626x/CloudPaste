@@ -33,6 +33,8 @@ export const DbTables = {
   CODE_REPOSITORY_BACKUPS: "code_repository_backups", // 代码仓库备份 - 备份记录表
   // 修改点（多备份目标优化）：一次备份写入多个挂载点，每个目标一行结果
   CODE_REPOSITORY_BACKUP_TARGETS: "code_repository_backup_targets", // 代码仓库备份 - 单次备份的各目标落盘结果
+  // 修改点（第 4 期 检测状态持久化）：每仓库/每引用一行检测状态（版本检测与备份水位）
+  REPO_DETECT_STATES: "repo_detect_states", // 代码仓库备份 - 逐引用的版本检测状态
 };
 
 // 默认的最大上传大小（MB）

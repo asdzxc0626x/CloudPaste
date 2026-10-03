@@ -856,7 +856,95 @@ export async function createCodeRepositoryTables(db) {
     )
     .run();
 
+  // 修改点（第 4 期：检测状态持久化）：每仓库 / 每引用一行检测状态
+  await createRepoDetectStatesTable(db);
+
   console.log("code_repositories/code_repository_backups 表检查/创建完成");
+}
+
+/**
+ * 创建检测状态表（修改点：第 4 期 检测状态持久化）
+ *
+ * 为什么需要独立一张表，而不是继续用 code_repositories 上的
+ * last_checked_at / last_known_commit_sha：
+ * - 那两列是「仓库级」的，但检测本来就是「逐引用」的（多分支仓库一次检测
+ *   会得到 N 个不同的 commit）。把 N 个结果塞进 1 列，必然丢失信息，
+ *   也没法表达「main 已备份、develop 有新版本」这种常态。
+ * - 「下次检测时间」必须是逐引用的，否则无法做削峰（见 next_detect_after）。
+ *
+ * 为什么不复用 metrics_cache（第 3 期额度账本那套）：
+ * - metrics_cache 的定位是「可从上游重建的派生数据」，丢了只是少一层保护。
+ *   检测状态里的 backed_up_commit_sha 是**判定是否需要备份的唯一依据**，
+ *   丢了会导致全量重复备份，不是派生数据，必须独立持久化。
+ *
+ * 判定「是否有更新」只看一处：commit_sha != backed_up_commit_sha。
+ * 不再用 code_repository_backups 做判据（那张表按 commit 去重，
+ * 回答不了「这个分支当前水位在哪」），避免两套判定源给出矛盾答案。
+ */
+export async function createRepoDetectStatesTable(db) {
+  await db
+    .prepare(
+      `
+      CREATE TABLE IF NOT EXISTS ${DbTables.REPO_DETECT_STATES} (
+        id TEXT PRIMARY KEY,
+        repository_id TEXT NOT NULL,                   -- 对应 code_repositories.id
+
+        ref_type TEXT NOT NULL,                        -- 'branch' | 'tag'
+        -- 引用名。release 模式跟踪「最新 tag」时没有固定名字，统一用空串占位：
+        -- 唯一索引里 NULL 彼此不相等，用 NULL 会导致同一仓库插出多行
+        ref TEXT NOT NULL DEFAULT '',
+
+        -- ---------- 检测结果 ----------
+        detect_status TEXT NOT NULL DEFAULT 'pending', -- 'pending' | 'ok' | 'deferred' | 'error'
+        commit_sha TEXT,                               -- 最近一次检测解析到的 commit
+        version TEXT,                                  -- 展示用版本串（main@282ea1c7 / v1.9.1）
+        published_at DATETIME,                         -- 该版本的提交/发布时间（批量路径下可能为空）
+
+        -- ---------- 已备份水位（判定「是否有更新」的唯一依据）----------
+        backed_up_commit_sha TEXT,                     -- 该引用最近一次成功备份的 commit
+        backed_up_at DATETIME,
+
+        -- ---------- 时间 ----------
+        last_detect_at DATETIME,                       -- 最近一次检测（含失败）
+        last_success_detect_at DATETIME,               -- 最近一次检测成功
+        -- 下次允许检测的时间。既是「检测进度」的持久化载体（重启不丢），
+        -- 也是削峰的闸门：到期的引用才会进入本轮检测
+        next_detect_after DATETIME,
+
+        -- ---------- 错误与连续状态 ----------
+        last_error TEXT,
+        last_error_kind TEXT,                          -- 'rate_limited' | 'transient' | 'permanent'
+        consecutive_error_count INTEGER NOT NULL DEFAULT 0,
+        -- 连续「检测成功但无更新」的次数。用于退避：长期不动的仓库自动降低检测频率
+        consecutive_unchanged_count INTEGER NOT NULL DEFAULT 0,
+
+        created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+      )
+    `,
+    )
+    .run();
+
+  // 一个仓库的同一引用只有一行状态（upsert 的冲突目标）
+  await db
+    .prepare(
+      `CREATE UNIQUE INDEX IF NOT EXISTS idx_repo_detect_states_unique
+       ON ${DbTables.REPO_DETECT_STATES}(repository_id, ref_type, ref)`,
+    )
+    .run();
+  // 「挑出到期的引用」是最热的查询路径
+  await db
+    .prepare(
+      `CREATE INDEX IF NOT EXISTS idx_repo_detect_states_due
+       ON ${DbTables.REPO_DETECT_STATES}(next_detect_after)`,
+    )
+    .run();
+  await db
+    .prepare(
+      `CREATE INDEX IF NOT EXISTS idx_repo_detect_states_repo
+       ON ${DbTables.REPO_DETECT_STATES}(repository_id)`,
+    )
+    .run();
 }
 
 export async function createIndexes(db) {

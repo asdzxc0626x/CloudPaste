@@ -1,6 +1,6 @@
 // cSpell:words tarball repobackup
 import type { TaskHandler, InternalJob, ExecutionContext } from "../TaskHandler.js";
-import type { TaskStats, ItemResult } from "../types.js";
+import type { TaskStats, ItemResult, RepoBackupResolvedRef } from "../types.js";
 import { ValidationError, NotFoundError } from "../../../../http/errors.js";
 import { ensureRepositoryFactory } from "../../../../utils/repositories.js";
 import { UserType } from "../../../../constants/index.js";
@@ -17,6 +17,9 @@ import { pruneOldVersions, describePruneResult } from "../../../../repobackup/re
 // 限流/暂时性故障不记失败，而是算出「最早可重试时间」交给调度层
 import { planRetryForError, describeRetryAt, describeErrorKind } from "../../../../repobackup/errors.js";
 import { deferRepositoryBackupSchedule } from "../../../../repobackup/schedule.js";
+// 修改点（第 4 期）：备份成功后推进该引用在 repo_detect_states 里的「已备份水位」，
+// 否则下一轮检测仍会认为有更新，同一个版本会被反复备份
+import { advanceBackedUpWatermark } from "../../../../repobackup/detect.js";
 
 /**
  * 代码仓库备份任务（修改点：新增功能）
@@ -67,6 +70,11 @@ type RepoBackupPayload = {
   /** owner/repo，仅用于任务列表显示，执行时仍以 repositoryId 为准 */
   repoIdentifier?: string;
   force?: boolean;
+  /**
+   * 预解析版本（修改点：第 4 期）
+   * 由 repo_backup_check 解析并落库后传入；有值时本任务不再请求 GitHub 版本 API
+   */
+  refs?: RepoBackupResolvedRef[];
 };
 
 /** 单个跟踪引用（分支）的备份结果 */
@@ -279,7 +287,32 @@ export class RepoBackupTaskHandler implements TaskHandler {
 
     // 修改点（多分支优化）：一个作业处理该仓库的全部跟踪引用
     const trackRefs = resolveTrackRefs(repoRow);
-    if (trackRefs.length === 0) {
+
+    /**
+     * 本次要备份的引用计划（修改点：第 4 期 检测与备份分离）
+     *
+     * 两种来源：
+     *  a) payload.refs 非空 —— repo_backup_check 任务已经解析过版本了，
+     *     直接用它给的 commitSha，**本任务不再请求 GitHub 版本 API**。
+     *     这是定时备份与手动备份的正常路径。
+     *  b) payload.refs 缺省 —— 退回「任务内自行解析」。
+     *     保留这条退路只为兼容两类历史调用：
+     *       · 升级前就已存在于 tasks 表里的 pending 作业（payload 里没有 refs）
+     *       · 直接按 repositoryId 调 createJob 的外部脚本
+     *     它不是第二套实现：解析结果同样会写回 repo_detect_states（见下面的
+     *     advanceBackedUpWatermark），不会出现两套互相矛盾的水位。
+     */
+    const preresolvedRefs: RepoBackupResolvedRef[] = Array.isArray(payload.refs)
+      ? payload.refs.filter((item) => item && typeof item.commitSha === "string" && item.commitSha.length > 0)
+      : [];
+    const usePreresolved = preresolvedRefs.length > 0;
+
+    const backupPlan: Array<{ trackRef: string | null; preresolved: RepoBackupResolvedRef | null }> = usePreresolved
+      ? preresolvedRefs.map((item) => ({ trackRef: item.ref ?? null, preresolved: item }))
+      // 显式标注参数类型：resolveTrackRefs 是 JS 模块（无 .d.ts），不标注会退化成隐式 any
+      : trackRefs.map((ref: string | null) => ({ trackRef: ref ?? null, preresolved: null }));
+
+    if (backupPlan.length === 0) {
       throw new ValidationError(`仓库未配置任何跟踪引用: ${repoIdentifier}`);
     }
 
@@ -301,7 +334,9 @@ export class RepoBackupTaskHandler implements TaskHandler {
       mounts.push(mount);
     }
 
-    const totalItems = trackRefs.length;
+    // 修改点（第 4 期）：进度分母跟着实际计划走 —— 预解析路径下只备份「有更新的引用」，
+    // 用 trackRefs.length 当分母会让进度永远到不了 100%
+    const totalItems = backupPlan.length;
     const itemResults: ItemResult[] = [];
     const outcomes: RefOutcome[] = [];
 
@@ -395,7 +430,8 @@ export class RepoBackupTaskHandler implements TaskHandler {
     let firstError: Error | null = null;
 
     // ---------- 3. 逐个引用（分支）备份 ----------
-    for (const trackRef of trackRefs) {
+    for (const planItem of backupPlan) {
+      const trackRef = planItem.trackRef;
       currentRef = trackRef ?? null;
       const itemResult: ItemResult = {
         kind: "repo",
@@ -415,18 +451,37 @@ export class RepoBackupTaskHandler implements TaskHandler {
           throw new Error("cancelled");
         }
 
-        // 3.1 解析该引用的最新版本
+        // 3.1 取该引用的版本
         currentStage = "resolving";
         await report(processed);
 
-        const version = await providerInstance.resolveLatestVersion({
-          repoIdentifier,
-          trackMode,
-          trackRef: trackRef ?? null,
-          // 修改点（第 1 期请求数量优化）：把本轮要解析的引用总数告诉 provider，
-          // 多分支时它会改用 1 次 /branches 批量请求代替 N 次单分支请求
-          refCount: trackRefs.length,
-        });
+        /**
+         * 修改点（第 4 期 需求 4）：有预解析版本时**不发任何 GitHub 请求**。
+         *
+         * 这一步是本期省额度的关键：原来每个备份周期都要为每个仓库打一次
+         * /branches 或 /commits，即使最终判定「无更新」而跳过。现在那次请求
+         * 已经在 repo_backup_check 里付过了，结果也落了库，备份阶段只负责下载。
+         *
+         * 另一个好处是一致性：检测到的 commitSha 与实际下载的归档严格同一个
+         *（openSourceArchive 用 commitSha 拼 codeload 直链），不会因为两次解析
+         * 之间分支又有新提交而拿到对不上的内容。
+         */
+        const version = planItem.preresolved
+          ? {
+              refType: planItem.preresolved.refType,
+              ref: planItem.preresolved.ref,
+              commitSha: planItem.preresolved.commitSha,
+              version: planItem.preresolved.version ?? `${planItem.preresolved.ref ?? ""}@${planItem.preresolved.commitSha.slice(0, 7)}`,
+              publishedAt: planItem.preresolved.publishedAt ?? null,
+            }
+          : await providerInstance.resolveLatestVersion({
+              repoIdentifier,
+              trackMode,
+              trackRef: trackRef ?? null,
+              // 修改点（第 1 期请求数量优化）：把本轮要解析的引用总数告诉 provider，
+              // 多分支时它会改用 1 次 /branches 批量请求代替 N 次单分支请求
+              refCount: backupPlan.length,
+            });
 
         // 修改点（详情完善）：targets 记录每个目标的写入结果，供任务详情逐条展示
         const targetSummaries: Array<{
@@ -474,6 +529,24 @@ export class RepoBackupTaskHandler implements TaskHandler {
             }
 
             if (missingMounts.length === 0) {
+              /**
+               * 修改点（第 4 期）：所有目标都已有该版本的副本 —— 这说明水位落后于事实。
+               * 正常链路不会走到这里（检测阶段就会判定「无更新」而不创建备份任务），
+               * 能走到说明是以下几种情况之一：
+               *   · 迁移回填时这个引用没有成功备份记录可取（例如 ref 名变过）
+               *   · 用户手动强制备份过一次，水位没跟上
+               *   · 并发：两个备份任务备同一个 commit
+               * 不在这里把水位补上，下一轮检测还会判「有更新」，于是永远在这条
+               * 「创建任务 → 发现已存在 → 跳过」的空转上打转。
+               */
+              await advanceBackedUpWatermark(
+                codeRepo,
+                repoRow.id,
+                version.refType,
+                version.ref ?? trackRef ?? null,
+                version.commitSha,
+              );
+
               itemResult.status = "skipped";
               itemResult.message = `已存在该版本的备份（${version.version}），跳过`;
               itemResult.durationMs = Date.now() - refStartedMs;
@@ -832,6 +905,25 @@ export class RepoBackupTaskHandler implements TaskHandler {
           last_known_commit_sha: version.commitSha,
           last_error: backupWarning,
         });
+
+        /**
+         * 修改点（第 4 期）：推进该引用的「已备份水位」
+         *
+         * 只在 allDone（全部目标都有副本）时推进，partial 时**故意不推进**：
+         * 水位一推进，下一轮检测就会判「无更新」而不创建备份任务，
+         * 那个写失败的目标就永远补不上了。保持水位落后，下一轮检测照旧判「有更新」，
+         * 备份任务跑起来后上面 3.2 的去重逻辑会识别出「只缺某几个目标」并只补写它们
+         * —— 这正是既有的自愈路径，第 4 期不改它，只是别把它掐断。
+         */
+        if (allDone) {
+          await advanceBackedUpWatermark(
+            codeRepo,
+            repoRow.id,
+            version.refType,
+            version.ref ?? trackRef ?? null,
+            version.commitSha,
+          );
+        }
 
         // 部分目标成功时：备份记录记为 partial（历史里能看出哪些目标缺副本），
         // 但任务条目仍记为 failed —— 用户要求"写入全部目标"，没写全就不算成功

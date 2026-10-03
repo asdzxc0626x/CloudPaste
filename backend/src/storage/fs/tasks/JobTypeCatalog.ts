@@ -191,5 +191,16 @@ export function buildBuiltinJobTypeDefinitions(): JobTypeDefinition[] {
       createPolicy: { policy: "admin.all", pathCheck: false },
       capabilities: { retry: "none" },
     },
+    // 修改点（第 4 期 检测状态持久化）：版本检测任务。
+    // 与 repo_backup 同类同可见性；retry: "none" —— 检测本来就是幂等的周期行为，
+    // 下一轮到期自然会再来，不需要前端一键重试这条额外入口
+    {
+      taskType: "repo_backup_check",
+      i18nKey: "admin.tasks.taskType.repo_backup_check",
+      category: "repo",
+      visibility: { mode: "admin-only" },
+      createPolicy: { policy: "admin.all", pathCheck: false },
+      capabilities: { retry: "none" },
+    },
   ];
 }

@@ -14,6 +14,8 @@ import {
   createMetricsCacheTables,
   // 修改点（代码仓库备份功能）：v35 迁移用
   createCodeRepositoryTables,
+  // 修改点（第 4 期 检测状态持久化）：v38 迁移用
+  createRepoDetectStatesTable,
 } from "./schema.js";
 import {
   addCustomContentSettings,
@@ -243,6 +245,89 @@ export async function migrateRepoBackupSchedules(db) {
 
   const changes = result?.meta?.changes ?? result?.changes ?? 0;
   console.log(`版本37：为 ${changes} 个存量代码仓库回填了备份计划（默认每 6 小时）`);
+  return { ok: true, created: changes };
+}
+
+/**
+ * 建 repo_detect_states 并从既有备份记录回填「已备份水位」（修改点：第 4 期）
+ *
+ * 为什么必须回填（否则升级后会全量重复备份一遍）：
+ *   第 4 期把「是否需要备份」的判据从 code_repository_backups 换成了
+ *   repo_detect_states.backed_up_commit_sha。新表首轮是空的，如果把
+ *   「没有行」当成「从未备份」，那么所有已经备份过的分支都会被判为有更新，
+ *   升级后第一轮就会把每个仓库重新下载一遍（既浪费额度也浪费存储）。
+ *
+ * 回填口径：
+ *   直接从 code_repository_backups 里取「每个 (仓库, ref_type, ref) 最近一次成功备份」，
+ *   把它的 commit_sha 写成该引用的初始水位。
+ *   —— 不去解析 code_repositories.track_refs_json：SQL 里拆 JSON 数组很脆弱，
+ *   而且「从未成功备份过的分支」本来就该被判为有更新（它确实需要备份），
+ *   不给它建行、让首轮检测自然建行，语义正好是对的。
+ *
+ * next_detect_after 留 NULL = 立即到期，沿用 scheduled_jobs.next_run_after 的同一约定。
+ * 这里不会造成洪峰：每个仓库各有一行 scheduled_jobs（首次执行时间本来就错开），
+ * 单轮内的引用数量还有 check 任务的每轮配额再兜一层。
+ */
+export async function migrateRepoDetectStates(db) {
+  // 1. 建表（幂等，新库由 schema.js 直接建到最终态，这里只服务存量库）
+  await createRepoDetectStatesTable(db);
+
+  // 2. 回填水位
+  const result = await db
+    .prepare(
+      `
+      INSERT INTO ${DbTables.REPO_DETECT_STATES} (
+        id, repository_id, ref_type, ref,
+        detect_status, commit_sha, version, published_at,
+        backed_up_commit_sha, backed_up_at,
+        last_detect_at, last_success_detect_at, next_detect_after,
+        last_error, last_error_kind,
+        consecutive_error_count, consecutive_unchanged_count,
+        created_at, updated_at
+      )
+      SELECT
+        lower(hex(randomblob(16))),
+        b.repository_id,
+        COALESCE(NULLIF(b.ref_type, ''), 'branch'),
+        COALESCE(b.ref, ''),
+        'pending',
+        NULL, NULL, NULL,
+        b.commit_sha,
+        COALESCE(b.finished_at, b.created_at),
+        NULL, NULL, NULL,
+        NULL, NULL,
+        0, 0,
+        CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+      FROM ${DbTables.CODE_REPOSITORY_BACKUPS} b
+      WHERE b.status = 'success'
+        AND b.commit_sha IS NOT NULL
+        AND b.commit_sha != ''
+        -- 每个 (仓库, ref_type, ref) 只取最近那一条成功记录
+        AND b.id = (
+          SELECT b2.id
+          FROM ${DbTables.CODE_REPOSITORY_BACKUPS} b2
+          WHERE b2.repository_id = b.repository_id
+            AND COALESCE(NULLIF(b2.ref_type, ''), 'branch') = COALESCE(NULLIF(b.ref_type, ''), 'branch')
+            AND COALESCE(b2.ref, '') = COALESCE(b.ref, '')
+            AND b2.status = 'success'
+            AND b2.commit_sha IS NOT NULL
+            AND b2.commit_sha != ''
+          ORDER BY COALESCE(b2.finished_at, b2.created_at) DESC, b2.id DESC
+          LIMIT 1
+        )
+        -- 可重入：已经有状态行就不碰（重跑迁移不会覆盖运行期的新水位）
+        AND NOT EXISTS (
+          SELECT 1 FROM ${DbTables.REPO_DETECT_STATES} s
+          WHERE s.repository_id = b.repository_id
+            AND s.ref_type = COALESCE(NULLIF(b.ref_type, ''), 'branch')
+            AND s.ref = COALESCE(b.ref, '')
+        )
+    `,
+    )
+    .run();
+
+  const changes = result?.meta?.changes ?? result?.changes ?? 0;
+  console.log(`版本38：从既有备份记录回填了 ${changes} 条检测状态（已备份水位）`);
   return { ok: true, created: changes };
 }
 
@@ -989,6 +1074,17 @@ export async function runLegacyMigrationByVersion(db, version) {
       break;
     }
 
+    // 修改点（第 4 期 检测状态持久化）
+    case 38: {
+      console.log("版本38：新增 repo_detect_states（逐引用检测状态）并回填已备份水位...");
+      try {
+        await migrateRepoDetectStates(db);
+      } catch (e) {
+        console.warn("版本38：创建/回填检测状态失败（可忽略，首次检测时会自动建行）:", e?.message || e);
+      }
+      break;
+    }
+
     default:
       console.log(`未知的迁移版本: ${version}`);
       break;
@@ -1000,6 +1096,8 @@ export default {
   removeTableField,
   migrateCodeRepositoryMultiTrackAndTargets,
   migrateRepoBackupSchedules,
+  // 修改点（第 4 期 检测状态持久化）
+  migrateRepoDetectStates,
   migrateFilesTableToMultiStorage,
   rebuildFilesTable,
   migrateToBitFlagPermissions,

@@ -199,6 +199,13 @@ codeRepositoryRoutes.post("/api/admin/repo-backup/repositories/:id/check", requi
   const result = await checkRepository(db, repositoryFactory, encryptionSecret, id, env);
 
   let message = result.hasUpdate ? "检测到新版本" : "已是最新备份版本";
+  // 修改点（第 4 期）：限流/暂时性故障走的是「已安排自动重试」，
+  // 不能混进「检查失败」里说 —— 那会让用户以为仓库配置有问题
+  if (result.deferredCount > 0) {
+    message = result.hasUpdate
+      ? `检测到新版本，另有 ${result.deferredCount} 个分支因上游限流已安排自动重试`
+      : `${result.deferredCount} 个分支因上游限流或暂时不可用，已安排自动重试（不算失败）`;
+  }
   if (result.failedCount > 0) {
     message = result.hasUpdate
       ? `检测到新版本，但有 ${result.failedCount} 个分支检查失败`
@@ -210,7 +217,20 @@ codeRepositoryRoutes.post("/api/admin/repo-backup/repositories/:id/check", requi
 });
 
 /**
- * 触发一次备份（创建 repo_backup 作业，异步执行）
+ * 触发一次备份（创建作业，异步执行）
+ *
+ * 修改点（第 4 期）：创建的是 repo_backup_check 而不是 repo_backup。
+ *
+ * 为什么手动备份也要先走检测：
+ * - 需求「备份任务不再重复调用 GitHub 版本 API」对手动路径同样成立。
+ *   若这里直接建 repo_backup，备份任务就必须自己解析版本 —— 又回到
+ *   「同一个版本被解析两次」的老路。
+ * - 检测任务解析一次、落库、再把 commitSha 交给备份任务，全链路只打一次 GitHub。
+ * - force 透传给检测任务：force=true 时它会把全部检测成功的引用都交给备份任务，
+ *   并把 force 一起传下去，忽略 commitSha 去重重新下载 —— 原有「强制备份」语义不变。
+ *
+ * 返回值里的 jobId 变成检测作业的 ID（前端只用它定位任务，不依赖 taskType），
+ * 备份作业会在检测完成后由检测任务自动创建，两者都出现在「任务管理」里。
  */
 codeRepositoryRoutes.post("/api/admin/repo-backup/repositories/:id/backup", requireAdmin, async (c) => {
   const { db, repositoryFactory, encryptionSecret, env } = resolveContext(c);
@@ -230,10 +250,17 @@ codeRepositoryRoutes.post("/api/admin/repo-backup/repositories/:id/backup", requ
   const fileSystem = new FileSystem(mountManager, env);
 
   const job = await fileSystem.createJob(
-    "repo_backup",
-    // 修改点（任务列表显示仓库名）：payload 里带上 owner/repo，
-    // 让「任务管理」列表不必反查仓库表就能显示具体仓库
-    { repositoryId: id, repoIdentifier: repo.repoIdentifier, force },
+    "repo_backup_check",
+    {
+      repositoryId: id,
+      // 修改点（任务列表显示仓库名）：payload 里带上 owner/repo，
+      // 让「任务管理」列表不必反查仓库表就能显示具体仓库
+      repoIdentifier: repo.repoIdentifier,
+      createBackup: true,
+      // 手动触发：无视退避，立刻检测全部跟踪引用
+      ignoreDue: true,
+      force,
+    },
     adminId,
     UserType.ADMIN,
     { triggerType: "manual", triggerRef: "admin/repo-backup/backup" },
@@ -242,7 +269,9 @@ codeRepositoryRoutes.post("/api/admin/repo-backup/repositories/:id/backup", requ
   return jsonOk(
     c,
     { jobId: job.jobId, taskType: job.taskType, repositoryId: id, force },
-    "备份作业已创建",
+    // 修改点（第 4 期）：措辞与实际行为对齐 —— 先建的是检测作业，
+    // 发现新版本后才会接着建备份作业（force 时无条件接着建）
+    force ? "强制备份作业已创建（先检测版本，随后开始备份）" : "已创建版本检测作业，检测到新版本后会自动开始备份",
   );
 });
 

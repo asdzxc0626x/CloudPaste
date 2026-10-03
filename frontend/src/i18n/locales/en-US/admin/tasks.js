@@ -144,6 +144,9 @@ export default {
         manifest: 'Writing manifest',
         pruning: 'Pruning old versions',
         finished: 'Finished',
+        // 修改点（第 4 期 检测状态持久化）：版本检测任务的阶段
+        detecting: 'Detecting versions',
+        dispatching: 'Creating backup job',
         unknown: '-',
       },
     },
@@ -217,6 +220,8 @@ export default {
       fs_index_rebuild: 'Index Rebuild',
       fs_index_apply_dirty: 'Apply Index Dirty',
       repo_backup: 'Repository Backup',
+      // 修改点（第 4 期 检测状态持久化）：版本检测任务
+      repo_backup_check: 'Repository Version Check',
       unknown: 'Unknown Task',
       unknownWithType: 'Unknown ({type})',
     },

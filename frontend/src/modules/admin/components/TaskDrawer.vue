@@ -297,7 +297,9 @@ const formatTaskType = (type) => {
     fs_index_rebuild: t('admin.tasks.taskType.fs_index_rebuild'),
     fs_index_apply_dirty: t('admin.tasks.taskType.fs_index_apply_dirty'),
     // 修改点（任务列表显示仓库名）：补上仓库备份类型，否则会落到"未知任务（repo_backup）"
-    repo_backup: t('admin.tasks.taskType.repo_backup')
+    repo_backup: t('admin.tasks.taskType.repo_backup'),
+    // 修改点（第 4 期 检测状态持久化）：版本检测任务同样要有显示名
+    repo_backup_check: t('admin.tasks.taskType.repo_backup_check')
   }
   return typeMap[type] || t('admin.tasks.taskType.unknownWithType', { type })
 }
@@ -307,7 +309,8 @@ const formatTaskType = (type) => {
  * - 与任务列表保持一致：仓库备份任务显示 owner/repo
  */
 const formatTaskTitle = (task) => {
-  if (task?.taskType === 'repo_backup') {
+  // 修改点（第 4 期）：检测任务的 payload 同样带 repoIdentifier
+  if (task?.taskType === 'repo_backup' || task?.taskType === 'repo_backup_check') {
     const fromPayload = task?.payload?.repoIdentifier
     if (fromPayload) return String(fromPayload)
     const label = task?.stats?.itemResults?.[0]?.label
@@ -317,7 +320,7 @@ const formatTaskTitle = (task) => {
 }
 
 /** 仓库名大小写敏感，不能被 capitalize 改写成 Owner/Repo */
-const taskTitleCaseClass = (type) => (type === 'repo_backup' ? '' : 'capitalize')
+const taskTitleCaseClass = (type) => (type === 'repo_backup' || type === 'repo_backup_check' ? '' : 'capitalize')
 
 const getTaskIcon = (type) => {
   if (!type) return SyncIcon
@@ -341,7 +344,10 @@ const getTaskDetailsComponent = (taskType) => {
     fs_index_apply_dirty: TaskDetailsFsIndexApplyDirty,
     // 修改点（任务详情完善）：仓库备份任务原本没有详情组件，
     // 抽屉里只有时间线和 payload，看不到阶段/分支/目标/错误
-    repo_backup: TaskDetailsRepoBackup
+    repo_backup: TaskDetailsRepoBackup,
+    // 修改点（第 4 期）：检测任务复用同一个详情组件 —— 它的 stats 形状兼容
+    //（stage / itemResults 都有；targetMounts 缺省时组件显示 '-'，不会报错）
+    repo_backup_check: TaskDetailsRepoBackup
   }
   return componentMap[taskType] || null
 }
