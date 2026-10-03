@@ -9,6 +9,7 @@
  * - 手机端抽屉占满宽度、记录卡改单列堆叠，不产生横向滚动
  */
 import { computed } from "vue";
+import { useI18n } from "vue-i18n";
 import { IconClose, IconDownload, IconRefresh } from "@/components/icons";
 // 修改点（站点时区一期）：改用统一的 timeUtils。
 // 原来的 new Date(value).toLocaleString() 会把后端下发的
@@ -29,6 +30,9 @@ const props = defineProps({
 });
 
 const emit = defineEmits(["close", "refresh", "page-change", "download", "status-change"]);
+
+// script 里要取 i18n 文案（结果徽章需要按 outcome 回退取值，模板的 $t 做不到回退）
+const { t } = useI18n();
 
 const hasPrev = computed(() => props.paging.offset > 0);
 const hasNext = computed(() => props.paging.offset + props.paging.limit < props.total);
@@ -76,24 +80,6 @@ const filterBtnClass = (filter) => {
     : "border-gray-300 text-gray-600 hover:bg-gray-100";
 };
 
-const statusClass = (status) => {
-  switch (status) {
-    case "success":
-      return "bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300";
-    case "partial":
-      return "bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300";
-    case "failed":
-      return "bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300";
-    case "running":
-      return "bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300";
-    // 修改点（状态显示不一致修复）：延迟重试是「稍后自动重试」，不是失败
-    case "deferred":
-      return "bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300";
-    default:
-      return "bg-gray-100 text-gray-700 dark:bg-gray-700/60 dark:text-gray-300";
-  }
-};
-
 /**
  * 目标结果圆点（修改点：状态显示不一致修复）
  * 原先只判断「是不是 success」，其余一律画红 —— 于是「本次跳过」「已延迟重试」
@@ -115,12 +101,73 @@ const targetDotClass = (status) => {
 /**
  * error_message 的展示颜色（修改点：状态显示不一致修复）
  * 它既可能是失败原因，也可能是「已安排在 X 自动重试」或 partial 的告警，
- * 所以按状态上色，不再除了 partial 之外一律红字。
+ * 所以按结果色调上色，不再除了 partial 之外一律红字。
  */
-const messageClass = (status) => {
-  if (status === "failed") return "text-red-600 dark:text-red-400";
-  if (status === "partial" || status === "deferred") return "text-amber-600 dark:text-amber-400";
+const messageClass = (item) => {
+  const tone = itemTone(item);
+  if (tone === "error") return "text-red-600 dark:text-red-400";
+  if (tone === "warn") return "text-amber-600 dark:text-amber-400";
   return "text-gray-500 dark:text-gray-400";
+};
+
+// ==================== 结果口径（修改点：旧失败记录压住新结论）====================
+
+/**
+ * 记录徽章按 outcome 渲染，不按 status。
+ *
+ * 旧版本把限流写成 status='failed'，仓库管理页已按语义判成「延迟重试」；
+ * 历史若仍按 status 显示红色「失败」，两个页面就又对同一条记录给出不同结论。
+ * outcome / outcomeTone 由后端 repobackup/status.js 统一推导，前端只显示。
+ *
+ * 注意筛选器仍按 status 分档（它筛的是落库值，计数也来自数据库聚合），
+ * 因此「失败」档里可能出现一条标着「已延迟重试」的旧记录 —— 这是如实呈现：
+ * 落库是 failed，真实语义是限流延迟。
+ */
+const itemOutcome = (item) => item?.outcome || item?.status || "pending";
+
+const itemTone = (item) => {
+  if (item?.outcomeTone) return item.outcomeTone;
+  // 老接口回退：按 status 推一次色调
+  switch (item?.status) {
+    case "success":
+      return "ok";
+    case "running":
+      return "info";
+    case "partial":
+    case "deferred":
+      return "warn";
+    case "failed":
+      return "error";
+    default:
+      return "muted";
+  }
+};
+
+const toneBadgeClass = (tone) => {
+  switch (tone) {
+    case "ok":
+      return "bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300";
+    case "info":
+      return "bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300";
+    case "warn":
+      return "bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300";
+    case "error":
+      return "bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300";
+    default:
+      return "bg-gray-100 text-gray-700 dark:bg-gray-700/60 dark:text-gray-300";
+  }
+};
+
+const itemBadgeClass = (item) => toneBadgeClass(itemTone(item));
+
+const itemLabel = (item) => {
+  const outcome = itemOutcome(item);
+  const key = `admin.repoBackup.outcome.${outcome}`;
+  const text = t(key);
+  if (text !== key) return text;
+  const fallbackKey = `admin.repoBackup.backupStatus.${item?.status}`;
+  const fallback = t(fallbackKey);
+  return fallback === fallbackKey ? outcome : fallback;
 };
 
 const formatTime = (value) => {
@@ -227,8 +274,8 @@ const showTargetList = (item) => Array.isArray(item.targets) && item.targets.len
             <div class="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-2">
               <div class="min-w-0 flex-1">
                 <div class="flex items-center gap-1.5 flex-wrap">
-                  <span class="px-1.5 py-0.5 text-[10px] rounded font-medium" :class="statusClass(item.status)">
-                    {{ $t(`admin.repoBackup.backupStatus.${item.status}`) }}
+                  <span class="px-1.5 py-0.5 text-[10px] rounded font-medium" :class="itemBadgeClass(item)">
+                    {{ itemLabel(item) }}
                   </span>
                   <span
                     v-if="item.ref"
@@ -252,7 +299,7 @@ const showTargetList = (item) => Array.isArray(item.targets) && item.targets.len
                   <span v-if="item.sizeBytes"> · {{ formatSize(item.sizeBytes) }}</span>
                 </div>
 
-                <div v-if="item.errorMessage" class="mt-1 text-[11px] break-all" :class="messageClass(item.status)">
+                <div v-if="item.errorMessage" class="mt-1 text-[11px] break-all" :class="messageClass(item)">
                   {{ item.errorMessage }}
                 </div>
 

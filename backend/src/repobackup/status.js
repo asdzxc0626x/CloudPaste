@@ -93,6 +93,55 @@ export function isSuccessOutcome(outcome) {
 }
 
 /**
+ * 旧数据里「其实是限流 / 上游暂时不可用」的措辞（修改点：旧失败记录压住新结论）
+ *
+ * 当前代码绝不会把限流写成 failed —— 限流抛 RateLimitedError，落库是 deferred。
+ * 但修复前的版本会，例如用户库里这条：
+ *   「GitHub API 速率受限，约 40 分钟后才恢复，已放弃等待（请在仓库配置里填写
+ *     GitHub Token 提高速率上限，或稍后重试）」
+ * 那句「已放弃等待」的措辞在 07494ba4 之后就从代码里删掉了，也就是说凡是带这些
+ * 词的 failed 记录都是历史遗留。不认它们的话，这些仓库会永远红着 ——
+ * 用户只能手改数据库才消得掉，这显然不对。
+ */
+const DEFERRABLE_MESSAGE_HINTS = ["速率受限", "已放弃等待", "暂时不可用", "限流", "自动重试"];
+
+/** 这条记录的说明文字看起来是不是「可延迟重试」而非真失败 */
+function looksDeferrable(record) {
+  const text = record && typeof record.errorMessage === "string" ? record.errorMessage : "";
+  if (!text) return false;
+  return DEFERRABLE_MESSAGE_HINTS.some((hint) => text.includes(hint));
+}
+
+/**
+ * 把数据库时间值解析成毫秒（修改点：旧失败记录压住新结论）
+ *
+ * 为什么不直接 Date.parse：
+ *   新写入的时间都是 new Date().toISOString()（带 Z 的 UTC），但更早的数据
+ *   与 SQLite 的 CURRENT_TIMESTAMP 默认值是 "YYYY-MM-DD HH:MM:SS"（无时区标记），
+ *   后者会被 Date.parse 当成**本地时间**，和前者相比凭空差出一个时区偏移。
+ *   统一补成 UTC 再解析，两种格式才可比。
+ */
+function toMs(value) {
+  if (!value) return null;
+  const text = String(value).trim();
+  if (!text) return null;
+  const normalized = /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}/.test(text) ? `${text.replace(" ", "T")}Z` : text;
+  const ms = Date.parse(normalized);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/** 逐引用检测里最近一次「成功检测」的时间（毫秒），没有则 null */
+function latestSuccessDetectMs(states) {
+  let best = null;
+  for (const item of Array.isArray(states) ? states : []) {
+    if (!item) continue;
+    const ms = toMs(item.lastSuccessDetectAt);
+    if (ms !== null && (best === null || ms > best)) best = ms;
+  }
+  return best;
+}
+
+/**
  * 备份记录状态 → 统一结果
  *
  * @param {string} status code_repository_backups.status
@@ -111,19 +160,21 @@ export function outcomeFromBackupStatus(status, record = null) {
     case "deferred":
       return REPO_OUTCOME.DEFERRED;
     case "failed":
-      return REPO_OUTCOME.FAILED;
+      /**
+       * 修改点（旧失败记录压住新结论）：旧版本把限流也写成 failed，
+       * 按语义还原成「延迟重试」。见 DEFERRABLE_MESSAGE_HINTS 的说明 ——
+       * 当前代码不可能产生这种记录，所以这里只会命中历史数据。
+       */
+      return looksDeferrable(record) ? REPO_OUTCOME.DEFERRED : REPO_OUTCOME.FAILED;
     case "skipped":
       /**
        * skipped 有两种来源，必须分开：
-       *  · 本次修复之后：只剩「任务被取消」这一种，属于「无需备份/已跳过」
+       *  · 本次修复之后：「无需备份 / 任务被取消」，属于已是最新
        *  · 历史数据：修复前限流也写 skipped，靠 error_message 里的措辞识别
        * 不做这层识别的话，升级前被限流过的仓库会永远显示成「已跳过」，
        * 用户看不到「已安排重试」这一事实。
        */
-      if (record && typeof record.errorMessage === "string" && record.errorMessage.includes("自动重试")) {
-        return REPO_OUTCOME.DEFERRED;
-      }
-      return REPO_OUTCOME.UP_TO_DATE;
+      return looksDeferrable(record) ? REPO_OUTCOME.DEFERRED : REPO_OUTCOME.UP_TO_DATE;
     default:
       return REPO_OUTCOME.PENDING;
   }
@@ -238,8 +289,35 @@ export function resolveRepositoryState({ enabled = true, latestBackup = null, de
     return build(REPO_OUTCOME.BLOCKED, "仓库已禁用，不会执行备份");
   }
 
+  /**
+   * 这条非成功的备份记录是否已经被更新的成功检测「结清」
+   * （修改点：旧失败记录压住新结论）
+   *
+   * 用户实际遇到的问题：10/02 因限流没备份成（旧版本把限流写成 failed），
+   * 10/03 的检测已经成功、且确认「当前版本就是已经备份过的版本」，
+   * 仓库管理却仍然红着显示 10/02 那句限流说明。原因是下面第 4/5 步
+   * 只看「最近一条备份记录」，既不比时间，也不看检测结论 ——
+   * 于是一条旧失败可以永久压住之后所有的成功事实。
+   *
+   * 判定要两个条件同时成立，缺一不可：
+   *   · 有一次**成功检测**发生在这条备份记录之后 —— 它是更新的事实；
+   *   · 该次检测的结论是「已是最新」（解析到的版本 = 已备份水位）—— 说明
+   *     那次没做完的活现在已经没有了。
+   * 若检测结论是「有新版本」，说明那次失败留下的工作还没完成，
+   * 必须继续报失败 —— 这条守卫确保修复不会把真正的失败藏起来。
+   */
+  const supersededByDetect = (() => {
+    if (detect.outcome !== REPO_OUTCOME.UP_TO_DATE) return false;
+    const detectMs = latestSuccessDetectMs(detectStates);
+    if (detectMs === null) return false;
+    const backupMs = toMs(latestBackup?.finishedAt ?? latestBackup?.createdAt ?? null);
+    // 备份记录没有可比时间时不敢下结论：宁可继续显示它，也不要把真失败藏起来
+    if (backupMs === null) return false;
+    return detectMs > backupMs;
+  })();
+
   // 4. 真失败：原因必须带出来，不能只给一个红点
-  if (backupOutcome === REPO_OUTCOME.FAILED) {
+  if (backupOutcome === REPO_OUTCOME.FAILED && !supersededByDetect) {
     return build(
       REPO_OUTCOME.FAILED,
       latestBackup?.errorMessage || null,
@@ -249,7 +327,7 @@ export function resolveRepositoryState({ enabled = true, latestBackup = null, de
   }
 
   // 5. 延迟重试（备份阶段撞限流，或检测阶段撞限流）
-  if (backupOutcome === REPO_OUTCOME.DEFERRED || detect.outcome === REPO_OUTCOME.DEFERRED) {
+  if (!supersededByDetect && (backupOutcome === REPO_OUTCOME.DEFERRED || detect.outcome === REPO_OUTCOME.DEFERRED)) {
     const fromBackup = backupOutcome === REPO_OUTCOME.DEFERRED;
     return build(
       REPO_OUTCOME.DEFERRED,

@@ -282,6 +282,9 @@ const detectStatesOf = (db, repositoryId) =>
       hasUpdate: Boolean(row.commit_sha) && row.commit_sha !== row.backed_up_commit_sha,
       lastError: row.last_error ?? null,
       nextDetectAfter: row.next_detect_after ?? null,
+      // 修改点（旧失败记录压住新结论）：「这条备份记录是否已被更新的成功检测结清」
+      // 要靠这个时间判断，辅助函数必须如实带出来
+      lastSuccessDetectAt: row.last_success_detect_at ?? null,
     }));
 
 /** 由落库数据推导仓库级状态（service 层 toRepositoryDto 走的就是这个函数） */
@@ -291,7 +294,13 @@ function repoStateFromDb(db, repositoryId, { activeJobCount = 0, enabled = true 
   return resolveRepositoryState({
     enabled,
     latestBackup: latest
-      ? { status: latest.status, errorMessage: latest.error_message, createdAt: latest.created_at }
+      ? {
+          status: latest.status,
+          errorMessage: latest.error_message,
+          createdAt: latest.created_at,
+          // 与 toBackupDto 一致：时序判定优先用完成时间
+          finishedAt: latest.finished_at ?? null,
+        }
       : null,
     detectStates: detectStatesOf(db, repositoryId),
     activeJobCount,
@@ -720,4 +729,188 @@ test("一致性：同一份落库数据推导出的状态，与任务条目给�
       "「算不算失败」两处也必须一致",
     );
   }
+});
+
+// ==================== 回归：旧失败记录压住新结论 ====================
+
+test("映射：升级前把限流写成 failed 的旧记录，按语义还原成延迟重试", () => {
+  // 这是用户库里真实存在的那条记录（「已放弃等待」的措辞在 07494ba4 之后已从代码里删除，
+  // 所以带这些词的 failed 必然是历史数据）
+  const legacy = {
+    errorMessage:
+      "GitHub API 速率受限，约 40 分钟后才恢复，已放弃等待（请在仓库配置里填写 GitHub Token 提高速率上限，或稍后重试）",
+  };
+  assert.equal(outcomeFromBackupStatus("failed", legacy), REPO_OUTCOME.DEFERRED);
+  assert.equal(isFailureOutcome(outcomeFromBackupStatus("failed", legacy)), false);
+
+  // 真失败不受影响：没有限流措辞的 failed 仍然是失败
+  const real = { errorMessage: "上传到挂载点失败: 权限不足" };
+  assert.equal(outcomeFromBackupStatus("failed", real), REPO_OUTCOME.FAILED);
+  assert.equal(isFailureOutcome(outcomeFromBackupStatus("failed", real)), true);
+  assert.equal(outcomeFromBackupStatus("failed", null), REPO_OUTCOME.FAILED);
+});
+
+test("回归：一条更旧的失败备份，不得压住之后『已是最新』的成功检测", () => {
+  /**
+   * 用户报的问题：仓库明明在 10/03 检测成功且已是最新，
+   * 仓库管理却一直红着显示 10/02 那次限流的说明。
+   * 根因是状态推导只看「最近一条备份记录」，既不比时间也不看检测结论。
+   */
+  const older = {
+    status: "failed",
+    errorMessage: "上传到挂载点失败: 权限不足",
+    finishedAt: "2026-10-02T11:10:00.000Z",
+    createdAt: "2026-10-02T11:10:00.000Z",
+  };
+  const upToDateAfterwards = [
+    {
+      ref: "main",
+      detectStatus: DETECT_STATUS.OK,
+      hasUpdate: false,
+      lastError: null,
+      nextDetectAfter: "2026-10-03T19:07:00.000Z",
+      lastSuccessDetectAt: "2026-10-03T18:31:00.000Z",
+    },
+  ];
+
+  const state = resolveRepositoryState({ latestBackup: older, detectStates: upToDateAfterwards });
+  assert.equal(state.outcome, REPO_OUTCOME.UP_TO_DATE, "更新的成功检测应当胜出");
+  assert.equal(state.tone, "ok");
+  assert.equal(isFailureOutcome(state.outcome), false);
+
+  // 同一条旧记录若是限流写成的 failed，结论同样不该是失败
+  const deferredLegacy = { ...older, errorMessage: "GitHub API 速率受限，约 40 分钟后才恢复，已放弃等待" };
+  assert.equal(
+    resolveRepositoryState({ latestBackup: deferredLegacy, detectStates: upToDateAfterwards }).outcome,
+    REPO_OUTCOME.UP_TO_DATE,
+  );
+});
+
+test("回归守卫：真失败且仍有未备份的版本时，必须继续显示失败", () => {
+  /**
+   * 上一条用例放宽了「失败」的优先级，这条守住它的边界：
+   * 只有在「之后的成功检测确认已是最新」时才让检测结论胜出。
+   * 若检测说还有新版本，那次失败留下的活没干完，绝不能把失败藏起来。
+   */
+  const failed = {
+    status: "failed",
+    errorMessage: "上传到挂载点失败: 权限不足",
+    finishedAt: "2026-10-02T11:10:00.000Z",
+    createdAt: "2026-10-02T11:10:00.000Z",
+  };
+
+  // 情形 1：之后检测成功，但发现有新版本（水位没推进）
+  const hasUpdateAfterwards = [
+    {
+      ref: "main",
+      detectStatus: DETECT_STATUS.OK,
+      hasUpdate: true,
+      lastError: null,
+      nextDetectAfter: null,
+      lastSuccessDetectAt: "2026-10-03T18:31:00.000Z",
+    },
+  ];
+  const s1 = resolveRepositoryState({ latestBackup: failed, detectStates: hasUpdateAfterwards });
+  assert.equal(s1.outcome, REPO_OUTCOME.FAILED, "还有没备份的版本时失败必须可见");
+  assert.equal(s1.message, "上传到挂载点失败: 权限不足");
+
+  // 情形 2：成功检测发生在失败**之前**（失败是更新的事实）
+  const detectBefore = [
+    {
+      ref: "main",
+      detectStatus: DETECT_STATUS.OK,
+      hasUpdate: false,
+      lastError: null,
+      nextDetectAfter: null,
+      lastSuccessDetectAt: "2026-10-01T09:00:00.000Z",
+    },
+  ];
+  assert.equal(
+    resolveRepositoryState({ latestBackup: failed, detectStates: detectBefore }).outcome,
+    REPO_OUTCOME.FAILED,
+    "检测比失败更早时，失败仍是最新的事实",
+  );
+
+  // 情形 3：没有可比时间时宁可继续报失败，也不要把它藏起来
+  assert.equal(
+    resolveRepositoryState({
+      latestBackup: { status: "failed", errorMessage: "写入失败", finishedAt: null, createdAt: null },
+      detectStates: [
+        {
+          ref: "main",
+          detectStatus: DETECT_STATUS.OK,
+          hasUpdate: false,
+          lastError: null,
+          nextDetectAfter: null,
+          lastSuccessDetectAt: "2026-10-03T18:31:00.000Z",
+        },
+      ],
+    }).outcome,
+    REPO_OUTCOME.FAILED,
+  );
+});
+
+test("回归：手动『立即备份』即使无需备份，也要在备份历史里留下记录", async () => {
+  /**
+   * 用户报的第二个问题：「手动执行了很多次，这个仓库的历史一直没有记录」。
+   * 原先只有延迟/失败才留痕，「已是最新、无需备份」什么都不写，
+   * 于是用户点完按钮无法在历史里核对这次点击的结果。
+   */
+  const db = createTestDb();
+  await setupSchema(db);
+  const repoRow = await seedRepo(db, { refs: ["main"] });
+  const codeRepo = new RepositoryFactory(db, { env: ENV }).getCodeRepositoryRepository();
+  await codeRepo.ensureDetectStates(repoRow.id, [{ refType: "branch", ref: "main" }]);
+  await advanceBackedUpWatermark(codeRepo, repoRow.id, "branch", "main", sha("b"));
+
+  const { createdJobs, progress } = await runCheck({
+    db,
+    repoRow,
+    responder: () => commitOk(sha("b")),
+    // manual=true 就是路由层「立即备份」传的那套 payload
+    payload: { createBackup: true, ignoreDue: true, manual: true },
+  });
+
+  // 结论本身不变：无需备份、不建备份作业、不算失败
+  const stats = progress[progress.length - 1];
+  assert.equal(stats.itemResults[0].meta.outcome, REPO_OUTCOME.UP_TO_DATE);
+  assert.equal(stats.failedCount, 0);
+  assert.equal(createdJobs.length, 0);
+
+  // 但历史里必须留下这一次尝试
+  const rows = readBackups(db, repoRow.id);
+  assert.equal(rows.length, 1, "手动备份必须在历史里留一条记录");
+  assert.equal(rows[0].status, "skipped");
+  assert.equal(outcomeFromBackupStatus(rows[0].status, { errorMessage: rows[0].error_message }), REPO_OUTCOME.UP_TO_DATE);
+  assert.match(rows[0].error_message, /已是最新/);
+  // 版本信息要带上，否则历史里只能显示「未解析到版本」
+  assert.equal(rows[0].version, "main@bbbbbbb", "留痕要带真实版本，历史才不会显示『未解析到版本』");
+  assert.equal(rows[0].ref, "main");
+  // commit_sha 必须是占位值：(repository_id, commit_sha) 上有唯一索引，
+  // 而这个 commit 正因为「已经备份过」才会走到这条分支，写真实 sha 会撞唯一约束
+  assert.match(rows[0].commit_sha, /^unresolved-/);
+
+  // 留痕不得让仓库看起来是失败的
+  const state = repoStateFromDb(db, repoRow.id);
+  assert.equal(state.outcome, REPO_OUTCOME.UP_TO_DATE);
+  assert.equal(isFailureOutcome(state.outcome), false);
+});
+
+test("回归：定时检测发现无更新时不写历史（避免把历史淹掉）", async () => {
+  const db = createTestDb();
+  await setupSchema(db);
+  const repoRow = await seedRepo(db, { refs: ["main"] });
+  const codeRepo = new RepositoryFactory(db, { env: ENV }).getCodeRepositoryRepository();
+  await codeRepo.ensureDetectStates(repoRow.id, [{ refType: "branch", ref: "main" }]);
+  await advanceBackedUpWatermark(codeRepo, repoRow.id, "branch", "main", sha("b"));
+
+  await runCheck({
+    db,
+    repoRow,
+    responder: () => commitOk(sha("b")),
+    // 没有 manual：这是调度器建的作业
+    payload: { createBackup: true, ignoreDue: true },
+  });
+
+  assert.equal(readBackups(db, repoRow.id).length, 0, "定时检测的『没变化』不该写历史");
 });

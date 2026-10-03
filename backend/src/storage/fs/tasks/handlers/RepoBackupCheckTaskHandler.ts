@@ -370,40 +370,62 @@ export class RepoBackupCheckTaskHandler implements TaskHandler {
     }
 
     /**
-     * 修改点（备份历史缺记录）：本次是「备份尝试」但一个引用都没能备份时，补一条留痕。
+     * 修改点（备份历史缺记录）：这一轮是「备份尝试」但没产生任何备份时，补一条留痕。
      *
-     * 触发条件 two 者同时成立：
-     *   · createBackup === true —— 这一轮是备份链路（定时检测 / 手动「立即备份」），
-     *     而不是只读的「检查更新」。只读检查不该往备份历史里写东西。
-     *   · 没有任何引用进入备份候选，且确实发生了延迟/失败 —— 也就是说这一轮
-     *     本该备份却没备份成。
+     * 触发条件：createBackup === true（这一轮是备份链路：定时检测 / 手动「立即备份」，
+     * 而不是只读的「检查更新」），且没有任何引用进入备份候选。此时分三种情形：
      *
-     * 不补这条记录会怎样（用户实际遇到的）：任务列表里明明有一条「跳过」，
-     * 点开该仓库的「历史」却空空如也（只有以前的成功/失败记录），
-     * 用户无法核对这次尝试到底发生了什么、下次什么时候重试。
+     *   · 延迟 / 失败 —— 一律留痕。这是「本该备份却没备份成」，
+     *     不记的话用户在任务列表看到一条「跳过」，点开历史却空空如也。
+     *   · 已是最新且是**手动**触发 —— 也留痕。用户主动点了「立即备份」，
+     *     必须能在历史里核对这次点击的结果（这正是用户反馈的
+     *     「手动执行了很多次，历史里一直没有记录」）。
+     *   · 已是最新且是定时触发 —— 不留痕。每几小时一条「没变化」会把历史淹掉。
      */
-    if (createBackup && backupCandidates.length === 0 && (outcome.deferredCount > 0 || outcome.errorCount > 0)) {
+    const nothingBackedUp = createBackup && backupCandidates.length === 0;
+    const hadTrouble = outcome.deferredCount > 0 || outcome.errorCount > 0;
+    const manualUpToDate = payload.manual === true && !hadTrouble && outcome.successCount > 0;
+
+    if (nothingBackedUp && (hadTrouble || manualUpToDate)) {
       const deferred = outcome.deferredCount > 0;
-      const reason =
-        detectResults.find((r) => r.error)?.error ||
-        `${describeErrorKind(outcome.deferredKind || "")}，上游暂时不可用`;
-      const summary = deferred
-        ? `本次未能完成，${outcome.deferredCount} 个引用因${describeErrorKind(outcome.deferredKind || "")}已安排 ${
-            deferRetryAt || "稍后"
-          } 自动重试：${reason}`
-        : `${outcome.errorCount} 个引用检测失败，未能备份：${reason}`;
+      /**
+       * 「已是最新」留痕要带上版本号。
+       *
+       * commit_sha 仍然必须用占位值：(repository_id, commit_sha) 上有唯一索引，
+       * 而这个 commit 早就有一条成功记录占着位子了（它正是「已是最新」的含义），
+       * 写真实 sha 会直接撞唯一约束。版本信息改放 version / ref 两个字段，
+       * 于是历史里显示的是「main · <版本>」而不是「未解析到版本」。
+       */
+      const sample = manualUpToDate ? detectResults.find((r) => r.detectStatus === DETECT_STATUS.OK) : null;
+
+      let summary: string;
+      if (manualUpToDate) {
+        summary = `手动触发：检查完成，当前已是最新版本（${
+          sample?.version || sample?.shortCommitSha || "已备份版本"
+        }），无需备份`;
+      } else {
+        const reason =
+          detectResults.find((r) => r.error)?.error ||
+          `${describeErrorKind(outcome.deferredKind || "")}，上游暂时不可用`;
+        summary = deferred
+          ? `本次未能完成，${outcome.deferredCount} 个引用因${describeErrorKind(outcome.deferredKind || "")}已安排 ${
+              deferRetryAt || "稍后"
+            } 自动重试：${reason}`
+          : `${outcome.errorCount} 个引用检测失败，未能备份：${reason}`;
+      }
 
       try {
         await codeRepo.createBackup({
           id: generateId("bk"),
           repository_id: repoRow.id,
           ref_type: String(repoRow.track_mode || "branch") === "branch" ? "branch" : "tag",
-          ref: null,
-          // 占位 commit_sha：这一轮根本没解析到版本；DTO 读取时会还原为 null
+          ref: sample?.ref ?? null,
+          // 占位 commit_sha：见上面的唯一索引说明；DTO 读取时会还原为 null
           commit_sha: buildUnresolvedCommitSha(),
-          version: null,
-          // 延迟写 deferred（非失败），其余情况才是 failed
-          status: deferred ? "deferred" : "failed",
+          version: sample?.version ?? null,
+          // 已是最新 → skipped（映射为「已是最新」，非失败）
+          // 延迟 → deferred（非失败）；其余才是 failed
+          status: manualUpToDate ? "skipped" : deferred ? "deferred" : "failed",
           job_id: job.jobId,
           error_message: summary,
           started_at: new Date().toISOString(),

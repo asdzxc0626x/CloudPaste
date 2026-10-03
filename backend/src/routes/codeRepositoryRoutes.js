@@ -278,6 +278,9 @@ codeRepositoryRoutes.post("/api/admin/repo-backup/repositories/:id/backup", requ
       createBackup: true,
       // 手动触发：无视退避，立刻检测全部跟踪引用
       ignoreDue: true,
+      // 修改点（手动备份在历史里看不到记录）：标明这是用户点出来的一次备份尝试，
+      // 于是即使结论是「已是最新、无需备份」也会在备份历史里留一条记录
+      manual: true,
       force,
     },
     adminId,

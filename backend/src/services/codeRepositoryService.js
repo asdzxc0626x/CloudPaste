@@ -45,7 +45,7 @@ import { normalizePathPrefix, buildRepoFolderName } from "../repobackup/paths.js
 import { prepareDetectRound, detectRefs, toDetectStateDto, resolveTrackedRefKeys } from "../repobackup/detect.js";
 // 修改点（状态显示不一致修复）：仓库级状态由统一的映射函数推导，
 // 两个页面读同一个来源，不再各自解释 last_error / status
-import { resolveRepositoryState, outcomeFromBackupStatus, REPO_OUTCOME } from "../repobackup/status.js";
+import { resolveRepositoryState, outcomeFromBackupStatus, outcomeTone, REPO_OUTCOME } from "../repobackup/status.js";
 // 修改点（第 3 期 3-B 凭据池）：全局池的读写与视图构建
 import {
   loadGlobalPool,
@@ -309,6 +309,14 @@ function toBackupDto(row, extra = {}) {
     // 修改点（状态显示不一致修复）：同一条记录的状态在两个页面必须给出同一个结论，
     // 因此把它映射成统一结果一并下发；前端不再自己判断「skipped 算不算失败」
     outcome: outcomeFromBackupStatus(row.status, { errorMessage: row.error_message }),
+    /**
+     * 结果色调（修改点：旧失败记录压住新结论）
+     *
+     * 前端渲染徽章颜色时直接用它，不要自己按 status 再判一次 ——
+     * 旧版本把限流写成 status='failed'，按 status 上色会红，
+     * 而仓库级状态已经按语义判成「延迟重试」（琥珀），同一行里就会自相矛盾。
+     */
+    outcomeTone: outcomeTone(outcomeFromBackupStatus(row.status, { errorMessage: row.error_message })),
     storagePath: row.storage_path ?? null,
     manifestPath: row.manifest_path ?? null,
     sizeBytes: row.size_bytes ?? null,

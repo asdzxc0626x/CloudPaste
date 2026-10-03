@@ -116,6 +116,32 @@ const stateHasDetail = (repo) => Boolean(stateDetail(repo));
  */
 const showLastError = (repo) => repoState(repo).tone === "error" && Boolean(repo.lastError);
 
+// ==================== 备份记录徽章（修改点：旧失败记录压住新结论）====================
+
+/**
+ * 「最近备份」徽章按 outcome 渲染，不按 status。
+ *
+ * 为什么：同一条记录只能有一个结论。旧版本把限流写成 status='failed'，
+ * 若这里仍按 status 上色，就会出现「状态列绿色『已是最新』、
+ * 最近备份列红色『失败』」这种同一行内自相矛盾的画面 —— 正是本次要修的问题。
+ * outcome / outcomeTone 由后端 repobackup/status.js 统一推导（已识别历史数据），
+ * 前端只负责显示。老接口没有这两个字段时回退到 status，保证兼容。
+ */
+const backupOutcome = (backup) => backup?.outcome || backup?.status || "pending";
+
+const backupBadgeClass = (backup) => (backup?.outcomeTone ? toneClass(backup.outcomeTone) : statusClass(backup?.status));
+
+const backupLabel = (backup) => {
+  const outcome = backupOutcome(backup);
+  const key = `admin.repoBackup.outcome.${outcome}`;
+  const text = t(key);
+  // 该 outcome 没有文案时退回备份状态文案，绝不把 key 直接显示出来
+  if (text !== key) return text;
+  const fallbackKey = `admin.repoBackup.backupStatus.${backup?.status}`;
+  const fallback = t(fallbackKey);
+  return fallback === fallbackKey ? outcome : fallback;
+};
+
 /** 格式化时间（修改点：站点时区一期，改用统一的 timeUtils）*/
 const formatTime = (value) => {
   if (!value) return "-";
@@ -444,8 +470,8 @@ const scheduleFailed = (repo) => repo.schedule?.enabled === true && repo.schedul
             <td class="px-4 py-3 align-top">
               <template v-if="repo.latestBackup">
                 <div class="flex items-center gap-2 flex-wrap">
-                  <span class="px-1.5 py-0.5 text-[10px] rounded font-medium" :class="statusClass(repo.latestBackup.status)">
-                    {{ $t(`admin.repoBackup.backupStatus.${repo.latestBackup.status}`) }}
+                  <span class="px-1.5 py-0.5 text-[10px] rounded font-medium" :class="backupBadgeClass(repo.latestBackup)">
+                    {{ backupLabel(repo.latestBackup) }}
                   </span>
                   <span class="text-xs font-mono" :class="darkMode ? 'text-gray-300' : 'text-gray-600'">
                     {{ repo.latestBackup.ref || repo.latestBackup.shortCommitSha }}
@@ -531,9 +557,9 @@ const scheduleFailed = (repo) => repo.schedule?.enabled === true && repo.schedul
           <span
             v-if="repo.latestBackup"
             class="shrink-0 px-1.5 py-0.5 text-[10px] rounded font-medium"
-            :class="statusClass(repo.latestBackup.status)"
+            :class="backupBadgeClass(repo.latestBackup)"
           >
-            {{ $t(`admin.repoBackup.backupStatus.${repo.latestBackup.status}`) }}
+            {{ backupLabel(repo.latestBackup) }}
           </span>
         </div>
 
