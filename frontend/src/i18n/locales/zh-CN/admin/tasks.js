@@ -148,6 +148,24 @@ export default {
         dispatching: '创建备份作业',
         unknown: '-',
       },
+      /**
+       * 统一结果文案（修改点：状态显示不一致修复）
+       *
+       * 条目上除了任务系统的 status（完成/跳过/失败），还会带一个来自后端
+       * repobackup/status.js 的 meta.outcome。同一个结果在「仓库管理」和这里
+       * 必须叫同一个名字，所以两边共用同一套取值。
+       */
+      outcome: {
+        pending: '尚未备份',
+        running: '进行中',
+        success: '成功完成',
+        partial: '部分成功',
+        up_to_date: '已是最新，无需备份',
+        update_available: '有新版本，可以备份',
+        deferred: '已延迟重试',
+        blocked: '已被阻止',
+        failed: '失败',
+      },
     },
 
     fileStatus: {

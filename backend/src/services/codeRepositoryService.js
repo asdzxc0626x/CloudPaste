@@ -43,6 +43,9 @@ import {
 import { normalizePathPrefix, buildRepoFolderName } from "../repobackup/paths.js";
 // 修改点（第 4 期 检测状态持久化）：手动「检查更新」与定时检测共用同一套检测实现
 import { prepareDetectRound, detectRefs, toDetectStateDto, resolveTrackedRefKeys } from "../repobackup/detect.js";
+// 修改点（状态显示不一致修复）：仓库级状态由统一的映射函数推导，
+// 两个页面读同一个来源，不再各自解释 last_error / status
+import { resolveRepositoryState, outcomeFromBackupStatus, REPO_OUTCOME } from "../repobackup/status.js";
 // 修改点（第 3 期 3-B 凭据池）：全局池的读写与视图构建
 import {
   loadGlobalPool,
@@ -56,6 +59,8 @@ import {
   removeRepositoryScheduleJob,
   loadRepositorySchedule,
   loadAllRepositorySchedules,
+  // 修改点（状态显示不一致修复）：「进行中的作业」的残留判定窗口与调度守卫保持一致
+  STALE_RUNNING_BACKUP_SEC,
 } from "../repobackup/schedule.js";
 
 /**
@@ -198,6 +203,7 @@ function toMountBrief(mount) {
 function toRepositoryDto(row, extra = {}) {
   const trackRefs = resolveTrackRefs(row);
   const targetMountIds = resolveTargetMountIds(row);
+  const enabled = row.enabled === 1 || row.enabled === true;
 
   return {
     id: row.id,
@@ -215,15 +221,51 @@ function toRepositoryDto(row, extra = {}) {
     targetPathPrefix: row.target_path_prefix || "/",
     // 修改点（版本保留优化）
     retentionCount: resolveRetentionCount(row),
-    enabled: row.enabled === 1 || row.enabled === true,
+    enabled,
     lastCheckedAt: row.last_checked_at ?? null,
     lastBackupAt: row.last_backup_at ?? null,
     lastKnownCommitSha: row.last_known_commit_sha ?? null,
     lastError: row.last_error ?? null,
+    /**
+     * 仓库级状态（修改点：状态显示不一致修复）
+     *
+     * 这是「仓库管理」列表渲染状态的**唯一来源**：由最近一条备份记录
+     * 与逐引用检测状态这些结构化数据推导，不再让前端看到 last_error 非空
+     * 就渲染成失败。lastError 仍然保留，但它现在只承载真正的失败原因。
+     */
+    state: resolveRepositoryState({
+      enabled,
+      latestBackup: extra.latestBackup || null,
+      detectStates: extra.detectStates || [],
+      activeJobCount: Number(extra.activeJobCount) || 0,
+    }),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     ...extra,
   };
+}
+
+/**
+ * 统计某仓库当前未结束的编排作业数（修改点：状态显示不一致修复）
+ *
+ * 用途：把「被其他任务阻止」这一状态变得可见 —— 用户连点两次「立即备份」，
+ * 第二次不会再创建新任务（该仓库已被上一个作业占住），此时仓库列表应当
+ * 显示「已有任务在进行中」而不是看起来什么都没发生。
+ *
+ * 失败不影响列表：这只是展示用的附加信息，查不到就按 0 处理。
+ */
+async function countActiveJobs(codeRepo, repositoryId) {
+  try {
+    return await codeRepo.countActiveRepoJobs(
+      repositoryId,
+      ["repo_backup", "repo_backup_check"],
+      // 复用「超期残留」的判定窗口，避免被杀死的任务永久占位
+      Date.now() - STALE_RUNNING_BACKUP_SEC * 1000,
+    );
+  } catch (error) {
+    console.warn("[repoBackup] 统计进行中的作业失败（按 0 处理）:", error?.message || error);
+    return 0;
+  }
 }
 
 /**
@@ -264,6 +306,9 @@ function toBackupDto(row, extra = {}) {
     unresolved,
     version: row.version ?? null,
     status: row.status,
+    // 修改点（状态显示不一致修复）：同一条记录的状态在两个页面必须给出同一个结论，
+    // 因此把它映射成统一结果一并下发；前端不再自己判断「skipped 算不算失败」
+    outcome: outcomeFromBackupStatus(row.status, { errorMessage: row.error_message }),
     storagePath: row.storage_path ?? null,
     manifestPath: row.manifest_path ?? null,
     sizeBytes: row.size_bytes ?? null,
@@ -342,6 +387,8 @@ export async function listRepositories(db, repositoryFactory, encryptionSecret, 
         // 修改点（第 4 期）：逐引用的检测状态（最近检测时间 / 下次检测时间 / 错误 / 是否有更新）
         detectStates: (detectStateMap.get(String(row.id)) || []).map(toDetectStateDto),
         latestBackup: latestBackup ? toBackupDto(latestBackup, { targets: latestBackupTargets }) : null,
+        // 修改点（状态显示不一致修复）：有未结束的作业 = 被其他任务占住
+        activeJobCount: await countActiveJobs(codeRepo, row.id),
       }),
     );
   }
@@ -384,6 +431,8 @@ export async function getRepository(db, repositoryFactory, encryptionSecret, id,
     // 修改点（第 4 期）：逐引用的检测状态
     detectStates: (await codeRepo.findDetectStates(row.id)).map(toDetectStateDto),
     latestBackup: latestBackup ? toBackupDto(latestBackup, { targets: latestBackupTargets }) : null,
+    // 修改点（状态显示不一致修复）：同上，详情与列表的状态来源保持一致
+    activeJobCount: await countActiveJobs(codeRepo, row.id),
   });
 }
 
@@ -861,12 +910,37 @@ export async function checkRepository(db, repositoryFactory, encryptionSecret, i
   const lastSuccess = await codeRepo.findLatestSuccessBackup(row.id);
   const lastSuccessTargets = lastSuccess ? await codeRepo.findTargetsByBackup(lastSuccess.id) : [];
 
+  /**
+   * 检测结论（修改点：无更新反馈 + 状态显示不一致修复）
+   *
+   * 「有没有更新」与「检测成功没有」是两件事，必须分开回答：
+   *   · 有引用解析成功且都无更新 → 检查完成，已是最新（**成功结果**）
+   *   · 一个引用都没解析成功（全是限流/暂时性） → 已安排重试，不是成功也不是失败
+   *   · 全部永久失败 → 检测失败
+   * 原先只有 hasUpdate 一个布尔，前端无法区分「已是最新」和「根本没查到」，
+   * 于是「无更新」看起来像空结果。
+   */
+  const detectedOkCount = successCount;
+  const hasUpdate = results.some((item) => item.hasUpdate);
+  const overallOutcome = allFailed
+    ? REPO_OUTCOME.FAILED
+    : hasUpdate
+      ? REPO_OUTCOME.UPDATE_AVAILABLE
+      : detectedOkCount > 0
+        ? REPO_OUTCOME.UP_TO_DATE
+        : REPO_OUTCOME.DEFERRED;
+
   return {
     repositoryId: row.id,
     // 修改点（多分支优化）：任一分支有更新即视为有更新
-    hasUpdate: results.some((item) => item.hasUpdate),
+    hasUpdate,
     allFailed,
+    // 修改点（状态显示不一致修复）：统一结果词汇，与仓库列表 / 任务条目同源
+    outcome: overallOutcome,
     checkedCount: results.length,
+    // 修改点（无更新反馈）：明确回答「这次检测成功了没有」——
+    // 只要有一个引用成功解析，就是一次成功的检查，哪怕结论是「已是最新」
+    detectedOkCount,
     successCount,
     failedCount: outcome.errorCount,
     // 修改点（第 4 期）：被延迟重检的引用数单独暴露，前端可提示「稍后自动重试」

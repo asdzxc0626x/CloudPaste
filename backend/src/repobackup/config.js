@@ -57,8 +57,24 @@ export function isUnresolvedCommitSha(value) {
  */
 export const NON_SUCCESS_HISTORY_KEEP = 20;
 
-/** 备份记录的合法状态，供列表筛选参数校验使用 */
-export const BACKUP_STATUSES = ["running", "success", "partial", "failed", "skipped"];
+/**
+ * 备份记录的合法状态，供列表筛选参数校验使用
+ *
+ * 修改点（状态显示不一致修复）：新增 `deferred`
+ *   原先「限流/上游暂时不可用」与「无需备份」都写 `skipped`，于是这条记录既可能表示
+ *   「已经是最新版本、本次不用备份」，也可能表示「这次没备份、已安排自动重试」。
+ *   两个页面从同一个值里读出了不同含义（任务列表显示「跳过」，仓库管理读 last_error
+ *   里的说明文字显示成红色失败）。给延迟重试一个独立状态，两边才有共同语义。
+ */
+export const BACKUP_STATUSES = ["running", "success", "partial", "failed", "skipped", "deferred"];
+
+/**
+ * 「没有产生可用快照」的备份状态
+ *
+ * 这些记录不占用「保留版本数」额度，但仍需要单独限量清理（见 retention.js）。
+ * 注意 partial 不在这里：它至少有一个目标写成功了，快照是可用的。
+ */
+export const NON_SUCCESS_BACKUP_STATUSES = ["failed", "skipped", "deferred"];
 
 /**
  * 把 JSON 数组列解析为字符串数组

@@ -198,20 +198,39 @@ codeRepositoryRoutes.post("/api/admin/repo-backup/repositories/:id/check", requi
   const { id } = c.req.param();
   const result = await checkRepository(db, repositoryFactory, encryptionSecret, id, env);
 
-  let message = result.hasUpdate ? "检测到新版本" : "已是最新备份版本";
-  // 修改点（第 4 期）：限流/暂时性故障走的是「已安排自动重试」，
-  // 不能混进「检查失败」里说 —— 那会让用户以为仓库配置有问题
-  if (result.deferredCount > 0) {
-    message = result.hasUpdate
-      ? `检测到新版本，另有 ${result.deferredCount} 个分支因上游限流已安排自动重试`
-      : `${result.deferredCount} 个分支因上游限流或暂时不可用，已安排自动重试（不算失败）`;
+  /**
+   * 结果提示（修改点：无更新反馈 + 状态显示不一致修复）
+   *
+   * 四种结论分别给话，重点是「无更新」必须被明确说成一次**成功**的检查结果：
+   * 原先是「已是最新备份版本」，虽然不算错，但既没提「检查完成」，
+   * 也没和「检测失败」「还没检查过」区分开，用户点完按钮容易以为没生效。
+   * 限流/延迟与失败各自保留真实状态，不混进成功口径。
+   */
+  let message;
+  switch (result.outcome) {
+    case "up_to_date":
+      message = `检查完成，当前已是最新版本（${result.checkedCount} 个引用）`;
+      break;
+    case "update_available":
+      message = result.failedCount > 0
+        ? `检测到新版本，但有 ${result.failedCount} 个分支检查失败`
+        : "检测到新版本，可以备份";
+      break;
+    case "failed":
+      message = "全部跟踪分支检查失败，请查看错误详情";
+      break;
+    case "deferred":
+    default:
+      // 限流 / 上游暂时不可用：既不是失败，也没有拿到有效结论
+      message = result.hasUpdate
+        ? `检测到新版本，另有 ${result.deferredCount} 个分支因上游限流已安排自动重试`
+        : `${result.deferredCount || result.checkedCount} 个分支因上游限流或暂时不可用未能检查，已安排自动重试（不算失败）`;
+      break;
   }
-  if (result.failedCount > 0) {
-    message = result.hasUpdate
-      ? `检测到新版本，但有 ${result.failedCount} 个分支检查失败`
-      : `有 ${result.failedCount} 个分支检查失败`;
+  // 部分失败仍然要提示，不能因为整体有结论就把它吞掉
+  if (result.failedCount > 0 && result.outcome !== "failed" && result.outcome !== "update_available") {
+    message = `${message}；另有 ${result.failedCount} 个分支检查失败`;
   }
-  if (result.allFailed) message = "全部跟踪分支检查失败，请查看错误详情";
 
   return jsonOk(c, result, message);
 });

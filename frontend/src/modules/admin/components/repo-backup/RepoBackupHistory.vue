@@ -44,6 +44,9 @@ const STATUS_FILTERS = [
   { key: "failed", statuses: ["failed"] },
   { key: "running", statuses: ["running"] },
   { key: "skipped", statuses: ["skipped"] },
+  // 修改点（状态显示不一致修复）：延迟重试单独一档。
+  // 它既不是成功也不是失败，混进任何一档都会让用户看到错误结论。
+  { key: "deferred", statuses: ["deferred"] },
 ];
 
 /** 当前选中的筛选项 key */
@@ -83,9 +86,41 @@ const statusClass = (status) => {
       return "bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300";
     case "running":
       return "bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300";
+    // 修改点（状态显示不一致修复）：延迟重试是「稍后自动重试」，不是失败
+    case "deferred":
+      return "bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300";
     default:
       return "bg-gray-100 text-gray-700 dark:bg-gray-700/60 dark:text-gray-300";
   }
+};
+
+/**
+ * 目标结果圆点（修改点：状态显示不一致修复）
+ * 原先只判断「是不是 success」，其余一律画红 —— 于是「本次跳过」「已延迟重试」
+ * 这些非失败的目标也被涂成红色，和「写入失败」看起来一模一样。
+ */
+const targetDotClass = (status) => {
+  switch (status) {
+    case "success":
+      return "bg-green-500";
+    case "failed":
+      return "bg-red-500";
+    case "deferred":
+      return "bg-amber-500";
+    default:
+      return "bg-gray-400";
+  }
+};
+
+/**
+ * error_message 的展示颜色（修改点：状态显示不一致修复）
+ * 它既可能是失败原因，也可能是「已安排在 X 自动重试」或 partial 的告警，
+ * 所以按状态上色，不再除了 partial 之外一律红字。
+ */
+const messageClass = (status) => {
+  if (status === "failed") return "text-red-600 dark:text-red-400";
+  if (status === "partial" || status === "deferred") return "text-amber-600 dark:text-amber-400";
+  return "text-gray-500 dark:text-gray-400";
 };
 
 const formatTime = (value) => {
@@ -217,7 +252,7 @@ const showTargetList = (item) => Array.isArray(item.targets) && item.targets.len
                   <span v-if="item.sizeBytes"> · {{ formatSize(item.sizeBytes) }}</span>
                 </div>
 
-                <div v-if="item.errorMessage" class="mt-1 text-[11px] break-all" :class="item.status === 'partial' ? 'text-amber-600 dark:text-amber-400' : 'text-red-600 dark:text-red-400'">
+                <div v-if="item.errorMessage" class="mt-1 text-[11px] break-all" :class="messageClass(item.status)">
                   {{ item.errorMessage }}
                 </div>
 
@@ -230,7 +265,7 @@ const showTargetList = (item) => Array.isArray(item.targets) && item.targets.len
                   >
                     <span
                       class="w-1.5 h-1.5 rounded-full shrink-0"
-                      :class="target.status === 'success' ? 'bg-green-500' : 'bg-red-500'"
+                      :class="targetDotClass(target.status)"
                     ></span>
                     <!-- truncate 在 flex 子项上必须配 min-w-0，否则不会收缩而是把容器撑破 -->
                     <span class="min-w-0 truncate font-mono" :class="darkMode ? 'text-gray-400' : 'text-gray-500'" :title="target.mountPath || ''">
@@ -239,7 +274,12 @@ const showTargetList = (item) => Array.isArray(item.targets) && item.targets.len
                     <span v-if="target.sizeBytes" class="shrink-0" :class="darkMode ? 'text-gray-500' : 'text-gray-400'">
                       · {{ formatSize(target.sizeBytes) }}
                     </span>
-                    <span v-if="target.errorMessage" class="min-w-0 text-red-500 truncate" :title="target.errorMessage">
+                    <span
+                      v-if="target.errorMessage"
+                      class="min-w-0 truncate"
+                      :class="target.status === 'failed' ? 'text-red-500' : 'text-amber-500'"
+                      :title="target.errorMessage"
+                    >
                       · {{ target.errorMessage }}
                     </span>
                   </div>

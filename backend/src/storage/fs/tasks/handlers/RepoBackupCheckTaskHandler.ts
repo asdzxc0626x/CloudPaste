@@ -5,7 +5,7 @@ import { ValidationError, NotFoundError } from "../../../../http/errors.js";
 import { ensureRepositoryFactory } from "../../../../utils/repositories.js";
 import { UserType } from "../../../../constants/index.js";
 import { RepoProviderFactory } from "../../../../repobackup/providers/index.js";
-import { parseProviderConfig } from "../../../../repobackup/config.js";
+import { parseProviderConfig, buildUnresolvedCommitSha } from "../../../../repobackup/config.js";
 import { describeRetryAt, describeErrorKind } from "../../../../repobackup/errors.js";
 import { deferRepositoryBackupSchedule } from "../../../../repobackup/schedule.js";
 import {
@@ -14,6 +14,8 @@ import {
   detectRefs,
   prepareDetectRound,
 } from "../../../../repobackup/detect.js";
+// 修改点（状态显示不一致修复）：统一结果词汇，任务条目与仓库管理页共用同一套
+import { REPO_OUTCOME } from "../../../../repobackup/status.js";
 
 /**
  * 代码仓库版本检测任务（修改点：第 4 期 检测状态持久化 + repo_backup_check）
@@ -83,6 +85,20 @@ function buildStats(totalItems: number, overrides: Partial<TaskStats> = {}): Tas
   };
 }
 
+/** 生成主键（修改点：备份历史缺记录 —— 补留痕需要写 code_repository_backups） */
+function generateId(prefix: string): string {
+  try {
+    // eslint-disable-next-line no-undef
+    if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+      // eslint-disable-next-line no-undef
+      return `${prefix}_${crypto.randomUUID()}`;
+    }
+  } catch {
+    // ignore
+  }
+  return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
 export class RepoBackupCheckTaskHandler implements TaskHandler {
   readonly taskType = "repo_backup_check";
 
@@ -140,6 +156,10 @@ export class RepoBackupCheckTaskHandler implements TaskHandler {
     let successCount = 0;
     let failedCount = 0;
     let skippedCount = 0;
+    // 修改点（状态显示不一致修复）：延迟重试单独计数。
+    // 它仍然计入 skippedCount（两者都不是失败，进度条口径不变），
+    // 但只有单独记一份，任务详情才能把「无需备份」和「已安排重试」区分开。
+    let deferredCount = 0;
     let createdJobId: string | null = null;
     let deferRetryAt: string | null = null;
 
@@ -151,6 +171,7 @@ export class RepoBackupCheckTaskHandler implements TaskHandler {
           successCount,
           failedCount,
           skippedCount,
+          deferredCount,
           itemResults,
           stage,
           repositoryId: repoRow.id,
@@ -177,6 +198,9 @@ export class RepoBackupCheckTaskHandler implements TaskHandler {
         kind: "repo",
         label: repoLabel,
         status: "skipped",
+        // 修改点（状态显示不一致修复）：这是「被挡住/无需执行」，不是失败。
+        // 区别在于「没到检测时间」属于正常节流，所以标成 blocked 而非 deferred。
+        meta: { outcome: REPO_OUTCOME.BLOCKED },
         message:
           round.trackedCount === 0
             ? "该仓库未配置任何跟踪引用"
@@ -213,34 +237,58 @@ export class RepoBackupCheckTaskHandler implements TaskHandler {
 
     successCount = outcome.successCount;
     failedCount = outcome.errorCount;
+    // 延迟重试也计进 skippedCount：两者都不是失败，进度条的分段口径与修复前一致
     skippedCount = outcome.deferredCount;
+    deferredCount = outcome.deferredCount;
 
     for (const item of detectResults) {
       const label = item.ref ? `${repoIdentifier}@${item.ref}` : repoIdentifier;
       if (item.detectStatus === DETECT_STATUS.OK) {
+        /**
+         * 修改点（状态显示不一致修复 + 无更新反馈）：
+         *
+         * 检测成功有两种结论，都必须被明确表达出来：
+         *   · 有更新 → UPDATE_AVAILABLE，随后会创建备份作业
+         *   · 无更新 → UP_TO_DATE，**这是成功检测结果**，不是失败也不是空结果
+         * 过去「无更新」只写了一句 message，接口层也没给出足够明确的措辞，
+         * 用户点完「检查更新」后分不清「已是最新」和「检查没跑起来」。
+         */
+        // 命名成 itemOutcome 而不是 outcome：外层的 outcome 是 detectRefs 的整轮结果，
+        // 循环里再叫 outcome 会遮住它，读代码的人容易以为下面用的还是这个
+        const itemOutcome = item.hasUpdate ? REPO_OUTCOME.UPDATE_AVAILABLE : REPO_OUTCOME.UP_TO_DATE;
         itemResults.push({
           kind: "repo",
           label,
           status: "success",
           message: item.hasUpdate
             ? `发现新版本 ${item.version || item.shortCommitSha}`
-            : `无更新（当前 ${item.version || item.shortCommitSha}）`,
+            : `检查完成，当前已是最新版本（${item.version || item.shortCommitSha}）`,
           meta: {
             refType: item.refType,
             ref: item.ref,
             commitSha: item.commitSha,
             version: item.version,
             hasUpdate: item.hasUpdate,
+            outcome: itemOutcome,
           },
         });
       } else if (item.detectStatus === DETECT_STATUS.DEFERRED) {
-        // 限流/暂时性：标成 skipped 而不是 failed —— 这不是失败，是「稍后再来」
+        // 限流/暂时性：标成 skipped 而不是 failed —— 这不是失败，是「稍后再来」。
+        // 修改点（状态显示不一致修复）：用 meta.outcome 说明「延迟重试」，
+        // 任务详情据此显示「已延迟重试」而不是笼统的「跳过」，
+        // 与仓库管理页显示的延迟状态一致
         itemResults.push({
           kind: "repo",
           label,
           status: "skipped",
           message: `${describeErrorKind(item.errorKind || "")}，已安排 ${item.retryAt} 重检`,
-          meta: { refType: item.refType, ref: item.ref, errorKind: item.errorKind, retryAt: item.retryAt },
+          meta: {
+            refType: item.refType,
+            ref: item.ref,
+            errorKind: item.errorKind,
+            retryAt: item.retryAt,
+            outcome: REPO_OUTCOME.DEFERRED,
+          },
         });
       } else {
         itemResults.push({
@@ -248,7 +296,12 @@ export class RepoBackupCheckTaskHandler implements TaskHandler {
           label,
           status: "failed",
           error: item.error || "检测失败",
-          meta: { refType: item.refType, ref: item.ref, errorKind: item.errorKind },
+          meta: {
+            refType: item.refType,
+            ref: item.ref,
+            errorKind: item.errorKind,
+            outcome: REPO_OUTCOME.FAILED,
+          },
         });
       }
     }
@@ -316,6 +369,52 @@ export class RepoBackupCheckTaskHandler implements TaskHandler {
       await deferRepositoryBackupSchedule(db, repoRow.id, deferRetryAt);
     }
 
+    /**
+     * 修改点（备份历史缺记录）：本次是「备份尝试」但一个引用都没能备份时，补一条留痕。
+     *
+     * 触发条件 two 者同时成立：
+     *   · createBackup === true —— 这一轮是备份链路（定时检测 / 手动「立即备份」），
+     *     而不是只读的「检查更新」。只读检查不该往备份历史里写东西。
+     *   · 没有任何引用进入备份候选，且确实发生了延迟/失败 —— 也就是说这一轮
+     *     本该备份却没备份成。
+     *
+     * 不补这条记录会怎样（用户实际遇到的）：任务列表里明明有一条「跳过」，
+     * 点开该仓库的「历史」却空空如也（只有以前的成功/失败记录），
+     * 用户无法核对这次尝试到底发生了什么、下次什么时候重试。
+     */
+    if (createBackup && backupCandidates.length === 0 && (outcome.deferredCount > 0 || outcome.errorCount > 0)) {
+      const deferred = outcome.deferredCount > 0;
+      const reason =
+        detectResults.find((r) => r.error)?.error ||
+        `${describeErrorKind(outcome.deferredKind || "")}，上游暂时不可用`;
+      const summary = deferred
+        ? `本次未能完成，${outcome.deferredCount} 个引用因${describeErrorKind(outcome.deferredKind || "")}已安排 ${
+            deferRetryAt || "稍后"
+          } 自动重试：${reason}`
+        : `${outcome.errorCount} 个引用检测失败，未能备份：${reason}`;
+
+      try {
+        await codeRepo.createBackup({
+          id: generateId("bk"),
+          repository_id: repoRow.id,
+          ref_type: String(repoRow.track_mode || "branch") === "branch" ? "branch" : "tag",
+          ref: null,
+          // 占位 commit_sha：这一轮根本没解析到版本；DTO 读取时会还原为 null
+          commit_sha: buildUnresolvedCommitSha(),
+          version: null,
+          // 延迟写 deferred（非失败），其余情况才是 failed
+          status: deferred ? "deferred" : "failed",
+          job_id: job.jobId,
+          error_message: summary,
+          started_at: new Date().toISOString(),
+          finished_at: new Date().toISOString(),
+        });
+      } catch (error: any) {
+        // 留痕写不进去不该让检测任务失败：检测本身已经完成、状态也已落库
+        console.warn("[RepoBackupCheckTaskHandler] 写入未完成留痕出错:", error?.message || error);
+      }
+    }
+
     // 仓库级字段降级为「聚合展示」：逐引用的真实状态在 repo_detect_states 里，
     // 这里只写一个最近检测时间给列表页用。last_error 仅在**全部**引用都永久失败时才写，
     // 避免「一个分支打错字」把整个仓库标红
@@ -371,8 +470,21 @@ function buildSummary(params: {
         ? `${what}，已创建备份作业`
         : `${what}${params.createBackup ? "（创建备份作业失败）" : "（本次不自动备份）"}`,
     );
+  } else if (params.detected > 0 && params.errors === params.detected) {
+    // 全部引用都检测失败：不能再说「没有新版本」，那会把失败伪装成成功
+    parts.push("检测未成功，无法判断是否有新版本");
+  } else if (params.deferred > 0 && params.deferred + params.errors >= params.detected) {
+    // 本轮一个引用都没查成功（全是限流或失败）：同样不能说「已是最新」——
+    // 我们根本不知道是不是最新。这类情况属于「已安排重检」，不是成功结论。
+    parts.push("本轮没有拿到有效检测结果，已安排重检");
   } else {
-    parts.push("没有新版本，未创建备份作业");
+    /**
+     * 修改点（状态显示不一致修复 + 无更新反馈）：
+     * 明确表达「检查完成且已是最新」，这是一个成功结果。
+     * 原来的「没有新版本，未创建备份作业」既没说「完成」，也没说「已是最新」，
+     * 用户点完按钮后分不清是「确实没问题」还是「检查根本没跑」。
+     */
+    parts.push("检查完成，当前已是最新版本，无需备份");
   }
 
   if (params.deferred > 0) parts.push(`${params.deferred} 个引用因上游限流/抽风已安排重检`);

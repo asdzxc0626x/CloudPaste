@@ -20,6 +20,13 @@ import { deferRepositoryBackupSchedule } from "../../../../repobackup/schedule.j
 // 修改点（第 4 期）：备份成功后推进该引用在 repo_detect_states 里的「已备份水位」，
 // 否则下一轮检测仍会认为有更新，同一个版本会被反复备份
 import { advanceBackedUpWatermark } from "../../../../repobackup/detect.js";
+/**
+ * 修改点（状态显示不一致修复）：条目的「状态」与「结果」分开表达。
+ * itemResult.status 仍是任务系统的通用条目状态（pending/processing/success/failed/skipped），
+ * 它决定进度条与统计；itemResult.meta.outcome 用统一词汇说明「这次到底怎么样」
+ * （up_to_date / deferred / partial / failed …），任务列表与仓库管理页共用同一套取值。
+ */
+import { REPO_OUTCOME } from "../../../../repobackup/status.js";
 
 /**
  * 代码仓库备份任务（修改点：新增功能）
@@ -77,10 +84,12 @@ type RepoBackupPayload = {
   refs?: RepoBackupResolvedRef[];
 };
 
+// 修改点（状态显示不一致修复）：条目状态与「结果」分开表达，
+// 统一词汇从 repobackup/status.js 引入（见文件头的 import 说明）。
 /** 单个跟踪引用（分支）的备份结果 */
 type RefOutcome = {
   ref: string | null;
-  status: "success" | "partial" | "failed" | "skipped";
+  status: "success" | "partial" | "failed" | "skipped" | "deferred";
   error?: string;
   sizeBytes?: number | null;
   primaryPath?: string | null;
@@ -383,7 +392,11 @@ export class RepoBackupTaskHandler implements TaskHandler {
           processedItems,
           successCount: outcomes.filter((o) => o.status === "success").length,
           failedCount: outcomes.filter((o) => o.status === "failed").length,
-          skippedCount: outcomes.filter((o) => o.status === "skipped").length,
+          // 修改点（状态显示不一致修复）：被延迟重试的引用**不算失败**，
+          // 与「跳过」一起计入 skippedCount，进度条的口径与修复前一致（不产生视觉回归）；
+          // 同时单独给出 deferredCount，让详情能区分「无需备份」和「已安排重试」
+          skippedCount: outcomes.filter((o) => o.status === "skipped" || o.status === "deferred").length,
+          deferredCount: outcomes.filter((o) => o.status === "deferred").length,
           itemResults,
           totalBytes,
           bytesTransferred,
@@ -484,11 +497,13 @@ export class RepoBackupTaskHandler implements TaskHandler {
             });
 
         // 修改点（详情完善）：targets 记录每个目标的写入结果，供任务详情逐条展示
+        // 修改点（状态显示不一致修复）：新增 "deferred" —— 目标撞上限流时既不能记
+        // success 也不能记 failed，它属于「本次没写成，已安排重试」
         const targetSummaries: Array<{
           mountId: string;
           name: string | null;
           mountPath: string | null;
-          status: "pending" | "processing" | "success" | "failed" | "skipped";
+          status: "pending" | "processing" | "success" | "failed" | "skipped" | "deferred";
           sizeBytes?: number | null;
           error?: string | null;
         }> = mounts.map((m) => ({
@@ -545,9 +560,19 @@ export class RepoBackupTaskHandler implements TaskHandler {
                 version.refType,
                 version.ref ?? trackRef ?? null,
                 version.commitSha,
+                // 修改点（正常跳过时的状态一致性）：这次跳过恰好证明了
+                // 「当前版本就是已备份的那个版本」，把它记成一次成功检测，
+                // 仓库管理页才会和任务列表一样显示「已是最新」而不是「成功完成」
+                { markDetected: true },
               );
 
               itemResult.status = "skipped";
+              // 修改点（状态显示不一致修复）：这是「已是最新、无需备份」，属于成功结果，
+              // 不是失败；用统一词汇标出来，前端据此显示「已是最新」而不是红字
+              itemResult.meta = {
+                ...(itemResult.meta || {}),
+                outcome: REPO_OUTCOME.UP_TO_DATE,
+              };
               itemResult.message = `已存在该版本的备份（${version.version}），跳过`;
               itemResult.durationMs = Date.now() - refStartedMs;
               outcomes.push({ ref: version.ref ?? trackRef ?? null, status: "skipped" });
@@ -767,8 +792,10 @@ export class RepoBackupTaskHandler implements TaskHandler {
             const message = String(targetError?.message || targetError || "未知错误");
 
             // 修改点（第 2 期 错误分类）：先判断这个目标的失败是不是「限流 / 暂时性」。
-            // 是的话本轮不能以失败收尾——目标行记 skipped（而不是 failed），
+            // 是的话本轮不能以失败收尾——目标行记 deferred（而不是 failed），
             // 并记下重试时间，由本轮收尾统一把延迟交给调度层。
+            // 修改点（状态显示不一致修复）：这里原先写 skipped，与「无需备份」混为一谈，
+            // 前端两个页面各自解读成「跳过」和「失败」。改用独立的 deferred。
             const targetDeferral = noteDeferral(targetError);
             if (targetDeferral && !refDeferral) refDeferral = targetDeferral;
 
@@ -779,7 +806,7 @@ export class RepoBackupTaskHandler implements TaskHandler {
             );
 
             if (targetSummary) {
-              targetSummary.status = targetDeferral ? "skipped" : "failed";
+              targetSummary.status = targetDeferral ? "deferred" : "failed";
               targetSummary.error = targetDeferral ? `已安排自动重试：${message}` : message;
             }
 
@@ -789,7 +816,7 @@ export class RepoBackupTaskHandler implements TaskHandler {
                 backup_id: backupId,
                 mount_id: mount.id,
                 mount_path: mount.mount_path,
-                status: targetDeferral ? "skipped" : "failed",
+                status: targetDeferral ? "deferred" : "failed",
                 error_message: message,
               })
               .catch((e: any) =>
@@ -825,9 +852,11 @@ export class RepoBackupTaskHandler implements TaskHandler {
 
           // 修改点（第 2 期 延迟重试）：写入阶段撞上限流/暂时性故障时不算失败。
           // 记录必须离开 running（否则会挡住下一次定时备份），但绝不能写 failed，
-          // 于是记 skipped，并在 error_message 里带上自动重试时间。
+          // 于是记 deferred，并在 error_message 里带上自动重试时间。
+          // 修改点（状态显示不一致修复）：原先是 skipped —— 与「无需备份」共用一个值，
+          // 前端只能靠猜，任务列表显示「跳过」而仓库管理显示成失败。
           await codeRepo.updateBackup(backupId, {
-            status: refDeferral ? "skipped" : "failed",
+            status: refDeferral ? "deferred" : "failed",
             error_message: refDeferral
               ? `本次未能完成，已安排在 ${describeRetryAt(refDeferral.retryAtMs as number)} 自动重试：${message}`
               : message,
@@ -840,10 +869,17 @@ export class RepoBackupTaskHandler implements TaskHandler {
           } else {
             itemResult.error = message;
           }
+          // 修改点（状态显示不一致修复）：延迟重试不是失败，用统一词汇标出来，
+          // 任务详情才能把它显示成「已延迟重试」而不是笼统的「跳过」
+          itemResult.meta = {
+            ...(itemResult.meta || {}),
+            outcome: refDeferral ? REPO_OUTCOME.DEFERRED : REPO_OUTCOME.FAILED,
+            retryAt: refDeferral ? describeRetryAt(refDeferral.retryAtMs as number) : null,
+          };
           itemResult.durationMs = Date.now() - refStartedMs;
           outcomes.push({
             ref: version.ref ?? trackRef ?? null,
-            status: refDeferral ? "skipped" : "failed",
+            status: refDeferral ? "deferred" : "failed",
             error: refDeferral ? undefined : message,
           });
           if (!refDeferral && !firstError) firstError = new Error(message);
@@ -903,6 +939,9 @@ export class RepoBackupTaskHandler implements TaskHandler {
         await codeRepo.updateRepository(repoRow.id, {
           last_backup_at: finishedAt,
           last_known_commit_sha: version.commitSha,
+          // 修改点（状态显示不一致修复）：last_error 只承载**真正的失败原因**。
+          // partial 仍要带上警告（目标确实没写全），但整体成功时不再往里写东西 ——
+          // 前端只要看到这个字段非空就渲染成红色失败，往里写非失败说明会造成误读。
           last_error: backupWarning,
         });
 
@@ -933,6 +972,19 @@ export class RepoBackupTaskHandler implements TaskHandler {
         itemResult.durationMs = Date.now() - refStartedMs;
         if (backupNote) itemResult.message = backupNote;
         if (!allDone) itemResult.error = backupWarning || "部分目标写入失败";
+
+        /**
+         * 修改点（状态显示不一致修复）：统一结果词汇
+         *
+         * status 保持原样（failedCount 的统计口径不变，任务级结论也不变），
+         * 但把「结果」单独标出来给两个页面共用：partial 在仓库管理与备份历史里
+         * 都是「部分成功」（快照可用），任务详情也应该显示同一个词，而不是
+         * 一边说「部分成功」一边说「失败」。下方 error 文本仍会展示缺哪个目标。
+         */
+        itemResult.meta = {
+          ...(itemResult.meta || {}),
+          outcome: allDone ? REPO_OUTCOME.SUCCESS : REPO_OUTCOME.PARTIAL,
+        };
 
         outcomes.push({
           ref: version.ref ?? trackRef ?? null,
@@ -965,10 +1017,11 @@ export class RepoBackupTaskHandler implements TaskHandler {
 
           if (backupId) {
             // 已经建好的记录不能留在 running（会永久挡住下一次定时备份），
-            // 但绝不能写 failed —— 记 skipped，表示「本次没备份，已安排重试」
+            // 但绝不能写 failed —— 记 deferred，表示「本次没备份，已安排重试」
+            // 修改点（状态显示不一致修复）：原先是 skipped，与「无需备份」共用同一个值
             await codeRepo
               .updateBackup(backupId, {
-                status: "skipped",
+                status: "deferred",
                 error_message: `本次未能完成，已安排在 ${retryAtText} 自动重试：${message}`,
                 finished_at: nowIso(),
               })
@@ -976,14 +1029,45 @@ export class RepoBackupTaskHandler implements TaskHandler {
                 console.warn("[RepoBackupTaskHandler] 更新延迟记录失败:", e?.message || e),
               );
           }
-          // 解析版本阶段就延迟时，原本会补一条失败留痕（见下方 else 分支）。
-          // 这里刻意不写任何记录：限流不是失败，写进备份历史只会污染它。
+          // 修改点（备份历史缺记录）：解析版本阶段就延迟时，原先**一条记录都不写**
+          // （当时的理由是「写进备份历史只会污染它」—— 那是只有 failed/skipped 两种
+          // 取值时的取舍）。结果是任务列表里明明有「跳过」，点开该仓库的备份历史
+          // 却什么都没有，用户无法核对「这次到底有没有尝试过备份」。
+          // 现在 deferred 是一个独立且明确的非失败状态，补一条留痕才说得通：
+          // 它记录的是「这次尝试没有产生任何快照，已安排在 X 之后重试」。
+          if (!backupId) {
+            await codeRepo
+              .createBackup({
+                id: generateId("bk"),
+                repository_id: repoRow.id,
+                ref_type: trackMode === "branch" ? "branch" : "tag",
+                ref: trackRef ?? null,
+                // 占位 commit_sha：真 sha 要等解析成功才有，DTO 读取时会还原为 null
+                commit_sha: buildUnresolvedCommitSha(),
+                version: null,
+                status: "deferred",
+                job_id: job.jobId,
+                error_message: `本次未能完成，已安排在 ${retryAtText} 自动重试：${message}`,
+                started_at: new Date(refStartedMs).toISOString(),
+                finished_at: nowIso(),
+              })
+              .catch((e: any) =>
+                console.warn("[RepoBackupTaskHandler] 写入延迟留痕记录出错:", e?.message || e),
+              );
+          }
 
           itemResult.status = "skipped";
           itemResult.message = `已延迟重试（${describeErrorKind(deferral.kind)}，重试时间 ${retryAtText}）：${message}`;
           itemResult.durationMs = Date.now() - refStartedMs;
 
-          outcomes.push({ ref: trackRef ?? null, status: "skipped", error: undefined });
+          // 修改点（状态显示不一致修复）：延迟重试不是失败，用统一词汇标出来
+          itemResult.meta = {
+            ...(itemResult.meta || {}),
+            outcome: REPO_OUTCOME.DEFERRED,
+            retryAt: retryAtText,
+          };
+
+          outcomes.push({ ref: trackRef ?? null, status: "deferred", error: undefined });
 
           // 不写 last_error：限流不是这个仓库的问题，留给收尾统一写「已安排重试」的说明
           console.warn(
@@ -1028,6 +1112,12 @@ export class RepoBackupTaskHandler implements TaskHandler {
           itemResult.error = message;
           itemResult.durationMs = Date.now() - refStartedMs;
 
+          // 修改点（状态显示不一致修复）：取消是「被阻止」，真错误才是「失败」
+          itemResult.meta = {
+            ...(itemResult.meta || {}),
+            outcome: cancelled ? REPO_OUTCOME.BLOCKED : REPO_OUTCOME.FAILED,
+          };
+
           outcomes.push({
             ref: trackRef ?? null,
             status: cancelled ? "skipped" : "failed",
@@ -1066,12 +1156,17 @@ export class RepoBackupTaskHandler implements TaskHandler {
       // 仓库未启用定时备份时返回 false，这种情况下只能由管理员手动重试
       const moved = await deferRepositoryBackupSchedule(db, repoRow.id, retryAtText);
 
-      await codeRepo
-        .updateRepository(repoRow.id, { last_error: note })
-        .catch((e: any) =>
-          console.warn("[RepoBackupTaskHandler] 更新仓库延迟状态失败:", e?.message || e),
-        );
-
+      /**
+       * 修改点（状态显示不一致修复）：**不再**把这句话写进 code_repositories.last_error。
+       *
+       * last_error 的语义是「最近一次失败原因」，前端只要看到它非空就渲染成红色失败。
+       * 往里写「已安排在 X 自动重试」等于把延迟重试谎报成故障 —— 这正是
+       * 「任务列表显示跳过、仓库管理显示失败」的由来。
+       * 现在延迟这件事有自己的落点，都已经是结构化的：
+       *   · 备份记录 status='deferred' + error_message（含重试时间）
+       *   · 检测状态 detect_status='deferred' + last_error + next_detect_after
+       * 仓库级状态由 repobackup/status.js 从这些结构化数据推导，前端不再靠猜。
+       */
       console.warn(
         `[RepoBackupTaskHandler] ${repoIdentifier} 本轮被推迟：${note}` +
           `（${moved ? "已提前备份计划" : "该仓库未启用定时备份，需手动重试"}）`,
@@ -1084,7 +1179,7 @@ export class RepoBackupTaskHandler implements TaskHandler {
     await report(processed, { durationMs: Date.now() - startedMs });
 
     // 全部引用都失败时向上抛出，让任务被标记为失败（部分失败按成功结束，便于重试单条）
-    // 修改点（第 2 期）：被推迟的引用记为 skipped 而不是 failed，因此
+    // 修改点（第 2 期）：被推迟的引用记 deferred 而不是 failed，因此
     // 「整轮都是限流」不会被判成失败 —— 它已经交给调度层安排了延迟重试。
     const failedCount = outcomes.filter((o) => o.status === "failed").length;
     if (failedCount > 0 && failedCount === outcomes.length) {

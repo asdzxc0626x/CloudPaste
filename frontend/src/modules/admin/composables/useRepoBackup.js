@@ -121,10 +121,18 @@ export function useRepoBackup() {
     }
   };
 
-  /** 加载仓库列表 */
-  const loadRepositories = async () => {
+  /**
+   * 加载仓库列表
+   *
+   * 修改点（检查更新没有反馈）：新增 keepMessages 选项。
+   * 原先这个方法无条件调用 clearMessages()，而「检查更新」「启用/禁用」的成功提示
+   * 是先赋值再紧接着调用它的 —— 提示刚写上就被清掉，用户永远看不到，
+   * 于是「检查完成、已是最新」看起来像没有任何结果（失败提示同理被吞掉）。
+   * 需要保留提示的调用方传 { keepMessages: true }。
+   */
+  const loadRepositories = async (options = {}) => {
     loading.value = true;
-    clearMessages();
+    if (!options.keepMessages) clearMessages();
     try {
       const resp = await listRepositories();
       if (resp?.success) repositories.value = resp.data || [];
@@ -241,18 +249,23 @@ export function useRepoBackup() {
   const handleCheck = async (repo) => {
     clearMessages();
     markBusy(repo.id, true);
+    // 修改点（检查更新没有反馈）：结果提示必须在列表刷新**之后**再落，
+    // 否则会被 loadRepositories 的 clearMessages 吞掉（原先就是这么丢的）
+    let message = "";
     try {
       const resp = await checkRepository(repo.id);
       if (resp?.success) {
         checkResults.value = { ...checkResults.value, [repo.id]: resp.data };
-        successMessage.value = resp.message || "";
-        // 检查会回写 last_checked_at / last_error，刷新列表保持一致
-        await loadRepositories();
+        message = resp.message || "";
       }
     } catch (e) {
       notifyError(e, "admin.repoBackup.messages.checkFailed");
-      await loadRepositories();
     } finally {
+      // 检查会回写 last_checked_at / last_error，刷新列表保持一致；
+      // keepMessages=true 让上面拿到的提示能留在界面上
+      await loadRepositories({ keepMessages: true });
+      // 失败时 notifyError 已经写过 error，不要再覆盖成成功提示
+      if (message && !error.value) successMessage.value = message;
       markBusy(repo.id, false);
     }
   };

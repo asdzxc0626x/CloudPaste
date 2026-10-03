@@ -48,10 +48,73 @@ const statusClass = (status) => {
       return "bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300";
     case "skipped":
       return "bg-gray-100 text-gray-700 dark:bg-gray-700/60 dark:text-gray-300";
+    // 修改点（状态显示不一致修复）：延迟重试不是失败，用琥珀色而不是红色
+    case "deferred":
+      return "bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300";
     default:
       return "bg-gray-100 text-gray-600 dark:bg-gray-700/60 dark:text-gray-400";
   }
 };
+
+// ==================== 统一状态（修改点：状态显示不一致修复）====================
+
+/**
+ * 后端 repobackup/status.js 推出的仓库级状态，是这一列状态的唯一来源。
+ *
+ * 为什么不再直接渲染 repo.lastError：
+ *   那个字段一旦非空就被渲染成红字，而 handler 曾经把「已安排在 X 自动重试」
+ *   这类**非失败**的说明也写进去，于是仓库管理看着像失败、任务列表却显示跳过。
+ *   现在 lastError 只承载真正的失败原因，而「算不算失败」由 state.tone 决定。
+ */
+const repoState = (repo) => repo.state || { outcome: "pending", tone: "muted", message: null, retryAt: null };
+
+/** 结果色调 → 徽章配色 */
+const toneClass = (tone) => {
+  switch (tone) {
+    case "ok":
+      return "bg-green-100 text-green-800 dark:bg-green-900/40 dark:text-green-300";
+    case "info":
+      return "bg-blue-100 text-blue-800 dark:bg-blue-900/40 dark:text-blue-300";
+    case "warn":
+      return "bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300";
+    case "error":
+      return "bg-red-100 text-red-800 dark:bg-red-900/40 dark:text-red-300";
+    default:
+      return "bg-gray-100 text-gray-700 dark:bg-gray-700/60 dark:text-gray-300";
+  }
+};
+
+/** 结果文案：与任务详情共用同一套 i18n 取值，两边不会各叫一个名字 */
+const stateLabel = (repo) => {
+  const outcome = repoState(repo).outcome;
+  const key = `admin.repoBackup.outcome.${outcome}`;
+  const text = t(key);
+  return text === key ? outcome : text;
+};
+
+/**
+ * 状态详情：优先给「延迟重试时间」（可以直接本地化成当前时区），
+ * 其次才用后端给的说明文本。失败时后端说明就是失败原因。
+ */
+const stateDetail = (repo) => {
+  const state = repoState(repo);
+  if (state.retryAt) {
+    const at = formatTime(state.retryAt);
+    const retryText = t("admin.repoBackup.state.retryAt", { time: at === "-" ? state.retryAt : at });
+    return state.message ? `${retryText} · ${state.message}` : retryText;
+  }
+  return state.message || "";
+};
+
+/** 是否需要展示详情文本（正常/已是最新这类无需额外说明） */
+const stateHasDetail = (repo) => Boolean(stateDetail(repo));
+
+/**
+ * 只有真正的失败才额外展示 last_error
+ * （state.message 通常已经带了原因，但 last_error 可能来自另一条链路，
+ *   例如「部分目标写入失败」的聚合警告，这里不丢信息）
+ */
+const showLastError = (repo) => repoState(repo).tone === "error" && Boolean(repo.lastError);
 
 /** 格式化时间（修改点：站点时区一期，改用统一的 timeUtils）*/
 const formatTime = (value) => {
@@ -262,7 +325,22 @@ const scheduleFailed = (repo) => repo.schedule?.enabled === true && repo.schedul
               <div class="text-xs mt-0.5 font-mono truncate" :class="darkMode ? 'text-gray-400' : 'text-gray-500'">
                 {{ repo.repoIdentifier }}
               </div>
-              <div v-if="repo.lastError" class="text-xs mt-1 text-red-600 dark:text-red-400 break-all">
+              <!-- 状态：统一结果（修改点：状态显示不一致修复）。
+                   「已是最新 / 已延迟重试 / 已被阻止」都不是失败，颜色由 tone 决定，
+                   不再因为 last_error 非空就渲染成红字。 -->
+              <div class="mt-1 flex items-center gap-1.5 flex-wrap">
+                <span class="px-1.5 py-0.5 text-[10px] rounded font-medium" :class="toneClass(repoState(repo).tone)">
+                  {{ stateLabel(repo) }}
+                </span>
+                <span
+                  v-if="stateHasDetail(repo)"
+                  class="text-[11px] break-all"
+                  :class="repoState(repo).tone === 'error' ? 'text-red-600 dark:text-red-400' : (darkMode ? 'text-gray-400' : 'text-gray-500')"
+                >
+                  {{ stateDetail(repo) }}
+                </span>
+              </div>
+              <div v-if="showLastError(repo)" class="text-xs mt-1 text-red-600 dark:text-red-400 break-all">
                 {{ repo.lastError }}
               </div>
               <div v-if="checkSummary(repo)" class="text-xs mt-1">
@@ -489,7 +567,20 @@ const scheduleFailed = (repo) => repo.schedule?.enabled === true && repo.schedul
               <template v-else>{{ $t("admin.repoBackup.table.neverBackedUp") }}</template>
             </dd>
           </div>
-          <div v-if="repo.lastError" class="text-red-600 dark:text-red-400 break-all">{{ repo.lastError }}</div>
+          <div v-if="showLastError(repo)" class="text-red-600 dark:text-red-400 break-all">{{ repo.lastError }}</div>
+          <!-- 状态：统一结果（修改点：状态显示不一致修复），移动端与桌面端同一套判定 -->
+          <div class="flex items-center gap-1.5 flex-wrap">
+            <span class="px-1.5 py-0.5 text-[10px] rounded font-medium" :class="toneClass(repoState(repo).tone)">
+              {{ stateLabel(repo) }}
+            </span>
+            <span
+              v-if="stateHasDetail(repo)"
+              class="min-w-0 text-[11px] break-all"
+              :class="repoState(repo).tone === 'error' ? 'text-red-600 dark:text-red-400' : (darkMode ? 'text-gray-400' : 'text-gray-500')"
+            >
+              {{ stateDetail(repo) }}
+            </span>
+          </div>
 
           <!-- 备份计划（修改点：独立备份计划优化） -->
           <div class="flex gap-2">

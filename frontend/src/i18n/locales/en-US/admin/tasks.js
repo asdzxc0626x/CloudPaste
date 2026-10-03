@@ -149,6 +149,24 @@ export default {
         dispatching: 'Creating backup job',
         unknown: '-',
       },
+      /**
+       * 统一结果文案（修改点：状态显示不一致修复）
+       *
+       * 条目上除了任务系统的 status（完成/跳过/失败），还会带一个来自后端
+       * repobackup/status.js 的 meta.outcome。同一个结果在「仓库管理」和这里
+       * 必须叫同一个名字，所以两边共用同一套取值。
+       */
+      outcome: {
+        pending: 'Not backed up yet',
+        running: 'Running',
+        success: 'Completed',
+        partial: 'Partially completed',
+        up_to_date: 'Already up to date, nothing to back up',
+        update_available: 'New version available to back up',
+        deferred: 'Retry scheduled',
+        blocked: 'Blocked',
+        failed: 'Failed',
+      },
     },
 
     fileStatus: {

@@ -238,10 +238,12 @@ export class CodeRepositoryRepository extends BaseRepository {
     const keep = Number.isFinite(Number(keepCount)) ? Math.max(0, Math.trunc(Number(keepCount))) : 0;
 
     // LIMIT -1 OFFSET n = 跳过最新的 n 条、取余下全部（SQLite / D1 均支持）
+    // 修改点（状态显示不一致修复）：'deferred'（限流延迟重试）同样没有产生可用快照，
+    // 一并计入这里限量清理，否则被限流的记录会无限增长
     const sql = `
       SELECT * FROM ${DbTables.CODE_REPOSITORY_BACKUPS}
       WHERE repository_id = ?
-        AND status IN ('failed', 'skipped')
+        AND status IN ('failed', 'skipped', 'deferred')
       ORDER BY created_at DESC
       LIMIT -1 OFFSET ?
     `;

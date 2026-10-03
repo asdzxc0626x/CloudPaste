@@ -51,6 +51,14 @@ export interface TaskStats {
   successCount: number;
   failedCount: number;
   skippedCount: number;
+  /**
+   * 被延迟重试的条目数（修改点：状态显示不一致修复）
+   *
+   * 与 skippedCount 的关系：deferred 也计入 skippedCount（两者都不是失败，
+   * 进度条的口径保持不变），单独再记一份是为了让「无需备份」与
+   * 「限流已安排重试」在任务详情里能被区分开 —— 它们是完全不同的两件事。
+   */
+  deferredCount?: number;
   totalBytes?: number;         // 总字节数 (用于进度计算)
   bytesTransferred?: number;   // 已传输字节数
   itemResults?: ItemResult[];  // 每个文件的处理结果

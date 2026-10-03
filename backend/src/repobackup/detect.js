@@ -447,9 +447,12 @@ export async function prepareDetectRound({ codeRepo, repoRow, maxRefs = DETECT_M
  * @param {string} refType 'branch' | 'tag'
  * @param {string|null} ref
  * @param {string} commitSha 刚刚备份成功的 commit
+ * @param {{ markDetected?: boolean }} [options]
+ *        markDetected=true 时同时把该引用记为「检测成功且水位一致」
+ *        （修改点：正常跳过时的状态一致性）
  * @returns {Promise<boolean>}
  */
-export async function advanceBackedUpWatermark(codeRepo, repositoryId, refType, ref, commitSha) {
+export async function advanceBackedUpWatermark(codeRepo, repositoryId, refType, ref, commitSha, options = {}) {
   if (!codeRepo || !repositoryId || !commitSha) return false;
   const nowIso = new Date().toISOString();
   // refType 进来时已经是 'branch' | 'tag'，这里只做一次兜底归一
@@ -458,12 +461,38 @@ export async function advanceBackedUpWatermark(codeRepo, repositoryId, refType, 
 
   await codeRepo.ensureDetectStates(repositoryId, [{ refType: normalizedType, ref: normalizedRef }]);
 
-  return await codeRepo.updateDetectState(repositoryId, normalizedType, normalizedRef, {
+  const patch = {
     backed_up_commit_sha: String(commitSha),
     backed_up_at: nowIso,
     // 水位推进后这个引用就「无更新」了，连续无更新计数从 1 开始
     consecutive_unchanged_count: 1,
-  });
+  };
+
+  /**
+   * 修改点（正常跳过时的状态一致性）：markDetected 额外把这次解析到的版本
+   * 记成一次成功的检测。
+   *
+   * 只在「备份任务发现该 commit 已有完整副本而跳过」时使用。那种情况下我们
+   * 确实知道当前版本是什么（来自已解析的 refs 或刚刚的解析）且它已经备份过了，
+   * 这正是 detect_status='ok' + commit 水位 = 已备份水位 的含义。
+   * 不记的话该引用的状态会停在 pending，仓库管理页就只能显示「成功完成」，
+   * 而任务列表显示「已是最新，无需备份」—— 两处又不一致了。
+   *
+   * 刻意不重算 next_detect_after：检测节奏由检测链路决定，
+   * 备份链路不该顺手改动它（保持原有 next_detect_after）。
+   */
+  if (options.markDetected) {
+    patch.detect_status = DETECT_STATUS.OK;
+    patch.commit_sha = String(commitSha);
+    patch.last_detect_at = nowIso;
+    patch.last_success_detect_at = nowIso;
+    // 既然确认已备份，之前的错误/延迟痕迹就该清掉
+    patch.last_error = null;
+    patch.last_error_kind = null;
+    patch.consecutive_error_count = 0;
+  }
+
+  return await codeRepo.updateDetectState(repositoryId, normalizedType, normalizedRef, patch);
 }
 
 export default {

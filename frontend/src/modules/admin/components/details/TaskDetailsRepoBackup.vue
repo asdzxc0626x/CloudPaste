@@ -87,9 +87,9 @@
               <div class="flex items-center gap-1.5 flex-wrap">
                 <span
                   class="px-2 py-0.5 rounded-full text-[11px] font-medium flex-shrink-0"
-                  :class="statusBadgeClass(item.status)"
+                  :class="statusBadgeClass(itemStatusKey(item))"
                 >
-                  {{ statusText(item.status) }}
+                  {{ itemStatusText(item) }}
                 </span>
                 <span class="text-sm font-medium text-gray-900 dark:text-gray-100 break-all">
                   {{ item.label }}
@@ -141,14 +141,16 @@
           <!-- 该引用的错误 / 提示 -->
           <div
             v-if="item.error"
-            class="mt-2 flex items-start gap-1.5 px-2 py-1.5 rounded text-[11px] bg-red-50 dark:bg-red-900/30 text-red-600 dark:text-red-300"
+            class="mt-2 flex items-start gap-1.5 px-2 py-1.5 rounded text-[11px]"
+            :class="itemMessageClass(item)"
           >
             <IconExclamation class="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
             <span class="break-words">{{ item.error }}</span>
           </div>
           <div
             v-else-if="item.message"
-            class="mt-2 flex items-start gap-1.5 px-2 py-1.5 rounded text-[11px] bg-gray-50 dark:bg-gray-900/40 text-gray-600 dark:text-gray-300"
+            class="mt-2 flex items-start gap-1.5 px-2 py-1.5 rounded text-[11px]"
+            :class="itemMessageClass(item)"
           >
             <span class="break-words">{{ item.message }}</span>
           </div>
@@ -218,15 +220,73 @@ const stageText = computed(() => {
 
 const itemTargets = (item) => (Array.isArray(item?.meta?.targets) ? item.meta.targets : [])
 
+/**
+ * 条目展示用的「结果」（修改点：状态显示不一致修复）
+ *
+ * 后端每个条目除了任务系统的 status，还会带一个来自 repobackup/status.js 的
+ * meta.outcome。有 outcome 时以它为准，因为 status 是通用于所有任务的粗粒度值：
+ *   · 「无需备份（已是最新）」与「限流已安排重试」在后端都是 skipped，
+ *     但它们是两件完全不同的事
+ *   · partial（部分目标写成功）在 status 上记 failed，可它并不是彻底失败
+ * 没有 outcome 的老任务回落到 status，显示不受影响。
+ */
+const OUTCOME_TO_STATUS = {
+  pending: 'pending',
+  running: 'processing',
+  success: 'success',
+  partial: 'partial',
+  up_to_date: 'skipped',
+  update_available: 'success',
+  deferred: 'deferred',
+  blocked: 'skipped',
+  failed: 'failed',
+}
+
+/** 条目最终用于着色的状态键 */
+const itemStatusKey = (item) => {
+  const outcome = item?.meta?.outcome
+  return (outcome && OUTCOME_TO_STATUS[outcome]) || item?.status || 'pending'
+}
+
+/** 条目最终用于显示的文案：outcome 有专门的名字就用它 */
+const itemStatusText = (item) => {
+  const outcome = item?.meta?.outcome
+  if (outcome) {
+    const key = `admin.tasks.repoBackup.outcome.${outcome}`
+    const text = t(key)
+    if (text !== key) return text
+  }
+  return statusText(item?.status)
+}
+
 const statusText = (status) => {
   const map = {
     success: t('admin.tasks.fileStatus.success'),
     processing: t('admin.tasks.fileStatus.processing'),
     failed: t('admin.tasks.fileStatus.failed'),
     skipped: t('admin.tasks.fileStatus.skipped'),
-    pending: t('admin.tasks.fileStatus.pending')
+    pending: t('admin.tasks.fileStatus.pending'),
+    // 修改点（状态显示不一致修复）：备份目标被限流时是「已延迟重试」，
+    // 不能复用通用的「跳过」，也不要落到未翻译的原始值上
+    deferred: t('admin.tasks.repoBackup.outcome.deferred')
   }
   return map[status] || status || '-'
+}
+
+/**
+ * 条目错误块的配色（修改点：状态显示不一致修复）
+ * deferred / partial 都会带一段说明文字，但它们不是「失败」，
+ * 一律涂红会让用户把「稍后重试」读成「坏了」。
+ */
+const itemMessageClass = (item) => {
+  const key = itemStatusKey(item)
+  if (key === 'failed') {
+    return 'bg-red-50 dark:bg-red-900/30 text-red-600 dark:text-red-300'
+  }
+  if (key === 'partial' || key === 'deferred') {
+    return 'bg-amber-50 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300'
+  }
+  return 'bg-gray-50 dark:bg-gray-900/40 text-gray-600 dark:text-gray-300'
 }
 
 const statusBadgeClass = (status) => {
@@ -235,7 +295,10 @@ const statusBadgeClass = (status) => {
     processing: 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300',
     failed: 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300',
     skipped: 'bg-yellow-100 text-yellow-700 dark:bg-yellow-900/40 dark:text-yellow-300',
-    pending: 'bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-400'
+    pending: 'bg-gray-100 text-gray-600 dark:bg-gray-700 dark:text-gray-400',
+    // 修改点（状态显示不一致修复）：部分成功 / 已延迟重试都不是失败，用琥珀色
+    partial: 'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300',
+    deferred: 'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300'
   }
   return map[status] || map.pending
 }
@@ -246,7 +309,9 @@ const targetDotClass = (status) => {
     processing: 'bg-blue-500 animate-pulse',
     failed: 'bg-red-500',
     skipped: 'bg-yellow-500',
-    pending: 'bg-gray-400'
+    pending: 'bg-gray-400',
+    // 修改点（状态显示不一致修复）：目标被延迟时不是写入失败
+    deferred: 'bg-amber-500'
   }
   return map[status] || map.pending
 }
