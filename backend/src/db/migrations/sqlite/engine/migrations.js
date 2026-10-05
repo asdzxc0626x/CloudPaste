@@ -25,6 +25,9 @@ import {
   addSiteSettings,
   createDefaultGuestApiKey,
 } from "./seed.js";
+// 修改点（第 5 期 错峰调度）：重新分散存量备份计划的执行时间，
+// 算法与运行期共用（零依赖模块，不反向依赖服务层）
+import { planFirstRunAtIso } from "../../../../repobackup/staggering.js";
 
 /**
  * SQLite/D1 迁移辅助函数（legacy）
@@ -329,6 +332,100 @@ export async function migrateRepoDetectStates(db) {
   const changes = result?.meta?.changes ?? result?.changes ?? 0;
   console.log(`版本38：从既有备份记录回填了 ${changes} 条检测状态（已备份水位）`);
   return { ok: true, created: changes };
+}
+
+/**
+ * 重新分散存量仓库备份计划的执行时间（修改点：第 5 期 错峰调度）
+ *
+ * 为什么必须做这一步：
+ *   v37 回填存量仓库的备份计划时，所有仓库用的是**同一个** firstRunAt
+ *   （now + 默认间隔），而运行期推进又是 `now + intervalSec`，
+ *   于是这些仓库永远在同一时刻到期、同一瞬间一起请求 GitHub。
+ *   只改新建/更新路径的抖动，救不了这些已经对齐的历史行 —— 必须重排一次。
+ *
+ * 范围严格限定（不动任何其他调度作业）：
+ *   - handler_id = 'repo_backup_schedule'（仓库备份计划）
+ *   - schedule_type = 'interval'（cron 是用户指定的具体时刻，不许抖动）
+ *   - enabled = 1（已关闭的计划不必重排）
+ *
+ * 可重入：迁移只按版本执行一次；即便被重跑，重排的结果依然是
+ * 「现在起 [50%,100%] × 间隔内」，不会累积偏移，也不会丢配置。
+ *
+ * 副作用说明：重排会把部分仓库的下次执行时间往后挪（最多挪到一个完整间隔），
+ * 这是打散对齐的代价；上限与默认间隔一致，因此没有仓库会比改动前等得更久。
+ */
+export async function redistributeRepoBackupScheduleJitter(db) {
+  const result = await db
+    .prepare(
+      `
+      SELECT task_id, interval_sec
+      FROM ${DbTables.SCHEDULED_JOBS}
+      WHERE handler_id = 'repo_backup_schedule'
+        AND schedule_type = 'interval'
+        AND enabled = 1
+        AND interval_sec IS NOT NULL
+        AND interval_sec > 0
+    `,
+    )
+    .all();
+
+  const rows = result?.results || [];
+  if (rows.length === 0) {
+    console.log("版本39：没有需要重新分散的仓库备份计划");
+    return { ok: true, updated: 0 };
+  }
+
+  // 同一个基准时刻，配合各自的随机系数，得到互不相同的下次执行时间
+  const nowMs = Date.now();
+  let updated = 0;
+
+  for (const row of rows) {
+    const nextRunAfter = planFirstRunAtIso(row.interval_sec, { nowMs });
+    if (!nextRunAfter) continue;
+
+    const updateResult = await db
+      .prepare(
+        `
+        UPDATE ${DbTables.SCHEDULED_JOBS}
+        SET next_run_after = ?
+        WHERE task_id = ?
+      `,
+      )
+      .bind(nextRunAfter, row.task_id)
+      .run();
+
+    updated += Number(updateResult?.meta?.changes ?? updateResult?.changes ?? 0) || 0;
+  }
+
+  console.log(`版本39：重新分散了 ${updated} 个仓库备份计划的执行时间`);
+  return { ok: true, updated };
+}
+
+/**
+ * 给 repo_detect_states 补 (repository_id, next_detect_after) 复合索引
+ * （修改点：第 5 期 优化 —— 数据库查询）
+ *
+ * findDueDetectStates / countDueDetectStates 的 WHERE 同时带 repository_id 与
+ * next_detect_after，而 v38 只建了单列索引 idx_repo_detect_states_due(next_detect_after)
+ * 与 idx_repo_detect_states_repo(repository_id)：单列索引只能收敛到其中一个条件，
+ * 另一个条件要靠回表后过滤。补上复合索引后，两个条件都能走索引定位。
+ *
+ * 纯索引变更，可重入（IF NOT EXISTS），不影响任何数据。
+ */
+export async function addRepoDetectStatesDueIndex(db) {
+  try {
+    await db
+      .prepare(
+        `CREATE INDEX IF NOT EXISTS idx_repo_detect_states_repo_due
+         ON ${DbTables.REPO_DETECT_STATES} (repository_id, next_detect_after)`,
+      )
+      .run();
+    console.log("版本39：已确保 repo_detect_states(repository_id, next_detect_after) 复合索引存在");
+  } catch (e) {
+    // 索引只是性能优化，建不出来不该阻断升级
+    console.warn("版本39：创建 repo_detect_states 复合索引失败（可忽略）:", e?.message || e);
+  }
+  return { ok: true };
 }
 
 export async function addTableField(db, tableName, fieldName, fieldDefinition) {
@@ -1081,6 +1178,22 @@ export async function runLegacyMigrationByVersion(db, version) {
         await migrateRepoDetectStates(db);
       } catch (e) {
         console.warn("版本38：创建/回填检测状态失败（可忽略，首次检测时会自动建行）:", e?.message || e);
+      }
+      break;
+    }
+
+    // 修改点（第 5 期 错峰调度 + 数据库查询优化）
+    case 39: {
+      console.log("版本39：重新分散存量仓库备份计划的执行时间，并补 repo_detect_states 复合索引...");
+      try {
+        await redistributeRepoBackupScheduleJitter(db);
+      } catch (e) {
+        console.warn("版本39：重新分散备份计划失败（可忽略，保存仓库时会重新排布）:", e?.message || e);
+      }
+      try {
+        await addRepoDetectStatesDueIndex(db);
+      } catch (e) {
+        console.warn("版本39：补复合索引失败（可忽略）:", e?.message || e);
       }
       break;
     }

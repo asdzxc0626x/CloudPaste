@@ -46,6 +46,13 @@ import { prepareDetectRound, detectRefs, toDetectStateDto, resolveTrackedRefKeys
 // 修改点（状态显示不一致修复）：仓库级状态由统一的映射函数推导，
 // 两个页面读同一个来源，不再各自解释 last_error / status
 import { resolveRepositoryState, outcomeFromBackupStatus, outcomeTone, REPO_OUTCOME } from "../repobackup/status.js";
+// 修改点（第 5 期 前端状态展示）：检测 / 备份 / 调度三个维度分别推导，
+// 页面不再靠一条合并结论（或旧备份记录）猜当前状态
+import {
+  buildDetectState,
+  buildBackupState,
+  buildScheduleState,
+} from "../repobackup/status.js";
 // 修改点（第 3 期 3-B 凭据池）：全局池的读写与视图构建
 import {
   loadGlobalPool,
@@ -205,6 +212,21 @@ function toRepositoryDto(row, extra = {}) {
   const targetMountIds = resolveTargetMountIds(row);
   const enabled = row.enabled === 1 || row.enabled === true;
 
+  /**
+   * 修改点（第 5 期 前端状态展示）：把「进行中的作业」按类型拆开，
+   * 并据此推导出检测 / 备份 / 调度三个互相独立的维度。
+   * 兼容：调用方只给了 activeJobCount 时，沿用改动前的口径（全部按备份作业处理）。
+   */
+  const latestBackup = extra.latestBackup || null;
+  const detectStates = extra.detectStates || [];
+  const schedule = extra.schedule || null;
+  const activeCheckCount = Number(extra.activeCheckCount) || 0;
+  const activeBackupCount = Number(extra.activeBackupCount) || 0;
+  const activeJobCount =
+    extra.activeJobCount === undefined || extra.activeJobCount === null
+      ? activeCheckCount + activeBackupCount
+      : Number(extra.activeJobCount) || 0;
+
   return {
     id: row.id,
     provider: row.provider,
@@ -235,36 +257,71 @@ function toRepositoryDto(row, extra = {}) {
      */
     state: resolveRepositoryState({
       enabled,
-      latestBackup: extra.latestBackup || null,
-      detectStates: extra.detectStates || [],
-      activeJobCount: Number(extra.activeJobCount) || 0,
+      latestBackup,
+      detectStates,
+      activeJobCount,
+      activeCheckCount,
+      activeBackupCount,
     }),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
     ...extra,
+    /**
+     * 修改点（第 5 期 前端状态展示）：三个维度放在 ...extra 之后，
+     * 保证归一化后的值不会被调用方传入的 undefined 覆盖。
+     *
+     * detectState  —— 检测维度：等待检测 / 检测中 / 无更新 / 检测到更新 / 延迟重试 / 失败
+     * backupState  —— 备份维度：备份中 / 已备份 / 部分成功 / 已跳过 / 延迟重试 / 失败
+     * scheduleState —— 调度维度：未配置 / 已关闭 / 等待下次执行 / 上次调度失败
+     *                  （唯一来源是 scheduled_jobs，不用备份历史记录冒充）
+     */
+    activeJobCount,
+    activeCheckCount,
+    activeBackupCount,
+    detectState: buildDetectState({ detectStates, activeCheckCount }),
+    backupState: buildBackupState({ latestBackup, activeBackupCount }),
+    scheduleState: buildScheduleState({ schedule }),
   };
 }
 
 /**
- * 统计某仓库当前未结束的编排作业数（修改点：状态显示不一致修复）
+ * 统计仓库当前未结束的编排作业数，并按类型拆开
+ * （修改点：状态显示不一致修复 / 第 5 期 数据库查询优化）
  *
  * 用途：把「被其他任务阻止」这一状态变得可见 —— 用户连点两次「立即备份」，
  * 第二次不会再创建新任务（该仓库已被上一个作业占住），此时仓库列表应当
  * 显示「已有任务在进行中」而不是看起来什么都没发生。
  *
+ * 修改点（第 5 期）：
+ * - 一次性批量查询，列表接口不再对每个仓库各查一次（原先 N+1）
+ * - 返回值按检测 / 备份分类：检测作业对应「检测中」，备份作业对应「备份中 / 已被阻止」
+ *
  * 失败不影响列表：这只是展示用的附加信息，查不到就按 0 处理。
+ *
+ * @param {object} codeRepo
+ * @param {string[]} repositoryIds
+ * @returns {Promise<{ check: Map<string, number>, backup: Map<string, number> }>}
  */
-async function countActiveJobs(codeRepo, repositoryId) {
+async function countActiveJobsByRepositories(codeRepo, repositoryIds) {
+  const grouped = { check: new Map(), backup: new Map() };
+  if (!Array.isArray(repositoryIds) || repositoryIds.length === 0) return grouped;
+
   try {
-    return await codeRepo.countActiveRepoJobs(
-      repositoryId,
+    const rows = await codeRepo.countActiveRepoJobsByRepositories(
+      repositoryIds,
       ["repo_backup", "repo_backup_check"],
-      // 复用「超期残留」的判定窗口，避免被杀死的任务永久占位
       Date.now() - STALE_RUNNING_BACKUP_SEC * 1000,
     );
+    for (const row of rows) {
+      if (!row?.repositoryId) continue;
+      const target = row.taskType === "repo_backup_check" ? grouped.check : grouped.backup;
+      target.set(String(row.repositoryId), Number(row.count) || 0);
+    }
+    return grouped;
   } catch (error) {
-    console.warn("[repoBackup] 统计进行中的作业失败（按 0 处理）:", error?.message || error);
-    return 0;
+    // 与单仓库版本一致：这只是展示用的附加信息，查不到就按 0 处理，不让整页失败
+    console.warn("[repoBackup] 批量统计进行中的作业失败（按 0 处理）:", error?.message || error);
+    return grouped;
   }
 }
 
@@ -366,6 +423,10 @@ export async function listRepositories(db, repositoryFactory, encryptionSecret, 
   // 修改点（第 4 期）：一次性取出全部检测状态，避免逐仓库查 repo_detect_states
   const detectStateMap = await codeRepo.findDetectStatesByRepositories(rows.map((row) => row.id));
 
+  // 修改点（第 5 期 数据库查询优化）：一次性取出全部「进行中的作业」并按类型分组，
+  // 不再逐仓库查询（原先是 N+1），同时把检测作业与备份作业区分开
+  const activeJobMap = await countActiveJobsByRepositories(codeRepo, rows.map((row) => row.id));
+
   const result = [];
   for (const row of rows) {
     const targetMountIds = resolveTargetMountIds(row);
@@ -373,6 +434,9 @@ export async function listRepositories(db, repositoryFactory, encryptionSecret, 
 
     const latestBackup = await codeRepo.findLatestBackup(row.id);
     const latestBackupTargets = latestBackup ? await codeRepo.findTargetsByBackup(latestBackup.id) : [];
+
+    const activeCheckCount = activeJobMap.check.get(String(row.id)) || 0;
+    const activeBackupCount = activeJobMap.backup.get(String(row.id)) || 0;
 
     // 备份目录：只给出第一个目标上的目录，避免列表里堆一长串路径
     const firstMount = targetMounts[0] ? mountMap.get(String(targetMountIds[0])) : null;
@@ -396,7 +460,10 @@ export async function listRepositories(db, repositoryFactory, encryptionSecret, 
         detectStates: (detectStateMap.get(String(row.id)) || []).map(toDetectStateDto),
         latestBackup: latestBackup ? toBackupDto(latestBackup, { targets: latestBackupTargets }) : null,
         // 修改点（状态显示不一致修复）：有未结束的作业 = 被其他任务占住
-        activeJobCount: await countActiveJobs(codeRepo, row.id),
+        // 修改点（第 5 期）：拆成检测 / 备份两类，分别对应「检测中」与「已被阻止」
+        activeJobCount: activeCheckCount + activeBackupCount,
+        activeCheckCount,
+        activeBackupCount,
       }),
     );
   }
@@ -429,6 +496,11 @@ export async function getRepository(db, repositoryFactory, encryptionSecret, id,
   const latestBackup = await codeRepo.findLatestBackup(row.id);
   const latestBackupTargets = latestBackup ? await codeRepo.findTargetsByBackup(latestBackup.id) : [];
 
+  // 修改点（第 5 期）：单仓库也复用批量统计，并把检测 / 备份作业数分开下发
+  const activeJobMap = await countActiveJobsByRepositories(codeRepo, [row.id]);
+  const activeCheckCount = activeJobMap.check.get(String(row.id)) || 0;
+  const activeBackupCount = activeJobMap.backup.get(String(row.id)) || 0;
+
   return toRepositoryDto(row, {
     config: await buildProviderConfigView(row.provider, row.config_json, encryptionSecret, options),
     targetMount: targetMounts[0] || null,
@@ -440,7 +512,10 @@ export async function getRepository(db, repositoryFactory, encryptionSecret, id,
     detectStates: (await codeRepo.findDetectStates(row.id)).map(toDetectStateDto),
     latestBackup: latestBackup ? toBackupDto(latestBackup, { targets: latestBackupTargets }) : null,
     // 修改点（状态显示不一致修复）：同上，详情与列表的状态来源保持一致
-    activeJobCount: await countActiveJobs(codeRepo, row.id),
+    // 修改点（第 5 期）：拆成检测 / 备份两类，详情页与列表给出同一套维度
+    activeJobCount: activeCheckCount + activeBackupCount,
+    activeCheckCount,
+    activeBackupCount,
   });
 }
 

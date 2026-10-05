@@ -9,7 +9,7 @@ import { UserType } from "../constants/index.js";
 import { jsonOk, jsonCreated } from "../utils/common.js";
 import { usePolicy } from "../security/policies/policies.js";
 import { resolvePrincipal } from "../security/helpers/principal.js";
-import { ValidationError } from "../http/errors.js";
+import { ValidationError, ConflictError } from "../http/errors.js";
 import { getEncryptionSecret } from "../utils/environmentUtils.js";
 import { MountManager } from "../storage/managers/MountManager.js";
 import { FileSystem } from "../storage/fs/FileSystem.js";
@@ -263,6 +263,21 @@ codeRepositoryRoutes.post("/api/admin/repo-backup/repositories/:id/backup", requ
   const repo = await getRepository(db, repositoryFactory, encryptionSecret, id, env);
   if (!repo.enabled) {
     throw new ValidationError("该代码仓库已禁用，请先启用后再备份");
+  }
+
+  /**
+   * 修改点（第 5 期 重复任务优化）：手动路径补上与定时路径相同的并发守卫。
+   *
+   * 定时备份由 ScheduledRepoBackupTask 挡住「上一次检测仍在进行」，手动「立即备份」
+   * 原先没有任何守卫，连点几次就会建出多个检测作业，同一仓库的 GitHub 请求叠在一起
+   * （既浪费额度，也让「当前到底在跑哪一个」变得不可知）。
+   * activeJobCount 由 getRepository 一并算出，含检测与备份两类作业；
+   * 超期残留的作业有 6 小时窗口兜底，不会永久挡住用户。
+   */
+  if (Number(repo.activeJobCount) > 0) {
+    throw new ConflictError(
+      `该仓库已有 ${repo.activeJobCount} 个任务正在进行中，请等待其结束后再试`,
+    );
   }
 
   const mountManager = new MountManager(db, encryptionSecret, repositoryFactory, { env });

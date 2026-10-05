@@ -25,6 +25,15 @@ import {
   updateScheduledJob,
   deleteScheduledJob,
 } from "../services/scheduledJobService.js";
+// 修改点（第 5 期 错峰调度）：错峰参数与首次执行时间算法放在零依赖模块里，
+// DB 迁移（v39 重新分散存量计划）与这里共用同一份实现
+import {
+  REPO_BACKUP_SCHEDULE_JITTER_RATIO,
+  REPO_BACKUP_MAX_DISPATCH_PER_TICK,
+} from "./staggering.js";
+
+// 这两个常量同时作为 schedule.js 的公共出口（调用方一直从本模块取错峰参数）
+export { REPO_BACKUP_SCHEDULE_JITTER_RATIO, REPO_BACKUP_MAX_DISPATCH_PER_TICK };
 
 /** ScheduledTaskRegistry 中的 handler ID（= scheduled_jobs.handler_id） */
 export const REPO_BACKUP_SCHEDULE_HANDLER_ID = "repo_backup_schedule";
@@ -287,12 +296,18 @@ export async function syncRepositoryScheduleJob(
       intervalSec,
       cronExpression: useCron ? cronExpression : null,
       enabled,
+      // 修改点（第 5 期 错峰调度）：interval 模式下把首次执行时间打散到
+      // [50%,100%] × 间隔，避免批量新建仓库在同一 tick 集体到期
+      firstRunJitterRatio: REPO_BACKUP_SCHEDULE_JITTER_RATIO,
       config: { repositoryId },
     });
     return await loadRepositorySchedule(db, repositoryId);
   }
 
   const patch = { config: { repositoryId } };
+  // 修改点（第 5 期 错峰调度）：计划被重置（改间隔 / 切调度方式 / 重新启用）时
+  // 同样打散；未重置时该参数会被 updateScheduledJob 忽略，不影响既有 next_run_after
+  patch.firstRunJitterRatio = REPO_BACKUP_SCHEDULE_JITTER_RATIO;
   // 调度类型变了必须提交，否则 interval/cron 互切不生效
   if (current.scheduleType !== (useCron ? "cron" : "interval")) {
     patch.scheduleType = useCron ? "cron" : "interval";
@@ -399,6 +414,9 @@ export default {
   // 修改点（第 2 期）：延迟重试相关
   RUNNING_GUARD_RETRY_DELAY_MS,
   MIN_DEFER_RETRY_DELAY_MS,
+  // 修改点（第 5 期）：错峰调度相关
+  REPO_BACKUP_SCHEDULE_JITTER_RATIO,
+  REPO_BACKUP_MAX_DISPATCH_PER_TICK,
   buildScheduleTaskId,
   buildScheduleName,
   loadAllRepositorySchedules,

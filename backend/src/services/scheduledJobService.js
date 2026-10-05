@@ -7,6 +7,8 @@ import {
 } from "../http/errors.js";
 import { scheduledTaskRegistry } from "../scheduled/ScheduledTaskRegistry.js";
 import { CronExpressionParser } from "cron-parser";
+// 修改点（第 5 期 错峰调度）：首次执行时间的分散系数算法与仓库备份侧共用
+import { resolveFirstRunFactor } from "../repobackup/staggering.js";
 
 /**
  * 计算未来若干次计划执行时间（仅用于前端可视化预览，不参与真实调度）
@@ -315,6 +317,7 @@ export async function getScheduledJob(db, taskId) {
  *   intervalSec?: number,
  *   cronExpression?: string,
  *   enabled?: boolean,
+ *   firstRunJitterRatio?: number,
    *   config?: any
  * }} payload
  */
@@ -396,8 +399,14 @@ export async function createScheduledJob(db, payload) {
     let firstNextRunIso = null;
 
     if (scheduleType === "interval") {
+      /**
+       * 修改点（第 5 期 错峰调度）：firstRunJitterRatio > 0 时把首次执行时间
+       * 打散到 [1-ratio, 1] × intervalSec 内。未传（默认）时系数恒为 1，
+       * 与改动前完全一致 —— 其他调度作业（清理会话 / 用量快照 / 同步复制）不受影响。
+       */
+      const factor = resolveFirstRunFactor(payload?.firstRunJitterRatio);
       firstNextRunIso = new Date(
-        Date.now() + intervalSec * 1000,
+        Date.now() + intervalSec * 1000 * factor,
       ).toISOString();
     } else if (scheduleType === "cron") {
       const expr = CronExpressionParser.parse(cronExpression, {
@@ -471,6 +480,7 @@ export async function createScheduledJob(db, payload) {
  *   intervalSec?: number,
  *   cronExpression?: string,
  *   enabled?: boolean,
+ *   firstRunJitterRatio?: number,
  *   config?: any,
  *   name?: string,
  *   description?: string
@@ -605,8 +615,11 @@ export async function updateScheduledJob(db, taskId, payload) {
     if (shouldResetSchedule) {
       const nowIso = new Date().toISOString();
       if (nextScheduleType === "interval") {
+        // 修改点（第 5 期 错峰调度）：重置时同样打散，语义与 createScheduledJob 一致；
+        // 未传 firstRunJitterRatio 时系数为 1，保持原有行为
+        const factor = resolveFirstRunFactor(payload?.firstRunJitterRatio);
         nextRunAfter = new Date(
-          Date.now() + nextIntervalSec * 1000,
+          Date.now() + nextIntervalSec * 1000 * factor,
         ).toISOString();
       } else if (nextScheduleType === "cron") {
         const expr = CronExpressionParser.parse(nextCronExpression, {

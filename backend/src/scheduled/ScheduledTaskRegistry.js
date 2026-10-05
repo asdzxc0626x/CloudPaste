@@ -27,7 +27,8 @@ export class ScheduledTaskRegistry {
      *     options?: Array<{ value: any, label: string }>,
      *     description?: string
      *   }>,
-     *   run: (ctx: any) => Promise<void>
+     *   run: (ctx: any) => Promise<void>,
+     *   maxDispatchPerTick?: number
      * }>}
      */
     this.handlers = new Map();

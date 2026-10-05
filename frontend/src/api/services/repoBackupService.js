@@ -95,6 +95,63 @@ import { get, post, put, del } from "../client";
  * @property {string|null} [backupFolder] - 备份文件所在目录（可跳转挂载浏览器）
  * @property {RepoSchedule|null} [schedule] - 独立备份计划，null 表示未配置
  * @property {RepoBackup|null} [latestBackup]
+ * @property {RepositoryState} [state] - 仓库级合并结论（主徽章用）
+ * @property {DetectState} [detectState] - 检测维度（修改点：第 5 期 状态展示）
+ * @property {BackupState} [backupState] - 备份维度（修改点：第 5 期 状态展示）
+ * @property {ScheduleState} [scheduleState] - 调度维度，来源是 scheduled_jobs（修改点：第 5 期 状态展示）
+ * @property {Object[]} [detectStates] - 逐引用检测状态
+ * @property {number} [activeJobCount] - 未结束的作业总数（检测 + 备份）
+ * @property {number} [activeCheckCount] - 未结束的检测作业数
+ * @property {number} [activeBackupCount] - 未结束的备份作业数
+ */
+
+/**
+ * 仓库级合并结论（主徽章用，修改点：第 5 期 前端状态展示）
+ * 检测 / 备份 / 调度的细节分别在 detectState / backupState / scheduleState 里
+ * @typedef {Object} RepositoryState
+ * @property {'pending'|'running'|'success'|'partial'|'up_to_date'|'update_available'|'deferred'|'blocked'|'failed'|'detecting'} outcome
+ * @property {'ok'|'info'|'warn'|'error'|'muted'} tone
+ * @property {string|null} message
+ * @property {string|null} retryAt
+ * @property {string|null} at
+ */
+
+/**
+ * 检测维度（修改点：第 5 期 前端状态展示）
+ * @typedef {Object} DetectState
+ * @property {'pending'|'detecting'|'up_to_date'|'update_available'|'deferred'|'failed'} status
+ * @property {'ok'|'info'|'warn'|'error'|'muted'} tone
+ * @property {string|null} message
+ * @property {string|null} ref
+ * @property {string|null} retryAt
+ * @property {string|null} nextDetectAfter
+ * @property {number} updatedRefCount
+ * @property {number} trackedRefCount
+ */
+
+/**
+ * 备份维度（修改点：第 5 期 前端状态展示）
+ * @typedef {Object} BackupState
+ * @property {'pending'|'running'|'success'|'partial'|'skipped'|'deferred'|'failed'} status
+ * @property {'ok'|'info'|'warn'|'error'|'muted'} tone
+ * @property {string|null} message
+ * @property {string|null} at
+ * @property {string|null} ref
+ * @property {string|null} version
+ * @property {string|null} commitSha
+ */
+
+/**
+ * 调度维度（修改点：第 5 期 前端状态展示）
+ * 唯一来源是 scheduled_jobs，不用备份历史记录冒充
+ * @typedef {Object} ScheduleState
+ * @property {'none'|'disabled'|'waiting'|'failed'} status
+ * @property {'ok'|'info'|'warn'|'error'|'muted'} tone
+ * @property {string|null} nextRunAfter
+ * @property {string|null} lastRunStatus
+ * @property {string|null} lastRunFinishedAt
+ * @property {string|null} runtimeState
+ * @property {boolean} enabled
  */
 
 /**

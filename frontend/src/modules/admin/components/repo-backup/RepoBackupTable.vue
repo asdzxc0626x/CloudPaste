@@ -294,6 +294,65 @@ const scheduleNextRun = (repo) => {
 
 /** 上一次调度执行失败时给出提示（例如仓库被禁用、计划配置失效） */
 const scheduleFailed = (repo) => repo.schedule?.enabled === true && repo.schedule?.lastRunStatus === "failure";
+
+// ==================== 三个维度（修改点：第 5 期 前端状态展示）====================
+
+/**
+ * 检测 ≠ 备份 ≠ 调度。
+ *
+ * 主徽章（repo.state）仍然是后端给出的合并结论，但它回答不了
+ * 「检测到哪一步了」「备份到哪一步了」「下次什么时候跑」。
+ * 三个维度由后端分别由结构化数据推导后下发（repobackup/status.js）：
+ *   detectState   ← repo_detect_states + 正在运行的检测作业
+ *   backupState   ← 最近一条备份记录 + 正在运行的备份作业
+ *   scheduleState ← scheduled_jobs（不再用备份历史记录冒充调度状态）
+ * 前端只负责把 status 渲染成文案与颜色，不自己判断「算不算失败」。
+ */
+
+/** 维度取值 → 文案（键不存在时退回原值，绝不把 i18n key 直接显示出来） */
+const dimensionLabel = (namespace, status) => {
+  const key = `admin.repoBackup.${namespace}.${status}`;
+  const text = t(key);
+  return text === key ? status : text;
+};
+
+/** 检测维度：等待检测 / 检测中 / 无更新 / 检测到更新 / 延迟重试 / 失败 */
+const detectDimension = (repo) => {
+  const state = repo.detectState || { status: "pending", tone: "muted" };
+  let extra = "";
+  if (state.status === "detecting" && Number(repo.activeCheckCount) > 0) {
+    // 用上「有 N 个任务正在执行」这条既有文案，让「检测中」有可核对的依据
+    extra = t("admin.repoBackup.state.activeJobs", { count: repo.activeCheckCount });
+  } else if (state.retryAt) {
+    extra = formatTime(state.retryAt);
+  }
+  return { tone: state.tone || "muted", label: dimensionLabel("detectStatus", state.status), extra };
+};
+
+/** 备份维度：尚无备份 / 备份中 / 已备份 / 部分成功 / 已跳过 / 延迟重试 / 失败 */
+const backupDimension = (repo) => {
+  const state = repo.backupState || { status: "pending", tone: "muted" };
+  return { tone: state.tone || "muted", label: dimensionLabel("backupState", state.status), extra: "" };
+};
+
+/** 调度维度：未配置定时 / 定时已关闭 / 等待下次执行（带时间）/ 上次调度失败 */
+const scheduleDimension = (repo) => {
+  const state = repo.scheduleState;
+  if (!state) {
+    // 兼容：后端一定下发该字段，这里只是防御，避免旧数据把整页渲染坏
+    return { tone: "muted", label: t("admin.repoBackup.scheduleState.none"), extra: "" };
+  }
+  const extra =
+    state.status === "waiting" && state.nextRunAfter ? formatTime(state.nextRunAfter) : "";
+  return { tone: state.tone || "muted", label: dimensionLabel("scheduleState", state.status), extra };
+};
+
+/** 三个维度的展示行（桌面端与移动端共用同一套判定） */
+const dimensionRows = (repo) => [
+  { key: "detect", name: t("admin.repoBackup.dimension.detect"), ...detectDimension(repo) },
+  { key: "backup", name: t("admin.repoBackup.dimension.backup"), ...backupDimension(repo) },
+  { key: "schedule", name: t("admin.repoBackup.dimension.schedule"), ...scheduleDimension(repo) },
+];
 </script>
 
 <template>
@@ -383,6 +442,16 @@ const scheduleFailed = (repo) => repo.schedule?.enabled === true && repo.schedul
                 <span v-if="checkSummary(repo).deferredCount > 0" class="text-amber-600 dark:text-amber-400 ml-1">
                   {{ $t("admin.repoBackup.check.partialDeferred", { count: checkSummary(repo).deferredCount }) }}
                 </span>
+              </div>
+
+              <!-- 三个维度（修改点：第 5 期 前端状态展示）：
+                   检测 / 备份 / 调度各自独立，主徽章只给合并结论 -->
+              <div class="mt-1 flex flex-col gap-0.5 text-[11px]">
+                <div v-for="dim in dimensionRows(repo)" :key="dim.key" class="flex items-center gap-1.5 flex-wrap">
+                  <span class="shrink-0" :class="darkMode ? 'text-gray-500' : 'text-gray-400'">{{ dim.name }}</span>
+                  <span class="px-1.5 py-0.5 rounded font-medium" :class="toneClass(dim.tone)">{{ dim.label }}</span>
+                  <span v-if="dim.extra" :class="darkMode ? 'text-gray-500' : 'text-gray-400'">{{ dim.extra }}</span>
+                </div>
               </div>
             </td>
 
@@ -554,12 +623,13 @@ const scheduleFailed = (repo) => repo.schedule?.enabled === true && repo.schedul
               {{ repo.repoIdentifier }}
             </div>
           </div>
+          <!-- 主徽章（修改点：第 5 期 前端状态展示）：与桌面端保持一致，
+               用合并结论而不是「最近一条备份记录」—— 后者是历史，不是当前状态 -->
           <span
-            v-if="repo.latestBackup"
             class="shrink-0 px-1.5 py-0.5 text-[10px] rounded font-medium"
-            :class="backupBadgeClass(repo.latestBackup)"
+            :class="toneClass(repoState(repo).tone)"
           >
-            {{ backupLabel(repo.latestBackup) }}
+            {{ stateLabel(repo) }}
           </span>
         </div>
 
@@ -606,6 +676,15 @@ const scheduleFailed = (repo) => repo.schedule?.enabled === true && repo.schedul
             >
               {{ stateDetail(repo) }}
             </span>
+          </div>
+
+          <!-- 三个维度（修改点：第 5 期 前端状态展示）：移动端与桌面端同一套判定 -->
+          <div class="flex flex-col gap-0.5">
+            <div v-for="dim in dimensionRows(repo)" :key="dim.key" class="flex items-center gap-1.5 flex-wrap">
+              <span class="shrink-0" :class="darkMode ? 'text-gray-500' : 'text-gray-400'">{{ dim.name }}</span>
+              <span class="px-1.5 py-0.5 rounded font-medium" :class="toneClass(dim.tone)">{{ dim.label }}</span>
+              <span v-if="dim.extra" :class="darkMode ? 'text-gray-500' : 'text-gray-400'">{{ dim.extra }}</span>
+            </div>
           </div>
 
           <!-- 备份计划（修改点：独立备份计划优化） -->

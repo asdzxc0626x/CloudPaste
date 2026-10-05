@@ -945,6 +945,14 @@ export async function createRepoDetectStatesTable(db) {
        ON ${DbTables.REPO_DETECT_STATES}(repository_id)`,
     )
     .run();
+  // 修改点（第 5 期 数据库查询优化）：到期查询同时带 repository_id 与 next_detect_after，
+  // 单列索引只能收敛一个条件，补复合索引让两个条件都能走索引（存量库由 v39 迁移补建）
+  await db
+    .prepare(
+      `CREATE INDEX IF NOT EXISTS idx_repo_detect_states_repo_due
+       ON ${DbTables.REPO_DETECT_STATES}(repository_id, next_detect_after)`,
+    )
+    .run();
 }
 
 export async function createIndexes(db) {

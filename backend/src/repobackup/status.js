@@ -23,6 +23,9 @@
  */
 
 import { DETECT_STATUS } from "./detect.js";
+// 修改点（第 5 期 前端状态展示）：判断备份记录里的 running 是不是残留，
+// 复用备份链路的同一个超期窗口，避免两处各写一个阈值
+import { STALE_RUNNING_BACKUP_SEC } from "./schedule.js";
 
 /**
  * 统一结果
@@ -49,6 +52,15 @@ export const REPO_OUTCOME = {
   BLOCKED: "blocked",
   /** 真正失败（仓库/分支不存在、目标写入失败等），需要人工介入 */
   FAILED: "failed",
+  /**
+   * 检测作业正在执行（修改点：第 5 期 前端状态展示）
+   *
+   * 与 RUNNING 的区别：RUNNING 指的是「正在写入备份」，
+   * DETECTING 指的是「正在向 GitHub 解析版本」，此时还没有任何备份动作。
+   * 原先两者被混为一谈 —— 有检测作业时仓库显示「已被阻止」，
+   * 用户看到的是「什么都没发生」，而不是「正在检测」。
+   */
+  DETECTING: "detecting",
 };
 
 /**
@@ -69,6 +81,8 @@ const OUTCOME_TONE = {
   [REPO_OUTCOME.DEFERRED]: "warn",
   [REPO_OUTCOME.BLOCKED]: "warn",
   [REPO_OUTCOME.FAILED]: "error",
+  // 修改点（第 5 期）：检测是「正在发生」，用 info（蓝）而不是 muted
+  [REPO_OUTCOME.DETECTING]: "info",
 };
 
 /** 取结果色调；未知值按「暂无结果」处理，绝不臆断成失败 */
@@ -239,6 +253,248 @@ export function outcomeFromDetectStates(states) {
   return { outcome: REPO_OUTCOME.UP_TO_DATE, message: null, ref: null, retryAt: null };
 }
 
+// ==================== 三个维度（修改点：第 5 期 前端状态展示）====================
+
+/**
+ * 为什么要把状态拆成三个维度
+ *
+ * 原先仓库管理页只有一个合并结论（resolveRepositoryState），它把
+ * 「检测」「备份」「调度」三件事压成一个 outcome。结果是用户无法回答
+ * 「上次检测到什么时候」「备份到哪一步了」「下次什么时候跑」——
+ * 而且很容易被一条旧记录带偏（例如一条陈旧的 running 备份记录
+ * 会让仓库永远显示「进行中」）。
+ *
+ * 现在三个维度各自独立、各自由结构化数据推导，前端并列展示：
+ *   检测维度 ← repo_detect_states + 正在运行的检测作业
+ *   备份维度 ← code_repository_backups 最近一条 + 正在运行的备份作业
+ *   调度维度 ← scheduled_jobs（下次执行时间 / 上次调度结果）—— 不再用备份记录冒充
+ *
+ * 合并结论（REPO_OUTCOME）仍然保留，作为列表页的「主徽章」，
+ * 保证既有页面与既有测试的行为不变。
+ */
+
+/** 检测维度取值（仓库管理页文案：等待检测 / 检测中 / 无更新 / 检测到更新 / 延迟重试 / 失败） */
+export const DETECT_OUTCOME = {
+  PENDING: "pending",
+  DETECTING: "detecting",
+  UP_TO_DATE: "up_to_date",
+  UPDATE_AVAILABLE: "update_available",
+  DEFERRED: "deferred",
+  FAILED: "failed",
+};
+
+/** 备份维度取值（备份中 / 已备份 / 部分成功 / 已跳过 / 延迟重试 / 失败 / 尚无备份） */
+export const BACKUP_STATE = {
+  /** 还没有任何备份记录 —— 注意与「已跳过」不同，后者是确实跑过一次但无需备份 */
+  PENDING: "pending",
+  RUNNING: "running",
+  SUCCESS: "success",
+  PARTIAL: "partial",
+  SKIPPED: "skipped",
+  DEFERRED: "deferred",
+  FAILED: "failed",
+};
+
+/** 调度维度取值（未配置定时 / 定时已关闭 / 等待下次执行 / 上次调度失败） */
+export const SCHEDULE_STATE = {
+  NONE: "none",
+  DISABLED: "disabled",
+  WAITING: "waiting",
+  FAILED: "failed",
+};
+
+/** 各维度的色调（与 OUTCOME_TONE 同一套取值：ok/info/warn/error/muted） */
+const DETECT_TONE = {
+  [DETECT_OUTCOME.PENDING]: "muted",
+  [DETECT_OUTCOME.DETECTING]: "info",
+  [DETECT_OUTCOME.UP_TO_DATE]: "ok",
+  [DETECT_OUTCOME.UPDATE_AVAILABLE]: "info",
+  [DETECT_OUTCOME.DEFERRED]: "warn",
+  [DETECT_OUTCOME.FAILED]: "error",
+};
+
+const BACKUP_TONE = {
+  [BACKUP_STATE.PENDING]: "muted",
+  [BACKUP_STATE.RUNNING]: "info",
+  [BACKUP_STATE.SUCCESS]: "ok",
+  [BACKUP_STATE.PARTIAL]: "warn",
+  // 「已跳过」= 跑过了但无需备份，既不是成功快照也不是故障，用中性灰
+  [BACKUP_STATE.SKIPPED]: "muted",
+  [BACKUP_STATE.DEFERRED]: "warn",
+  [BACKUP_STATE.FAILED]: "error",
+};
+
+const SCHEDULE_TONE = {
+  [SCHEDULE_STATE.NONE]: "muted",
+  [SCHEDULE_STATE.DISABLED]: "muted",
+  [SCHEDULE_STATE.WAITING]: "info",
+  [SCHEDULE_STATE.FAILED]: "error",
+};
+
+/** 备份记录 → 备份维度取值（复用 outcomeFromBackupStatus，保证与历史抽屉同一结论） */
+function backupStateFromOutcome(outcome) {
+  switch (outcome) {
+    case REPO_OUTCOME.RUNNING:
+      return BACKUP_STATE.RUNNING;
+    case REPO_OUTCOME.SUCCESS:
+      return BACKUP_STATE.SUCCESS;
+    case REPO_OUTCOME.PARTIAL:
+      return BACKUP_STATE.PARTIAL;
+    case REPO_OUTCOME.DEFERRED:
+      return BACKUP_STATE.DEFERRED;
+    case REPO_OUTCOME.FAILED:
+      return BACKUP_STATE.FAILED;
+    case REPO_OUTCOME.UP_TO_DATE:
+      // 备份记录里没有「已是最新」这种状态，落到这里只可能是 skipped
+      return BACKUP_STATE.SKIPPED;
+    default:
+      return BACKUP_STATE.PENDING;
+  }
+}
+
+/**
+ * 这条 running 备份记录是不是「残留」
+ *
+ * 任务进程被杀 / Workers 超时都会留下永远停在 running 的记录。
+ * 不做这层判定的话，陈旧的 running 会让仓库永远显示「备份中」，
+ * 用户既看不到真实进度，也等不到它结束。
+ */
+function isStaleRunningBackup(record) {
+  if (String(record?.status || "") !== "running") return false;
+  const ms = toMs(record?.startedAt ?? record?.createdAt ?? null);
+  /**
+   * 只有「确实能读出时间、且已经超出超期窗口」才判定为残留。
+   * 时间缺失/不可解析时保持原行为（仍视为正在运行）：
+   * code_repository_backups.created_at 是 NOT NULL，真实数据一定带时间，
+   * 而保守处理可以避免把一条信息不全的记录误判成「没在备份」。
+   */
+  if (ms === null) return false;
+  return Date.now() - ms > STALE_RUNNING_BACKUP_SEC * 1000;
+}
+
+/**
+ * 检测维度状态
+ *
+ * @param {object} params
+ * @param {Array<object>} [params.detectStates] toDetectStateDto 的结果数组
+ * @param {number} [params.activeCheckCount] 该仓库未结束的 repo_backup_check 作业数
+ * @returns {{ status: string, tone: string, message: string|null, ref: string|null, retryAt: string|null, nextDetectAfter: string|null, updatedRefCount: number, trackedRefCount: number }}
+ */
+export function buildDetectState({ detectStates = [], activeCheckCount = 0 } = {}) {
+  const list = Array.isArray(detectStates) ? detectStates.filter(Boolean) : [];
+
+  /**
+   * 「检测中」优先于上一轮的结论：作业正在跑，此刻的事实就是「正在检测」。
+   * 注意这与合并结论里的 RUNNING 不同 —— 那个说的是「正在写备份」。
+   */
+  if (Number(activeCheckCount) > 0) {
+    return {
+      status: DETECT_OUTCOME.DETECTING,
+      tone: DETECT_TONE[DETECT_OUTCOME.DETECTING],
+      message: null,
+      ref: null,
+      retryAt: null,
+      nextDetectAfter: null,
+      updatedRefCount: list.filter((item) => item.hasUpdate).length,
+      trackedRefCount: list.length,
+    };
+  }
+
+  const base = outcomeFromDetectStates(list);
+  const status = base.outcome === REPO_OUTCOME.DETECTING ? DETECT_OUTCOME.DETECTING : base.outcome;
+
+  // 最近的「下次检测时间」：给前端展示检测节奏，取最早的一个才有指导意义
+  let nextDetectAfter = null;
+  for (const item of list) {
+    const value = item.nextDetectAfter;
+    if (!value) continue;
+    if (nextDetectAfter === null || String(value) < String(nextDetectAfter)) nextDetectAfter = value;
+  }
+
+  return {
+    status,
+    tone: DETECT_TONE[status] || "muted",
+    message: base.message || null,
+    ref: base.ref ?? null,
+    retryAt: base.retryAt ?? null,
+    nextDetectAfter,
+    updatedRefCount: list.filter((item) => item.hasUpdate).length,
+    trackedRefCount: list.length,
+  };
+}
+
+/**
+ * 备份维度状态
+ *
+ * @param {object} params
+ * @param {object|null} [params.latestBackup] toBackupDto 形态的最近一条备份记录
+ * @param {number} [params.activeBackupCount] 该仓库未结束的 repo_backup 作业数
+ * @returns {{ status: string, tone: string, message: string|null, at: string|null, ref: string|null, version: string|null, commitSha: string|null }}
+ */
+export function buildBackupState({ latestBackup = null, activeBackupCount = 0 } = {}) {
+  const staleRunning = isStaleRunningBackup(latestBackup);
+  // 残留的 running 记录不参与判断（见 isStaleRunningBackup 的说明）
+  const record = staleRunning ? null : latestBackup;
+  const outcome = record ? outcomeFromBackupStatus(record.status, record) : null;
+
+  let status;
+  if (outcome === REPO_OUTCOME.RUNNING || Number(activeBackupCount) > 0) {
+    status = BACKUP_STATE.RUNNING;
+  } else if (outcome) {
+    status = backupStateFromOutcome(outcome);
+  } else {
+    status = BACKUP_STATE.PENDING;
+  }
+
+  return {
+    status,
+    tone: BACKUP_TONE[status] || "muted",
+    message: record?.errorMessage || null,
+    at: record?.finishedAt ?? record?.startedAt ?? record?.createdAt ?? null,
+    ref: record?.ref ?? null,
+    version: record?.version ?? null,
+    commitSha: record?.commitSha ?? null,
+  };
+}
+
+/**
+ * 调度维度状态（唯一来源是 scheduled_jobs，不用任何备份历史记录冒充）
+ *
+ * @param {{ schedule?: object|null }} params schedule 来自 loadRepositorySchedule / loadAllRepositorySchedules
+ * @returns {{ status: string, tone: string, nextRunAfter: string|null, lastRunStatus: string|null, lastRunFinishedAt: string|null, runtimeState: string|null, enabled: boolean }}
+ */
+export function buildScheduleState({ schedule = null } = {}) {
+  if (!schedule) {
+    return {
+      status: SCHEDULE_STATE.NONE,
+      tone: SCHEDULE_TONE[SCHEDULE_STATE.NONE],
+      nextRunAfter: null,
+      lastRunStatus: null,
+      lastRunFinishedAt: null,
+      runtimeState: null,
+      enabled: false,
+    };
+  }
+
+  const enabled = Boolean(schedule.enabled);
+  let status = SCHEDULE_STATE.WAITING;
+  if (!enabled) {
+    status = SCHEDULE_STATE.DISABLED;
+  } else if (String(schedule.lastRunStatus || "") === "failure") {
+    status = SCHEDULE_STATE.FAILED;
+  }
+
+  return {
+    status,
+    tone: SCHEDULE_TONE[status] || "muted",
+    nextRunAfter: schedule.nextRunAfter ?? null,
+    lastRunStatus: schedule.lastRunStatus ?? null,
+    lastRunFinishedAt: schedule.lastRunFinishedAt ?? null,
+    runtimeState: schedule.runtimeState ?? null,
+    enabled,
+  };
+}
+
 /**
  * 推导仓库级状态（仓库管理列表的唯一状态来源）
  *
@@ -256,12 +512,43 @@ export function outcomeFromDetectStates(states) {
  * @param {boolean} [params.enabled] 仓库是否启用
  * @param {object|null} [params.latestBackup] 最近一条备份记录（toBackupDto 形态）
  * @param {Array<object>} [params.detectStates] 逐引用检测状态（toDetectStateDto 形态）
- * @param {number} [params.activeJobCount] 该仓库未结束的作业数
+ * @param {number} [params.activeJobCount] 该仓库未结束的作业数（兼容旧调用方，不区分类型）
+ * @param {number} [params.activeCheckCount] 未结束的检测作业数（修改点：第 5 期）
+ * @param {number} [params.activeBackupCount] 未结束的备份作业数（修改点：第 5 期）
  * @returns {{ outcome: string, tone: string, message: string|null, retryAt: string|null, at: string|null }}
  */
-export function resolveRepositoryState({ enabled = true, latestBackup = null, detectStates = [], activeJobCount = 0 } = {}) {
+export function resolveRepositoryState({
+  enabled = true,
+  latestBackup = null,
+  detectStates = [],
+  activeJobCount = 0,
+  activeCheckCount = null,
+  activeBackupCount = null,
+} = {}) {
+  const legacyActive = Number(activeJobCount) || 0;
+
+  /**
+   * 修改点（第 5 期 前端状态展示）：作业数按类型拆开。
+   *
+   * 只传 activeJobCount 的旧调用方行为完全不变（全部按备份作业处理 → BLOCKED）；
+   * 传了拆分值的调用方，检测作业会被识别成「检测中」而不是「已被阻止」。
+   */
+  const backupActive =
+    activeBackupCount === null || activeBackupCount === undefined
+      ? legacyActive
+      : Number(activeBackupCount) || 0;
+  const checkActive =
+    activeCheckCount === null || activeCheckCount === undefined
+      ? 0
+      : Number(activeCheckCount) || 0;
+
   const detect = outcomeFromDetectStates(detectStates);
-  const backupOutcome = latestBackup ? outcomeFromBackupStatus(latestBackup.status, latestBackup) : null;
+  /**
+   * 修改点（第 5 期）：残留的 running 备份记录不再冒充「正在进行」。
+   * 与 buildBackupState 使用同一个判定，两个入口不会给出矛盾结论。
+   */
+  const effectiveBackup = isStaleRunningBackup(latestBackup) ? null : latestBackup;
+  const backupOutcome = effectiveBackup ? outcomeFromBackupStatus(effectiveBackup.status, effectiveBackup) : null;
 
   const build = (outcome, message = null, retryAt = null, at = null) => ({
     outcome,
@@ -273,15 +560,20 @@ export function resolveRepositoryState({ enabled = true, latestBackup = null, de
 
   // 1. 正在写入
   if (backupOutcome === REPO_OUTCOME.RUNNING) {
-    return build(REPO_OUTCOME.RUNNING, null, null, latestBackup?.startedAt ?? latestBackup?.createdAt ?? null);
+    return build(REPO_OUTCOME.RUNNING, null, null, effectiveBackup?.startedAt ?? effectiveBackup?.createdAt ?? null);
   }
 
-  // 2. 已被其他任务占住（有未结束的作业，但还没进入写入阶段）
-  if (activeJobCount > 0) {
+  // 2. 已被备份任务占住（有未结束的备份作业，但还没进入写入阶段）
+  if (backupActive > 0) {
     return build(
       REPO_OUTCOME.BLOCKED,
-      `该仓库已有 ${activeJobCount} 个任务正在进行中，本次不会再创建新任务`,
+      `该仓库已有 ${backupActive} 个任务正在进行中，本次不会再创建新任务`,
     );
+  }
+
+  // 2.5 检测作业正在跑（修改点：第 5 期）：这是「检测中」，不是「被阻止」
+  if (checkActive > 0) {
+    return build(REPO_OUTCOME.DETECTING);
   }
 
   // 3. 仓库被禁用：此时说「已是最新」或「成功」都是误导
@@ -368,10 +660,17 @@ export function resolveRepositoryState({ enabled = true, latestBackup = null, de
 
 export default {
   REPO_OUTCOME,
+  // 修改点（第 5 期 前端状态展示）：三个维度的取值与推导
+  DETECT_OUTCOME,
+  BACKUP_STATE,
+  SCHEDULE_STATE,
   outcomeTone,
   isFailureOutcome,
   isSuccessOutcome,
   outcomeFromBackupStatus,
   outcomeFromDetectStates,
+  buildDetectState,
+  buildBackupState,
+  buildScheduleState,
   resolveRepositoryState,
 };

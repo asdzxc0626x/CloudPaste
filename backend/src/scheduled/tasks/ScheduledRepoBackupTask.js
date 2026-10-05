@@ -7,6 +7,8 @@ import {
   REPO_BACKUP_SCHEDULE_HANDLER_ID,
   STALE_RUNNING_BACKUP_SEC,
   RUNNING_GUARD_RETRY_DELAY_MS,
+  // 修改点（第 5 期 错峰调度）：单轮派发上限
+  REPO_BACKUP_MAX_DISPATCH_PER_TICK,
 } from "../../repobackup/schedule.js";
 
 /**
@@ -58,6 +60,16 @@ export class ScheduledRepoBackupTask {
      * @type {Array<object>}
      */
     this.configSchema = [];
+
+    /**
+     * 单个调度 tick 最多派发多少个仓库备份作业（修改点：第 5 期 错峰调度）
+     *
+     * runDueScheduledJobs 会读取这个字段做削峰：大量仓库同时到期时，
+     * 一个 tick 只创建前 N 个检测作业，其余保持到期状态留到下一 tick
+     * （按 next_run_after 升序取，等得最久的优先，因此不会饿死）。
+     * @type {number}
+     */
+    this.maxDispatchPerTick = REPO_BACKUP_MAX_DISPATCH_PER_TICK;
   }
 
   /**

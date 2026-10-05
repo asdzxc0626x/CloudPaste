@@ -76,6 +76,44 @@ export default {
       activeJobs: "有 {count} 个任务正在执行",
     },
 
+    /**
+     * 检测 / 备份 / 调度三个维度（修改点：第 5 期 前端状态展示）
+     *
+     * 为什么另起一套文案而不是复用上面的 outcome.*：
+     *   outcome.* 是「仓库级合并结论」，备份历史与任务详情也在读它；
+     *   这里是仓库管理页并列展示的三个独立维度，语义不同
+     *   （例如 up_to_date 在合并结论里叫「已是最新」，在检测维度里叫「无更新」）。
+     *   分开之后改这里不会连带影响另外两个页面。
+     */
+    dimension: {
+      detect: "检测",
+      backup: "备份",
+      schedule: "调度",
+    },
+    detectStatus: {
+      pending: "等待检测",
+      detecting: "检测中",
+      up_to_date: "无更新",
+      update_available: "检测到更新",
+      deferred: "延迟重试",
+      failed: "失败",
+    },
+    backupState: {
+      pending: "尚无备份",
+      running: "备份中",
+      success: "已备份",
+      partial: "部分成功",
+      skipped: "已跳过",
+      deferred: "延迟重试",
+      failed: "失败",
+    },
+    scheduleState: {
+      none: "未配置定时",
+      disabled: "定时已关闭",
+      waiting: "等待下次执行",
+      failed: "上次调度失败",
+    },
+
     trackMode: {
       branch: "分支 Commit",
       release: "Release / Tag",

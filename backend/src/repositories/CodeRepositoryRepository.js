@@ -619,23 +619,32 @@ export class CodeRepositoryRepository extends BaseRepository {
     if (!repositoryId || !Array.isArray(refs) || refs.length === 0) return 0;
 
     const now = new Date().toISOString();
-    let created = 0;
 
+    /**
+     * 修改点（第 5 期 数据库查询优化）：原先每个引用各执行一条 INSERT，
+     * 一个仓库跟踪 20 个分支就是 20 次数据库往返（D1 上尤其明显）。
+     * 改为单条多值 INSERT，冲突语义完全不变（仍是 DO NOTHING，不覆盖已有水位）。
+     * 引用数受 MAX_TRACK_REFS 限制，绑定参数规模安全。
+     */
+    const valuesSql = [];
+    const binds = [];
     for (const item of refs) {
       const refType = String(item?.refType || "branch");
       const ref = item?.ref === null || item?.ref === undefined ? "" : String(item.ref);
-      const sql = `
-        INSERT INTO ${DbTables.REPO_DETECT_STATES}
-          (id, repository_id, ref_type, ref, detect_status, next_detect_after, created_at, updated_at)
-        VALUES (?, ?, ?, ?, 'pending', NULL, ?, ?)
-        ON CONFLICT(repository_id, ref_type, ref) DO NOTHING
-      `;
-      const result = await this.execute(sql, [crypto.randomUUID(), repositoryId, refType, ref, now, now]);
-      const changes = result?.meta?.changes ?? result?.changes ?? 0;
-      created += Number(changes) || 0;
+      valuesSql.push("(?, ?, ?, ?, 'pending', NULL, ?, ?)");
+      binds.push(crypto.randomUUID(), repositoryId, refType, ref, now, now);
     }
 
-    return created;
+    const sql = `
+      INSERT INTO ${DbTables.REPO_DETECT_STATES}
+        (id, repository_id, ref_type, ref, detect_status, next_detect_after, created_at, updated_at)
+      VALUES ${valuesSql.join(", ")}
+      ON CONFLICT(repository_id, ref_type, ref) DO NOTHING
+    `;
+
+    const result = await this.execute(sql, binds);
+    const changes = result?.meta?.changes ?? result?.changes ?? 0;
+    return Number(changes) || 0;
   }
 
   /**
@@ -699,10 +708,13 @@ export class CodeRepositoryRepository extends BaseRepository {
    * - tasks 表就是编排作业的真相来源，status 由编排器维护（含崩溃后的终态回写），
    *   再维护一份「正在检测」的标记必然出现漂移（任务被杀 → 标记永远留着 → 该仓库再也不检测）
    * - (task_type, status) 上已有索引 idx_tasks_type_status，先按它收敛到很小的结果集，
-   *   再用 payload LIKE 过滤仓库，代价可以忽略
+   *   再用 payload 里的 repositoryId 过滤，代价可以忽略
    *
-   * payload 里的 repositoryId 由 crypto.randomUUID() 生成（只含十六进制与短横线），
-   * 不含 % 或 _，因此可以直接拼进 LIKE 而不需要转义。
+   * 修改点（第 5 期 数据库查询优化）：原先用 `payload LIKE '%"repositoryId":"<id>"%'`，
+   * 现在改为 `json_extract(payload, '$.repositoryId') = ?`：
+   * - 语义是精确取值比较，不再依赖「id 里恰好没有 % / _ 这类 LIKE 通配符」这个前提；
+   * - 可以用 `IN (...)` 一次匹配多个仓库，支撑下面的批量版本（列表页去 N+1）。
+   * `json_valid` 守卫是为了让历史脏数据（payload 不是合法 JSON）不会让整个查询报错。
    *
    * @param {string} repositoryId
    * @param {string[]} taskTypes 例如 ["repo_backup_check"]
@@ -720,11 +732,52 @@ export class CodeRepositoryRepository extends BaseRepository {
       WHERE task_type IN (${typePlaceholders})
         AND status IN ('pending', 'running')
         AND created_at >= ?
-        AND payload LIKE ?
+        AND json_valid(payload)
+        AND json_extract(payload, '$.repositoryId') = ?
     `;
-    const binds = [...types, Number(staleBeforeMs) || 0, `%"repositoryId":"${repositoryId}"%`];
+    const binds = [...types, Number(staleBeforeMs) || 0, String(repositoryId)];
     const row = await this.queryFirst(sql, binds);
     return Number(row?.count) || 0;
+  }
+
+  /**
+   * 批量统计多个仓库当前未结束的作业数（修改点：第 5 期 数据库查询优化）
+   *
+   * 背景：仓库列表接口原先对每个仓库各调一次 countActiveRepoJobs，
+   * 列表有 N 个仓库就是 N 次查询（N+1）。这里一次查完再在内存里分组。
+   *
+   * @param {string[]} repositoryIds
+   * @param {string[]} taskTypes
+   * @param {number} staleBeforeMs
+   * @returns {Promise<Array<{repositoryId: string, taskType: string, count: number}>>}
+   */
+  async countActiveRepoJobsByRepositories(repositoryIds, taskTypes, staleBeforeMs) {
+    const ids = (repositoryIds || []).filter(Boolean).map(String);
+    const types = (taskTypes || []).filter(Boolean);
+    if (ids.length === 0 || types.length === 0) return [];
+
+    const typePlaceholders = types.map(() => "?").join(", ");
+    const idPlaceholders = ids.map(() => "?").join(", ");
+    const sql = `
+      SELECT
+        json_extract(payload, '$.repositoryId') AS repository_id,
+        task_type,
+        COUNT(*) AS count
+      FROM ${DbTables.TASKS}
+      WHERE task_type IN (${typePlaceholders})
+        AND status IN ('pending', 'running')
+        AND created_at >= ?
+        AND json_valid(payload)
+        AND json_extract(payload, '$.repositoryId') IN (${idPlaceholders})
+      GROUP BY repository_id, task_type
+    `;
+    const result = await this.query(sql, [...types, Number(staleBeforeMs) || 0, ...ids]);
+    const rows = result?.results || [];
+    return rows.map((row) => ({
+      repositoryId: row.repository_id === null || row.repository_id === undefined ? null : String(row.repository_id),
+      taskType: row.task_type,
+      count: Number(row.count) || 0,
+    }));
   }
 
   /**

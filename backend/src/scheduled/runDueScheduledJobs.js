@@ -298,7 +298,8 @@ export async function updateTaskSchedule(db, row, ctx) {
  *   dueCount: number,
  *   executedCount: number,
  *   skippedCount: number,
- *   failedCount: number
+ *   failedCount: number,
+ *   throttledCount: number
  * } | void>}
  */
 export async function runDueScheduledJobs(db, env, options = {}) {
@@ -328,6 +329,7 @@ export async function runDueScheduledJobs(db, env, options = {}) {
       FROM scheduled_jobs
       WHERE enabled = 1
         AND (next_run_after IS NULL OR next_run_after <= ?)
+      ORDER BY (next_run_after IS NULL) DESC, next_run_after ASC, task_id ASC
     `,
     )
     .bind(nowIso)
@@ -340,22 +342,61 @@ export async function runDueScheduledJobs(db, env, options = {}) {
       executedCount: 0,
       skippedCount: 0,
       failedCount: 0,
+      throttledCount: 0,
     };
   }
 
-  /** @type {{ dueCount: number, executedCount: number, skippedCount: number, failedCount: number }} */
+  /**
+   * @type {{ dueCount: number, executedCount: number, skippedCount: number, failedCount: number, throttledCount: number }}
+   * throttledCount（修改点：第 5 期 错峰调度）：因 handler 的单轮派发配额用尽而
+   * 主动留给下一轮的作业数。它们既不算跳过也不算失败 —— 本轮只是没轮到它们。
+   */
   const stats = {
     dueCount: rows.length,
     executedCount: 0,
     skippedCount: 0,
     failedCount: 0,
+    throttledCount: 0,
   };
+
+  /**
+   * 按 handler 声明的「单轮派发上限」做削峰（修改点：第 5 期 错峰调度）
+   *
+   * 背景：SELECT 会把所有到期行一次性取出来。仓库备份的 handler 只负责创建
+   * 编排作业（本身很快），于是一旦有大量仓库同时到期，就会在同一个 tick 里
+   * 塞进去同等数量的版本检测作业，随后一起向 GitHub 发请求。
+   *
+   * 语义：handler 可选地声明 maxDispatchPerTick（正整数），runDueScheduledJobs
+   * 每个 tick 最多为该 handler 派发这么多个作业；未派发到的行**不更新任何字段**，
+   * 保持「已到期」，下一 tick 依据上面的 ORDER BY（next_run_after 升序，
+   * 等得最久的排最前）最先被取到 —— 只延后，不饿死。
+   *
+   * 未声明该字段的 handler 不受影响（cap 缺席即无上限）。
+   */
+  const dispatchCaps = new Map();
+  for (const row of rows) {
+    if (dispatchCaps.has(row.handler_id)) continue;
+    const meta = scheduledTaskRegistry.getHandler(row.handler_id);
+    const cap = Number(meta?.maxDispatchPerTick);
+    if (Number.isFinite(cap) && cap > 0) {
+      dispatchCaps.set(row.handler_id, Math.trunc(cap));
+    }
+  }
+  /** @type {Map<string, number>} 本 tick 各 handler 已派发的数量 */
+  const dispatchedPerHandler = new Map();
 
   for (const row of rows) {
     const taskId = row.task_id; // 作业ID（jobId）
     const handlerId = row.handler_id; // Handler ID（任务类型ID）
     const startedAt = new Date().toISOString();
     const startedMs = Date.now();
+
+    // 修改点（第 5 期 错峰调度）：配额用尽就留给下一轮（见上面 dispatchCaps 的说明）
+    const cap = dispatchCaps.get(handlerId);
+    if (cap !== undefined && (dispatchedPerHandler.get(handlerId) || 0) >= cap) {
+      stats.throttledCount += 1;
+      continue;
+    }
 
     // 2. 获取锁，避免多实例并发执行
     const acquired = await tryAcquireLock(db, taskId, nowIso, lockTimeoutSec);
@@ -399,6 +440,9 @@ export async function runDueScheduledJobs(db, env, options = {}) {
         );
       }
     }
+
+    // 修改点（第 5 期 错峰调度）：只有真正要执行的作业才占用本轮配额
+    dispatchedPerHandler.set(handlerId, (dispatchedPerHandler.get(handlerId) || 0) + 1);
 
     try {
       const handlerResult = await handler.run({

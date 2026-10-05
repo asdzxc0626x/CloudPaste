@@ -76,6 +76,42 @@ export default {
       activeJobs: "{count} jobs currently running",
     },
 
+    /**
+     * Check / backup / schedule dimensions (phase 5: status display)
+     *
+     * Kept separate from outcome.* above: outcome.* is the merged repository-level
+     * conclusion shared with the backup history and task details, while these are the
+     * three independent dimensions shown side by side on the repositories page.
+     */
+    dimension: {
+      detect: "Check",
+      backup: "Backup",
+      schedule: "Schedule",
+    },
+    detectStatus: {
+      pending: "Awaiting check",
+      detecting: "Checking",
+      up_to_date: "No update",
+      update_available: "Update detected",
+      deferred: "Retry scheduled",
+      failed: "Failed",
+    },
+    backupState: {
+      pending: "Not backed up",
+      running: "Backing up",
+      success: "Backed up",
+      partial: "Partial",
+      skipped: "Skipped",
+      deferred: "Retry scheduled",
+      failed: "Failed",
+    },
+    scheduleState: {
+      none: "No schedule",
+      disabled: "Schedule off",
+      waiting: "Next run pending",
+      failed: "Last run failed",
+    },
+
     trackMode: {
       branch: "Branch commit",
       release: "Release / Tag",
