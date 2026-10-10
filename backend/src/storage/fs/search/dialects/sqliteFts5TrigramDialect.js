@@ -5,6 +5,7 @@
  */
 
 import { DbTables } from "../../../../constants/index.js";
+import { buildPathPrefixCondition } from "../../../../utils/sqlPathPrefix.js";
 
 function normalizeQuery(q) {
   return String(q || "").trim();
@@ -35,9 +36,15 @@ function buildWhereAndBind(p) {
   // 只要传入 pathPrefix，就强制按路径前缀过滤
   if (p?.pathPrefix) {
     const prefix = String(p.pathPrefix || "").replace(/\/+$/g, "") || "/";
-    const like = prefix === "/" ? "/%" : `${prefix}/%`;
-    where.push(`e.fs_path LIKE ?`);
-    bind.push(like);
+    // 修改点（修复 D1 的 LIKE 模式 50 字符上限）：原先 `e.fs_path LIKE '<前缀>/%'`，
+    // 在深层目录里搜索时模式超过 50 字符，D1 会直接报
+    // "LIKE or GLOB pattern too complex"，整个搜索 500。
+    // 改用范围查询表达同一集合，详见 utils/sqlPathPrefix.js
+    const scope = buildPathPrefixCondition("e.fs_path", prefix);
+    if (scope) {
+      where.push(scope.sql);
+      bind.push(...scope.params);
+    }
   }
 
   if (p?.cursorObj) {

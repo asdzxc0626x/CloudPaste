@@ -8,6 +8,7 @@
 
 import { DbTables, UserType } from "../constants/index.js";
 import { generateUUID } from "./common.js";
+import { buildPathPrefixCondition } from "./sqlPathPrefix.js";
 
 /**
  * 将 userIdOrInfo 规范化为 upload_sessions.user_id 的存储格式
@@ -541,12 +542,19 @@ export async function listActiveUploadSessions(db, params) {
     if (!normalized.startsWith("/")) {
       normalized = `/${normalized}`;
     }
-    // 转义 LIKE 通配符，避免路径中出现 %/_ 时扩大匹配范围
-    const escaped = normalized.replace(/[%_]/g, "\\$&");
-    const likePrefix = `${escaped}%`;
-    // 使用单字符转义符（反斜杠），符合 SQLite/D1 对 ESCAPE 的约束
-    sqlParts.push("AND fs_path LIKE ? ESCAPE '\\'");
-    values.push(likePrefix);
+    // 修改点（修复 D1 的 LIKE 模式 50 字符上限）：
+    // 原实现是 `fs_path LIKE '<前缀>%' ESCAPE '\'`，有两个毛病：
+    // 1) D1 把 LIKE 模式硬限制在 50 字符，而这里的路径带挂载段（例如
+    //    /b2-1/Github/github__owner__repo/main 已 52 字节），再加上对 _ 的转义
+    //    （每个 _ 变两个字节）只会更早越界，D1 直接抛
+    //    "LIKE or GLOB pattern too complex" → 续传列表整个 500；
+    // 2) 字符串前缀会把 /a/b-other 这类只是前缀相同的兄弟目录也算进来。
+    // 改为范围查询：命中「该目录本身 + 该目录下的所有条目」，语义更准且不受长度限制
+    const scope = buildPathPrefixCondition("fs_path", normalized, { includeExact: true });
+    if (scope) {
+      sqlParts.push(`AND ${scope.sql}`);
+      values.push(...scope.params);
+    }
   }
 
   // 过滤掉已过期的会话（如果 expires_at 有值）

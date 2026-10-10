@@ -9,6 +9,7 @@
 
 import { DbTables } from "../../../constants/index.js";
 import { ValidationError } from "../../../http/errors.js";
+import { buildPathPrefixCondition } from "../../../utils/sqlPathPrefix.js";
 import { decodeSearchCursor, encodeSearchCursor } from "./FsSearchCursor.js";
 import { createSqliteFts5TrigramDialect } from "./dialects/sqliteFts5TrigramDialect.js";
 
@@ -94,7 +95,14 @@ export class FsSearchIndexStore {
 
     // SQLite substr 是 1-based；这里取 parent 后面的相对路径
     const startPos = parent.length + 1;
-    const likePrefix = `${parent}%`;
+
+    // 修改点（修复 D1 的 LIKE 模式 50 字符上限）：
+    // 原来这里是 `fs_path LIKE '<parent>%'`。FS 路径带挂载段，目录一深模式就超过
+    // D1 的 50 字符上限（例如 /b2-1/Github/github__owner__repo/main 已 52 字节，
+    // 拼上 "%" 是 54），D1 会直接抛 "LIKE or GLOB pattern too complex"，
+    // 表现为挂载浏览点进深目录整个 500。改用范围查询表达同一集合，详见
+    // utils/sqlPathPrefix.js（顺带不再把路径里的 _ 当通配符）。
+    const scope = buildPathPrefixCondition("fs_path", parent);
 
     const sql = `
       WITH scoped AS (
@@ -105,7 +113,7 @@ export class FsSearchIndexStore {
           modified_ms,
           substr(fs_path, ?) AS rel
         FROM ${DbTables.FS_SEARCH_INDEX_ENTRIES}
-        WHERE mount_id = ? AND fs_path LIKE ?
+        WHERE mount_id = ? AND ${scope.sql}
       )
       SELECT
         (? || substr(rel, 1, instr(rel, '/'))) AS dir_path,
@@ -117,7 +125,7 @@ export class FsSearchIndexStore {
       GROUP BY dir_path
     `;
 
-    const resp = await this.db.prepare(sql).bind(startPos, id, likePrefix, parent).all();
+    const resp = await this.db.prepare(sql).bind(startPos, id, ...scope.params, parent).all();
     return Array.isArray(resp?.results) ? resp.results : [];
   }
 
@@ -418,12 +426,13 @@ export class FsSearchIndexStore {
     const id = mountId ? String(mountId) : "";
     const prefix = dirPath ? String(dirPath) : "";
     if (!id || !prefix) return;
-    const like = prefix.endsWith("/") ? `${prefix}%` : `${prefix}/%`;
+    // 修改点（修复 D1 的 LIKE 模式 50 字符上限）：原来的 `fs_path = ? OR fs_path LIKE '<前缀>%'`
+    // 在深目录下模式超 50 字符会被 D1 拒绝（索引维护任务会静默失败，子树删不掉）。
+    // 改成范围查询，集合完全等价（含「前缀本身」那一项）
+    const scope = buildPathPrefixCondition("fs_path", prefix, { includeExact: true });
     await this.db
-      .prepare(
-        `DELETE FROM ${DbTables.FS_SEARCH_INDEX_ENTRIES} WHERE mount_id = ? AND (fs_path = ? OR fs_path LIKE ?)`,
-      )
-      .bind(id, prefix, like)
+      .prepare(`DELETE FROM ${DbTables.FS_SEARCH_INDEX_ENTRIES} WHERE mount_id = ? AND ${scope.sql}`)
+      .bind(id, ...scope.params)
       .run();
   }
 
@@ -436,12 +445,14 @@ export class FsSearchIndexStore {
   async cleanupPrefixByRunId(mountId, dirPath, indexRunId) {
     if (!mountId || !dirPath || !indexRunId) return;
     const prefix = String(dirPath);
-    const like = prefix.endsWith("/") ? `${prefix}%` : `${prefix}/%`;
+    // 修改点（修复 D1 的 LIKE 模式 50 字符上限）：同 deleteByPathPrefix，
+    // 深目录下 LIKE 模式超 50 字符会让「子树无停机重建」的清理步骤整个报错
+    const scope = buildPathPrefixCondition("fs_path", prefix, { includeExact: true });
     await this.db
       .prepare(
-        `DELETE FROM ${DbTables.FS_SEARCH_INDEX_ENTRIES} WHERE mount_id = ? AND (fs_path = ? OR fs_path LIKE ?) AND (index_run_id IS NULL OR index_run_id != ?)`,
+        `DELETE FROM ${DbTables.FS_SEARCH_INDEX_ENTRIES} WHERE mount_id = ? AND ${scope.sql} AND (index_run_id IS NULL OR index_run_id != ?)`,
       )
-      .bind(String(mountId), prefix, like, String(indexRunId))
+      .bind(String(mountId), ...scope.params, String(indexRunId))
       .run();
   }
 
