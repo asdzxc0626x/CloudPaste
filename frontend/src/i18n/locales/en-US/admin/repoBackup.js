@@ -193,8 +193,10 @@ export default {
       noWritableMount: "No writable mount available. Add a writable mount in \"Mount Management\" first.",
       pathPrefix: "Path prefix",
       // 修改点（备份默认目录按仓库源区分）：默认目录不再是根目录，而是按仓库类型分目录
+      // 修改点（备份目录按分支分层）：其下不再平铺所有快照，而是「分支 / 时间_分支_sha」两级
+      // 修改点（快照按仓库名命名）：专属目录里的快照文件名为「仓库_分支_sha」
       pathPrefixHint:
-        "Directory inside the mount, by default a per-type folder (GitHub → /GitHub); each repository gets its own subdirectory",
+        "Directory inside the mount, by default a per-type folder (GitHub → /GitHub); branch folders and a per-backup \"time_branch_sha\" folder are created underneath, holding a \"repo_branch_sha\" snapshot",
       retentionCount: "Versions to keep",
       retentionCountHint: "Older versions are deleted automatically beyond this count; default {count}",
 

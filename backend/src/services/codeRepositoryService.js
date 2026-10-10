@@ -471,6 +471,9 @@ export async function listRepositories(db, repositoryFactory, encryptionSecret, 
     const activeBackupCount = activeJobMap.backup.get(String(row.id)) || 0;
 
     // 备份目录：只给出第一个目标上的目录，避免列表里堆一长串路径
+    // 修改点（备份目录按分支分层）：这里给的是「仓库根目录」——新结构下它下面还有
+    // 「分支目录 / 时间_分支_sha 目录」两级，列表里只展示这一层最简洁；
+    // 具体某个快照的完整路径由 storagePath（备份历史接口）给出
     const firstMount = targetMounts[0] ? mountMap.get(String(targetMountIds[0])) : null;
     const backupFolder = firstMount
       ? `${String(firstMount.mount_path).replace(/\/+$/, "")}${normalizePathPrefix(row.target_path_prefix)}/${buildRepoFolderName({

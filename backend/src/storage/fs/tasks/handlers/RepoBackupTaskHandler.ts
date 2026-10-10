@@ -701,12 +701,15 @@ export class RepoBackupTaskHandler implements TaskHandler {
 
           try {
             // createDirectory 对已存在目录是幂等的（返回 alreadyExists）
+            // 修改点（备份目录按分支分层）：直接建「本次备份的专属目录」，
+            // 其上层（仓库目录 / 分支目录）由驱动的多级创建一并带出；
+            // 创建失败不回滚：归档与 manifest 都要落在这个目录里，后续 uploadFile 会再兜一次
             try {
-              await fileSystem.createDirectory(paths.repoDirPath, job.userId, job.userType);
+              await fileSystem.createDirectory(paths.backupDirPath, job.userId, job.userType);
             } catch (dirError: any) {
               // 部分对象存储没有真实目录概念，创建失败不影响后续写入
               console.warn(
-                `[RepoBackupTaskHandler] 创建目录失败（继续尝试上传）: ${paths.repoDirPath}`,
+                `[RepoBackupTaskHandler] 创建目录失败（继续尝试上传）: ${paths.backupDirPath}`,
                 dirError?.message || dirError,
               );
             }

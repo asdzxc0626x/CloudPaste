@@ -9,41 +9,64 @@
  * - 文件删除是「尽力而为」：某个目标删不掉（挂载点被删、驱动只读等）不会阻塞
  *   其余目标的清理，也不会让备份任务失败——数据库记录照样清理，避免残留脏记录
  * - 复用 fileSystem.batchRemoveItems，不自己拼驱动调用
+ * - 修改点（备份目录按分支分层）：每次备份独占一个「时间_分支_sha」目录，
+ *   文件删完后顺手把该目录也清掉，否则本地 / WebDAV 这类真实目录的存储上会堆一堆空目录
  */
 
 import { resolveRetentionCount, NON_SUCCESS_HISTORY_KEEP } from "./config.js";
+// 修改点（备份目录按分支分层）：从落盘路径反推「本次备份的专属目录」，用于顺带清理空目录
+import { resolveBackupDirFromFilePath } from "./paths.js";
 
 /**
  * 按挂载点把待删路径分组
  * - batchRemoveItems 不支持跨挂载批量删除，因此必须分组调用
+ * - 修改点（备份目录按分支分层）：文件与目录分开返回。文件是「必须删掉」的，
+ *   目录只是收尾（见 pruneOldVersions），混在一起会让目录删除失败被误报成「文件删除失败」
+ * - 导出仅供回归测试使用（retentionGrouping.test.js），业务代码只在本文件内调用
  * @param {Object[]} targets code_repository_backup_targets 行
  * @param {Object} legacyBackup 无目标结果时的兜底记录（v35 及更早）
- * @returns {Map<string, string[]>} key 为 mount_id（未知时用 ""）
+ * @returns {{ files: Map<string, string[]>, dirs: Map<string, string[]> }} key 为 mount_id（未知时用 ""）
  */
-function groupPathsByMount(targets, legacyBackup) {
-  const groups = new Map();
+export function groupPathsByMount(targets, legacyBackup) {
+  const files = new Map();
+  const dirs = new Map();
 
-  const push = (mountId, path) => {
+  const push = (bucket, mountId, path) => {
     if (!path) return;
     const key = String(mountId || "");
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(path);
+    if (!bucket.has(key)) bucket.set(key, []);
+    bucket.get(key).push(path);
+  };
+
+  /**
+   * 记录一个目标：快照、manifest，以及它们所在的专属目录
+   * 修改点（备份目录按分支分层）：只在新结构下才会推出目录
+   * （老记录的父目录是仓库目录，resolveBackupDirFromFilePath 返回 null，行为与改造前一致）
+   */
+  const pushTarget = (mountId, storagePath, manifestPath) => {
+    push(files, mountId, storagePath);
+    push(files, mountId, manifestPath);
+    // 快照与 manifest 同在一个专属目录里，反推出的目录会重复一次，用 Set 去重
+    const targetDirs = new Set();
+    for (const path of [storagePath, manifestPath]) {
+      const dir = resolveBackupDirFromFilePath(path);
+      if (dir) targetDirs.add(dir);
+    }
+    for (const dir of targetDirs) push(dirs, mountId, dir);
   };
 
   if (Array.isArray(targets) && targets.length > 0) {
     for (const target of targets) {
-      push(target.mount_id, target.storage_path);
-      push(target.mount_id, target.manifest_path);
+      pushTarget(target.mount_id, target.storage_path, target.manifest_path);
     }
-    return groups;
+    return { files, dirs };
   }
 
   // 兼容 v35 数据：路径直接存在备份记录上，且两者必然同挂载点
   if (legacyBackup) {
-    push(legacyBackup.target_mount_id || "", legacyBackup.storage_path);
-    push(legacyBackup.target_mount_id || "", legacyBackup.manifest_path);
+    pushTarget(legacyBackup.target_mount_id || "", legacyBackup.storage_path, legacyBackup.manifest_path);
   }
-  return groups;
+  return { files, dirs };
 }
 
 /**
@@ -77,9 +100,9 @@ export async function pruneOldVersions({ codeRepo, fileSystem, repositoryRow, us
     if (fileSystem) {
       try {
         const targets = await codeRepo.findTargetsByBackup(backup.id);
-        const groups = groupPathsByMount(targets, backup);
+        const { files, dirs } = groupPathsByMount(targets, backup);
 
-        for (const paths of groups.values()) {
+        for (const paths of files.values()) {
           if (paths.length === 0) continue;
           try {
             const result = await fileSystem.batchRemoveItems(paths, userId, userType);
@@ -93,6 +116,22 @@ export async function pruneOldVersions({ codeRepo, fileSystem, repositoryRow, us
             // 挂载点已被删除等场景：记录后继续，不阻塞记录清理
             summary.failedPaths += paths.length;
             summary.errors.push(`删除快照失败（${paths.join(", ")}）: ${error?.message || error}`);
+          }
+        }
+
+        // 修改点（备份目录按分支分层）：快照与 manifest 删完后，那种「时间_分支_sha」
+        // 专属目录就空了，顺手收掉，免得本地 / WebDAV 这类真实目录的存储上堆一堆空目录。
+        // 这一步纯粹是收拾现场：失败（驱动不支持删目录、目录里还有删不掉的文件等）
+        // 既不计入 failedPaths 也不写 errors，避免让管理员以为快照没删干净。
+        for (const paths of dirs.values()) {
+          if (paths.length === 0) continue;
+          try {
+            await fileSystem.batchRemoveItems(paths, userId, userType);
+          } catch (error) {
+            console.warn(
+              `[repoBackup] 清理备份目录失败（不影响记录清理）: ${paths.join(", ")}`,
+              error?.message || error,
+            );
           }
         }
       } catch (error) {
