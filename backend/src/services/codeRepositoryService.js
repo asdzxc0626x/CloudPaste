@@ -203,6 +203,30 @@ function toMountBrief(mount) {
 }
 
 /**
+ * 从 config_json 中取出非敏感的 endpoint_url（修改点：点击 owner/repo 跳转仓库）
+ *
+ * 为什么直接 JSON.parse 而不走 parseProviderConfig：
+ * - endpoint_url 不在 provider 的敏感字段表里（只有 token / tokens / proxies 是密文），
+ *   这里读到的就是明文，无需解密
+ * - toRepositoryDto 是同步函数，而 parseProviderConfig 是异步的（要解密）
+ * - 解析失败/字段缺失一律返回 null，交给 provider 的默认站点规则处理
+ *
+ * @param {string|null|undefined} configJson
+ * @returns {string|null}
+ */
+function readEndpointUrl(configJson) {
+  if (!configJson) return null;
+  try {
+    const parsed = JSON.parse(configJson);
+    if (!parsed || typeof parsed !== "object") return null;
+    const value = parsed.endpoint_url;
+    return value ? String(value).trim() || null : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * 把数据库行转换为 API 返回结构
  * @param {object} row
  * @param {object} [extra]
@@ -233,6 +257,14 @@ function toRepositoryDto(row, extra = {}) {
     providerDisplayName: RepoProviderFactory.getDisplayName(row.provider),
     name: row.name || row.repo_identifier,
     repoIdentifier: row.repo_identifier,
+    /**
+     * 仓库网页地址（修改点：点击 owner/repo 跳转仓库）
+     * - 官方 GitHub 时为 https://github.com/owner/repo；自建实例按 endpoint_url 反推站点
+     * - null 表示推导不出（标识非法 / provider 未提供该能力），前端保持纯文本展示
+     */
+    repoWebUrl: RepoProviderFactory.buildRepositoryWebUrl(row.provider, row.repo_identifier, {
+      endpoint_url: readEndpointUrl(row.config_json),
+    }),
     trackMode: row.track_mode,
     // 修改点（多分支优化）：对外暴露数组；trackRef 保留为兼容用的“主引用”
     trackRefs,

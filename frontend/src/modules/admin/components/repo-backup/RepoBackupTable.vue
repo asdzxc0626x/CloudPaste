@@ -408,7 +408,17 @@ const dimensionRows = (repo) => [
                 </span>
               </div>
               <div class="text-xs mt-0.5 font-mono truncate" :class="darkMode ? 'text-gray-400' : 'text-gray-500'">
-                {{ repo.repoIdentifier }}
+                <!-- 修改点（点击 owner/repo 跳转仓库）：后端推导出网页地址时渲染成链接，
+                     推导不出（标识非法 / provider 未提供该能力）时保持纯文本，外观不变 -->
+                <a
+                  v-if="repo.repoWebUrl"
+                  :href="repo.repoWebUrl"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  class="hover:underline hover:text-blue-600 dark:hover:text-blue-400"
+                  :title="$t('admin.repoBackup.openRepository')"
+                >{{ repo.repoIdentifier }}</a>
+                <template v-else>{{ repo.repoIdentifier }}</template>
               </div>
               <!-- 状态：统一结果（修改点：状态显示不一致修复）。
                    「已是最新 / 已延迟重试 / 已被阻止」都不是失败，颜色由 tone 决定，
@@ -620,7 +630,16 @@ const dimensionRows = (repo) => [
               </span>
             </div>
             <div class="text-[11px] mt-0.5 font-mono break-all" :class="darkMode ? 'text-gray-400' : 'text-gray-500'">
-              {{ repo.repoIdentifier }}
+              <!-- 修改点（点击 owner/repo 跳转仓库）：与桌面端一致 -->
+              <a
+                v-if="repo.repoWebUrl"
+                :href="repo.repoWebUrl"
+                target="_blank"
+                rel="noopener noreferrer"
+                class="hover:underline hover:text-blue-600 dark:hover:text-blue-400"
+                :title="$t('admin.repoBackup.openRepository')"
+              >{{ repo.repoIdentifier }}</a>
+              <template v-else>{{ repo.repoIdentifier }}</template>
             </div>
           </div>
           <!-- 主徽章（修改点：第 5 期 前端状态展示）：与桌面端保持一致，

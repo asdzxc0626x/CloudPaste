@@ -76,6 +76,8 @@ import { get, post, put, del } from "../client";
  * @property {string} providerDisplayName
  * @property {string} name
  * @property {string} repoIdentifier - 'owner/repo'
+ * @property {string|null} repoWebUrl - 仓库网页地址（修改点：点击 owner/repo 跳转仓库）；
+ *   为 null 表示推导不出，前端按纯文本展示
  * @property {TrackMode} trackMode
  * @property {string[]} trackRefs - 跟踪引用列表（branch 模式=多个分支；release 模式=单元素）
  * @property {string|null} trackRef - 主引用（兼容字段）

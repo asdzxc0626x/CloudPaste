@@ -147,6 +147,9 @@ export default {
       delete: "Delete",
     },
 
+    // 修改点（点击 owner/repo 跳转仓库）：仓库标识的悬停提示
+    openRepository: "Open the repository page in a new tab",
+
     buttons: {
       cancel: "Cancel",
       save: "Save",

@@ -221,7 +221,16 @@ const showTargetList = (item) => Array.isArray(item.targets) && item.targets.len
             {{ $t("admin.repoBackup.history.title") }}
           </h3>
           <p v-if="repo" class="text-[11px] mt-0.5 font-mono truncate" :class="darkMode ? 'text-gray-400' : 'text-gray-500'">
-            {{ repo.repoIdentifier }}
+            <!-- 修改点（点击 owner/repo 跳转仓库）：与仓库列表一致，可推导出网页地址时可点击 -->
+            <a
+              v-if="repo.repoWebUrl"
+              :href="repo.repoWebUrl"
+              target="_blank"
+              rel="noopener noreferrer"
+              class="hover:underline hover:text-blue-600 dark:hover:text-blue-400"
+              :title="$t('admin.repoBackup.openRepository')"
+            >{{ repo.repoIdentifier }}</a>
+            <template v-else>{{ repo.repoIdentifier }}</template>
           </p>
         </div>
 

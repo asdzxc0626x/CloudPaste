@@ -206,6 +206,64 @@ function parseRepoIdentifier(raw) {
   return { owner: segments[0], repo: segments[1] };
 }
 
+/**
+ * 推导 GitHub 的「网页站点」基址（修改点：点击 owner/repo 跳转仓库）
+ *
+ * 与 apiBase 的区别：apiBase 是 API 主机（api.github.com），这里是给人看的网页主机。
+ * 规则：
+ * - 官方 api.github.com      -> https://github.com
+ * - 自建 / GitHub Enterprise -> 由 API 基址反推站点根：
+ *     https://ghe.example.com/api/v3 -> https://ghe.example.com
+ *     https://git.example.com/api/v3 -> https://git.example.com
+ *   反推不了（地址非法）时返回 null，前端据此不渲染链接。
+ *
+ * 为什么放在 provider 侧而不是前端拼：这是「平台知识」。
+ * 将来接 GitLab / Gitea 时网页地址规则完全不同，应由各自的 provider 决定。
+ *
+ * @param {string} apiBase provider 配置里的 endpoint_url（可能为空 = 官方站）
+ * @returns {string|null}
+ */
+export function resolveGithubWebBase(apiBase) {
+  const base = String(apiBase || "").trim() || DEFAULT_API_BASE;
+  try {
+    const url = new URL(base);
+    if (url.host.toLowerCase() === DEFAULT_API_BASE_HOST) return "https://github.com";
+
+    // GitHub Enterprise Server 的 API 固定挂在 /api/v3 前缀下，网页页面在该前缀的上一级
+    const path = url.pathname.replace(/\/+$/, "").replace(/\/api\/v3$/i, "");
+    return `${url.origin}${path}`;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 构建仓库的网页访问地址（修改点：点击 owner/repo 跳转仓库）
+ *
+ * @param {string} repoIdentifier 'owner/repo'（也兼容完整 URL 形式）
+ * @param {Object} [config] provider 配置，只用到非敏感的 endpoint_url
+ * @returns {string|null} 推导不出时返回 null —— 前端据此保留纯文本，不渲染成链接
+ */
+export function buildGithubRepositoryWebUrl(repoIdentifier, config = {}) {
+  const webBase = resolveGithubWebBase(config?.endpoint_url);
+  if (!webBase) return null;
+
+  // 兼容把自建实例的完整地址填进「仓库标识」的写法：
+  // 先剥掉站点前缀再解析，否则 parseRepoIdentifier 会把主机名当成 owner
+  let identifier = String(repoIdentifier || "").trim();
+  const escapedBase = webBase.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  identifier = identifier.replace(new RegExp(`^${escapedBase}/`, "i"), "");
+  // 官方站点同理（parseRepoIdentifier 已能处理，这里不重复剥离，保持一致即可）
+
+  try {
+    const { owner, repo } = parseRepoIdentifier(identifier);
+    return `${webBase}/${owner}/${repo}`;
+  } catch {
+    // 标识非法（例如正在编辑中的半成品）不该让接口报错，按「没有链接」处理
+    return null;
+  }
+}
+
 export class GithubRepoProvider extends BaseRepoProvider {
   /**
    * @param {Object} config 已解密的 provider 配置

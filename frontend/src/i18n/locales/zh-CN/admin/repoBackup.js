@@ -150,6 +150,9 @@ export default {
       delete: "删除",
     },
 
+    // 修改点（点击 owner/repo 跳转仓库）：仓库标识的悬停提示
+    openRepository: "在新标签页打开仓库页面",
+
     // 按钮通用文案（不用 common.save/common.delete：该命名空间下不存在这两个键）
     buttons: {
       cancel: "取消",

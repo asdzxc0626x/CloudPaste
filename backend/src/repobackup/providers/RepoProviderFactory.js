@@ -8,7 +8,8 @@
  */
 
 import { ValidationError, NotFoundError } from "../../http/errors.js";
-import { GithubRepoProvider } from "./GithubRepoProvider.js";
+// 修改点（点击 owner/repo 跳转仓库）：GitHub 的网页地址推导随 provider 一起注册
+import { GithubRepoProvider, buildGithubRepositoryWebUrl } from "./GithubRepoProvider.js";
 
 /**
  * provider 注册表
@@ -20,6 +21,7 @@ import { GithubRepoProvider } from "./GithubRepoProvider.js";
  *     trackModes: string[],
  *     configSchema: object|null,
  *     ui: object|null,
+ *     webUrlBuilder: Function|null,   // (repoIdentifier, config) => string|null
  *   }
  */
 const registry = new Map();
@@ -32,9 +34,11 @@ export class RepoProviderFactory {
   /**
    * 注册 provider
    * @param {string} type
-   * @param {{ ctor: Function, displayName?: string, validate?: Function|null, trackModes?: string[], configSchema?: object|null, ui?: object|null }} meta
+   * @param {{ ctor: Function, displayName?: string, validate?: Function|null, trackModes?: string[], configSchema?: object|null, ui?: object|null, webUrlBuilder?: Function|null }} meta
+   *        webUrlBuilder（修改点：点击 owner/repo 跳转仓库）—— 把 'owner/repo' 变成可点击的网页地址。
+   *        不提供时该 provider 的仓库标识按纯文本展示（不是错误，只是不跳转）。
    */
-  static registerProvider(type, { ctor, displayName = null, validate = null, trackModes = ["branch", "release"], configSchema = null, ui = null } = {}) {
+  static registerProvider(type, { ctor, displayName = null, validate = null, trackModes = ["branch", "release"], configSchema = null, ui = null, webUrlBuilder = null } = {}) {
     if (!type || !ctor) {
       throw new ValidationError("registerProvider 需要提供 type 和 ctor");
     }
@@ -45,6 +49,7 @@ export class RepoProviderFactory {
       trackModes: Array.isArray(trackModes) && trackModes.length > 0 ? trackModes : ["branch"],
       configSchema: configSchema || null,
       ui: ui || null,
+      webUrlBuilder: typeof webUrlBuilder === "function" ? webUrlBuilder : null,
     });
   }
 
@@ -78,6 +83,33 @@ export class RepoProviderFactory {
 
   static getDisplayName(providerType) {
     return registry.get(providerType)?.displayName || providerType;
+  }
+
+  /**
+   * 构建仓库的网页访问地址（修改点：点击 owner/repo 跳转仓库）
+   *
+   * 页面上的 owner/repo 是给人看的标识，点击应当跳到对应平台的仓库页：
+   * - 官方 GitHub        -> https://github.com/owner/repo
+   * - 自建 / Enterprise  -> 由该 provider 的 endpoint_url 反推出的站点地址
+   *
+   * @param {string} providerType
+   * @param {string} repoIdentifier 'owner/repo'
+   * @param {Object} [config] provider 配置（只需非敏感的 endpoint_url）
+   * @returns {string|null} null = 无法确定，调用方按纯文本展示
+   */
+  static buildRepositoryWebUrl(providerType, repoIdentifier, config = {}) {
+    const builder = registry.get(providerType)?.webUrlBuilder;
+    if (typeof builder !== "function") return null;
+    try {
+      return builder(repoIdentifier, config) || null;
+    } catch (error) {
+      // 单个仓库推导失败不能让整个列表接口 500（与 fail-open 的既有风格一致）
+      console.warn(
+        `[repoBackup] 构建仓库网页地址失败 (provider=${providerType}, repo=${repoIdentifier}):`,
+        error?.message || error,
+      );
+      return null;
+    }
   }
 
   /**
@@ -152,6 +184,9 @@ RepoProviderFactory.registerProvider(RepoProviderFactory.SUPPORTED_TYPES.GITHUB,
   displayName: "GitHub",
   trackModes: ["branch", "release"],
   validate: (input) => GithubRepoProvider.validateInput(input),
+  // 修改点（点击 owner/repo 跳转仓库）：默认跳到 github.com；
+  // endpoint_url 指向自建 / GitHub Enterprise 时，反推到该实例的网页地址
+  webUrlBuilder: buildGithubRepositoryWebUrl,
   ui: {
     icon: "storage-github-api",
     i18nKey: "admin.repoBackup.provider.github",
