@@ -7,16 +7,20 @@
  * 单独抽出来的原因：任务层要写入、服务层要生成下载链接，两边必须用同一套规则。
  *
  * 产出形态（与用户确认的方案一致）：
- *   /{mountPath}/{prefix}/{provider}__{owner}__{repo}/{ref}/{yyyyMMdd-HHmmss}__{ref}__{sha7}/{owner}__{repo}__{ref}__{sha7}.tar.gz
- *   /{mountPath}/{prefix}/{provider}__{owner}__{repo}/{ref}/{yyyyMMdd-HHmmss}__{ref}__{sha7}/{owner}__{repo}__{ref}__{sha7}.manifest.json
+ *   /{mountPath}/{prefix}/{owner}__{repo}/{ref}/{yyyyMMdd-HHmmss}__{ref}__{sha7}/{owner}__{repo}__{ref}__{sha7}.tar.gz
+ *   /{mountPath}/{prefix}/{owner}__{repo}/{ref}/{yyyyMMdd-HHmmss}__{ref}__{sha7}/{owner}__{repo}__{ref}__{sha7}.manifest.json
  *
  * 修改点（备份目录按分支分层）：在仓库目录与快照之间插入「分支目录 + 本次备份专属目录」两层，
- * 例如 github__owner__repo/main/20261005-155036__main__8a7950d/angusdevgo__IDM_Pro_Tool__main__8a7950d.tar.gz。
+ * 例如 owner__repo/main/20261005-155036__main__8a7950d/angusdevgo__IDM_Pro_Tool__main__8a7950d.tar.gz。
  * 这么分层的原因：
  * - 同一个仓库往往同时跟踪多个分支，原先所有分支、所有版本平铺在一个目录里，
  *   版本一多就分不清哪个文件属于哪个分支、哪一次备份；
  * - 每次备份独占一个「时间_分支_sha」目录，快照与它的 manifest 天然成组，
  *   删除某个版本时整目录拿走即可，不会误伤邻居
+ *
+ * 修改点（仓库目录去掉平台前缀）：仓库目录名由 `{provider}__{owner}__{repo}` 改为 `{owner}__{repo}`。
+ * 上级目录本来就按仓库源分（GitHub 默认落到 /GitHub），仓库源在路径里重复出现了一次，
+ * 于是 github__owner__repo 变成 owner__repo，路径更短也更好认。
  *
  * 修改点（快照按仓库名命名）：专属目录里的文件用 owner__repo__ref__sha 命名（不带平台前缀），
  * 文件名自身就能说明「哪个仓库的哪个分支哪个版本」，单独拿出去也认得出来
@@ -37,7 +41,7 @@ const DEFAULT_REF_SEGMENT = "default";
  * 版本保留清理要判断一个路径的父目录是不是「本次备份专属目录」，好把空目录一并收掉。
  * 判定必须严格 —— 认错就会把整个仓库目录删掉，所以这里只认我们自己生成的时间戳形态：
  * - 时间戳是 UTC 的 yyyyMMdd-HHmmss，固定 8 位数字 + "-" + 6 位数字，老结构（父目录是
- *   github__owner__repo 这类仓库目录）不可能以它开头；
+ *   owner__repo 这类仓库目录）不可能以它开头；
  * - 末段是 7 个字符的短 sha（commitSha 缺失时代码会写成 "unknown"，也正好 7 位）
  */
 const BACKUP_DIR_NAME_PATTERN = /^\d{8}-\d{6}__.+__[0-9a-zA-Z]{7}$/;
@@ -107,12 +111,21 @@ function splitRepoIdentifier(repoIdentifier) {
 
 /**
  * 仓库在挂载点内的专属目录名
- * @param {{ provider: string, repoIdentifier: string }} params
- * @returns {string} 例如 github__ling-drag0n__CloudPaste
+ *
+ * 修改点（仓库目录去掉平台前缀）：原来是 `${provider}__${owner}__${repo}`（例如
+ * github__ling-drag0n__CloudPaste），现在只留 owner__repo。上级目录已经按仓库源分
+ * （GitHub 默认落到 /GitHub），仓库源没必要在路径里重复一遍。
+ * provider 参数保留只是为了不动调用方签名，已不参与拼名。
+ *
+ * 取舍：默认前缀按仓库源分目录，所以不同仓库源的同名 owner/repo 不会撞在一起；
+ * 若有人手工把两个仓库源的前缀设成同一个目录，它们会共用同一个仓库目录 —— 刻意接受。
+ *
+ * @param {{ provider?: string, repoIdentifier: string }} params
+ * @returns {string} 例如 ling-drag0n__CloudPaste
  */
-export function buildRepoFolderName({ provider, repoIdentifier }) {
+export function buildRepoFolderName({ repoIdentifier }) {
   const { owner, repo } = splitRepoIdentifier(repoIdentifier);
-  return `${sanitizeSegment(provider) || "unknown"}__${owner}__${repo}`;
+  return `${owner}__${repo}`;
 }
 
 /**

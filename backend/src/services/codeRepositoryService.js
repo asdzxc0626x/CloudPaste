@@ -474,6 +474,8 @@ export async function listRepositories(db, repositoryFactory, encryptionSecret, 
     // 修改点（备份目录按分支分层）：这里给的是「仓库根目录」——新结构下它下面还有
     // 「分支目录 / 时间_分支_sha 目录」两级，列表里只展示这一层最简洁；
     // 具体某个快照的完整路径由 storagePath（备份历史接口）给出
+    // 修改点（仓库目录去掉平台前缀）：仓库根目录现在是 /{前缀}/{owner}__{repo}/，
+    // 名字由 buildRepoFolderName 统一给出，这里不再需要额外处理
     const firstMount = targetMounts[0] ? mountMap.get(String(targetMountIds[0])) : null;
     const backupFolder = firstMount
       ? `${String(firstMount.mount_path).replace(/\/+$/, "")}${normalizePathPrefix(row.target_path_prefix)}/${buildRepoFolderName({

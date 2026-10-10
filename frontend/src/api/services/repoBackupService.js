@@ -98,8 +98,8 @@ import { get, post, put, del } from "../client";
  * @property {RepoTargetMount[]} [targetMounts]
  * @property {string[]} [missingMountIds] - 已被删除的挂载点 ID
  * @property {string|null} [backupFolder] - 备份文件所在目录（可跳转挂载浏览器）；
- *   修改点（备份目录按分支分层）：这里是「仓库根目录」，形如 /GitHub/github__owner__repo/，
- *   具体的快照在它下面的「分支目录 / 时间_分支_sha 目录」两级里
+ *   修改点（备份目录按分支分层）：这里是「仓库根目录」，形如 /GitHub/owner__repo/
+ *   （修改点：仓库目录去掉平台前缀），具体的快照在它下面的「分支目录 / 时间_分支_sha 目录」两级里
  * @property {RepoSchedule|null} [schedule] - 独立备份计划，null 表示未配置
  * @property {RepoBackup|null} [latestBackup]
  * @property {RepositoryState} [state] - 仓库级合并结论（主徽章用）
@@ -172,7 +172,8 @@ import { get, post, put, del } from "../client";
  * @property {string|null} version
  * @property {BackupStatus} status
  * @property {string|null} storagePath - 快照文件落盘路径（修改点：备份目录按分支分层、快照按仓库名命名），
- *   形如 /GitHub/github__owner__repo/main/20261005-155036__main__8a7950d/owner__repo__main__8a7950d.tar.gz
+ *   形如 /GitHub/owner__repo/main/20261005-155036__main__8a7950d/owner__repo__main__8a7950d.tar.gz
+ *   （修改点：仓库目录去掉平台前缀，第二级目录不再带 github__）
  * @property {string|null} manifestPath - 同一备份的 manifest，与快照同目录
  * @property {number|null} sizeBytes
  * @property {string|null} jobId
