@@ -91,6 +91,52 @@ export function normalizeRef(ref) {
 }
 
 /**
+ * 把跟踪键从 DB 键形态（空串）还原成对外形态（null）
+ *
+ * 修改点（P0 跟踪键语义统一）：两种形态各有唯一用途，不要混用 ——
+ * - DB 键形态（`""`）：进 repo_detect_states.ref（NOT NULL + 唯一索引）
+ * - 对外形态（`null`）：进任务 payload / DTO，前端据此显示「最新 Release」
+ */
+export function trackingRefToDto(ref) {
+  const normalized = normalizeRef(ref);
+  return normalized === "" ? null : normalized;
+}
+
+/**
+ * 把一个「候选 ref」收敛到该仓库真正的跟踪键上（修改点：P0 水位键错位）
+ *
+ * 为什么必须有这一步：
+ *   release 模式跟踪「最新 Release」时，跟踪键是空串，而 provider 解析出来的是
+ *   具体 Tag（例如 `v9.9.9`）。备份成功后如果拿这个具体 Tag 去推进水位，
+ *   水位会落到一行**全新的** `ref='v9.9.9'` 状态行上（ensureDetectStates 会把它建出来），
+ *   真正的跟踪行 `ref=''` 的 backed_up_commit_sha 永远是 NULL，
+ *   于是每轮检测都判「有更新」→ 反复创建备份任务 → 永久空转。
+ *
+ * 收敛规则（刻意保守，不乱猜）：
+ *   1. 候选本身就是该仓库的跟踪键 → 原样返回（branch 模式、显式 Tag 都走这条）
+ *   2. 候选对不上，但该仓库只跟踪一个引用 → 返回那个唯一的跟踪键
+ *      （「release + 空 Tag」正是这种情形，这条是修复的主力）
+ *   3. 候选对不上且跟踪多个引用 → 保持原值，不猜
+ *
+ * @param {object} repoRow code_repositories 行
+ * @param {string|null} candidateRef 可能是具体 Tag，也可能已经是跟踪键
+ * @param {string} [refType] 期望的 ref_type，用于在多引用时按类型再筛一次
+ * @returns {string} DB 键形态的跟踪键（空串表示「最新」）
+ */
+export function resolveTrackingRefKey(repoRow, candidateRef, refType = null) {
+  const candidate = normalizeRef(candidateRef);
+  const tracked = resolveTrackedRefKeys(repoRow);
+  if (tracked.length === 0) return candidate;
+
+  const sameType = refType ? tracked.filter((item) => item.refType === refType) : tracked;
+  const pool = sameType.length > 0 ? sameType : tracked;
+
+  if (pool.some((item) => item.ref === candidate)) return candidate;
+  if (pool.length === 1) return pool[0].ref;
+  return candidate;
+}
+
+/**
  * 由仓库的 track_mode 推出 detect state 的 ref_type
  * @param {string} trackMode
  * @returns {'branch'|'tag'}
@@ -276,6 +322,15 @@ export async function detectRefs({ codeRepo, provider, repoRow, refs }) {
       const entry = {
         refType: latest.refType || refType,
         ref: latest.ref ?? (ref === "" ? null : ref),
+        /**
+         * 修改点（P0 水位键错位）：跟踪键与展示用 ref 分开带下去。
+         * 上面的 `refType`/`ref` 是 provider 解析出来的**具体版本**
+         * （release 模式跟踪「最新」时会是 `v9.9.9` 这种具体 Tag），
+         * 只能用于展示 / manifest；备份成功后推进水位必须用这里的跟踪键，
+         * 否则水位会落到一行全新的状态行上，真正的跟踪行永远不更新。
+         */
+        trackingRefType: refType,
+        trackingRef: trackingRefToDto(ref),
         commitSha,
         shortCommitSha: commitSha.slice(0, 7),
         version: latest.version ?? null,
@@ -315,6 +370,10 @@ export async function detectRefs({ codeRepo, provider, repoRow, refs }) {
         results.push({
           refType,
           ref: ref === "" ? null : ref,
+          // 修改点（P0 水位键错位）：失败/延迟路径没有解析到具体版本，
+          // 跟踪键与展示 ref 本来就相同，这里仍显式带上，保持 payload 形状一致
+          trackingRefType: refType,
+          trackingRef: trackingRefToDto(ref),
           commitSha: prior?.commit_sha ?? null,
           shortCommitSha: prior?.commit_sha ? String(prior.commit_sha).slice(0, 7) : null,
           version: prior?.version ?? null,
@@ -344,6 +403,9 @@ export async function detectRefs({ codeRepo, provider, repoRow, refs }) {
       results.push({
         refType,
         ref: ref === "" ? null : ref,
+        // 修改点（P0 水位键错位）：同上，保持 payload 形状一致
+        trackingRefType: refType,
+        trackingRef: trackingRefToDto(ref),
         commitSha: prior?.commit_sha ?? null,
         shortCommitSha: prior?.commit_sha ? String(prior.commit_sha).slice(0, 7) : null,
         version: prior?.version ?? null,
@@ -447,9 +509,11 @@ export async function prepareDetectRound({ codeRepo, repoRow, maxRefs = DETECT_M
  * @param {string} refType 'branch' | 'tag'
  * @param {string|null} ref
  * @param {string} commitSha 刚刚备份成功的 commit
- * @param {{ markDetected?: boolean }} [options]
+ * @param {{ markDetected?: boolean, repoRow?: object|null }} [options]
  *        markDetected=true 时同时把该引用记为「检测成功且水位一致」
  *        （修改点：正常跳过时的状态一致性）
+ *        repoRow 给出时会把 ref 收敛到该仓库真正的跟踪键上
+ *        （修改点：P0 水位键错位，见 resolveTrackingRefKey）
  * @returns {Promise<boolean>}
  */
 export async function advanceBackedUpWatermark(codeRepo, repositoryId, refType, ref, commitSha, options = {}) {
@@ -457,7 +521,18 @@ export async function advanceBackedUpWatermark(codeRepo, repositoryId, refType, 
   const nowIso = new Date().toISOString();
   // refType 进来时已经是 'branch' | 'tag'，这里只做一次兜底归一
   const normalizedType = String(refType || "branch") === "tag" ? "tag" : "branch";
-  const normalizedRef = normalizeRef(ref);
+
+  /**
+   * 修改点（P0 水位键错位）：水位只允许落在该仓库**真正跟踪的键**上。
+   *
+   * 这里是最后一道防线 —— 调用方已经改成传跟踪键了，但仍然保留这道收敛，
+   * 因为下面紧跟着 ensureDetectStates：一旦 ref 是个「不被跟踪的具体 Tag」，
+   * 它会**静默建出一行新状态**，水位落在那行上，真正的跟踪行永远不更新，
+   * 形成「每轮都判有更新 → 反复备份」的空转。宁可收敛，也不要建错行。
+   */
+  const normalizedRef = options.repoRow
+    ? resolveTrackingRefKey(options.repoRow, ref, normalizedType)
+    : normalizeRef(ref);
 
   await codeRepo.ensureDetectStates(repositoryId, [{ refType: normalizedType, ref: normalizedRef }]);
 
@@ -503,6 +578,8 @@ export default {
   DETECT_ERROR_BACKOFF_MAX_MS,
   DETECT_MAX_REFS_PER_RUN,
   normalizeRef,
+  trackingRefToDto,
+  resolveTrackingRefKey,
   refTypeOfTrackMode,
   resolveTrackedRefKeys,
   computeNextDetectAfterOnSuccess,

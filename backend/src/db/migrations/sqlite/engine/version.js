@@ -7,7 +7,8 @@
 // 修改点（仓库备份优化）：36 -> 37，为存量代码仓库回填各自的备份计划（scheduled_jobs 行）
 // 修改点（第 4 期 检测状态持久化）：37 -> 38，新增 repo_detect_states 并从既有备份记录回填备份水位
 // 修改点（第 5 期 错峰调度）：38 -> 39，重新分散存量仓库备份计划的执行时间 + repo_detect_states 补复合索引
-export const APP_SCHEMA_VERSION = 39;
+// 修改点（P0 Release 空 Tag 水位键纠错）：39 -> 40，修正 v38 回填把 provider 具体 Tag 当成状态键留下的错行
+export const APP_SCHEMA_VERSION = 40;
 
 // 兼容命名：历史代码中使用 DB_SCHEMA_VERSION
 export const DB_SCHEMA_VERSION = APP_SCHEMA_VERSION;

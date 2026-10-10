@@ -58,6 +58,16 @@ type CheckStage = "preparing" | "detecting" | "dispatching" | "finished";
 type DetectRefResult = {
   refType: string;
   ref: string | null;
+  /**
+   * 跟踪键（修改点：P0 水位键错位）
+   *
+   * 上面的 `ref` 是 provider 解析出来的具体版本（release 模式跟踪「最新」时是具体 Tag），
+   * 只能用于展示；`trackingRef` 才是 repo_detect_states 的状态键。
+   * 必须把它一路转进备份任务的 payload —— 以前这里没有这两个字段，
+   * 组 payload 时跟踪键就被丢掉了，备份成功后水位落到错的状态行上。
+   */
+  trackingRef?: string | null;
+  trackingRefType?: string;
   commitSha: string | null;
   shortCommitSha: string | null;
   version: string | null;
@@ -326,6 +336,15 @@ export class RepoBackupCheckTaskHandler implements TaskHandler {
       const refs: RepoBackupResolvedRef[] = backupCandidates.map((item) => ({
         refType: (item.refType === "tag" ? "tag" : "branch") as "branch" | "tag",
         ref: item.ref ?? null,
+        /**
+         * 修改点（P0 水位键错位）：把跟踪键一起转下去。
+         * 备份任务推进水位时只认这个字段；以前这里丢掉它，备份任务只能拿
+         * 上面那个「具体 Tag」当状态键用，于是 release 模式跟踪「最新」的仓库
+         * 水位永远落在一行新建的 ref='v9.9.9' 上，跟踪行 ref='' 永远是空的。
+         */
+        trackingRef: item.trackingRef !== undefined ? item.trackingRef : (item.ref ?? null),
+        // 缺省时回落到 refType（而不是硬当 branch）：release 仓库的状态键类型是 tag
+        trackingRefType: ((item.trackingRefType ?? item.refType) === "tag" ? "tag" : "branch") as "branch" | "tag",
         commitSha: String(item.commitSha),
         version: item.version ?? null,
         publishedAt: item.publishedAt ?? null,

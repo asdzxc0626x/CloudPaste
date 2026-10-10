@@ -19,7 +19,13 @@ import { planRetryForError, describeRetryAt, describeErrorKind } from "../../../
 import { deferRepositoryBackupSchedule } from "../../../../repobackup/schedule.js";
 // 修改点（第 4 期）：备份成功后推进该引用在 repo_detect_states 里的「已备份水位」，
 // 否则下一轮检测仍会认为有更新，同一个版本会被反复备份
-import { advanceBackedUpWatermark } from "../../../../repobackup/detect.js";
+// 修改点（P0 水位键错位）：再引入跟踪键的归一与收敛工具，水位只许落在跟踪键上
+import {
+  advanceBackedUpWatermark,
+  normalizeRef,
+  resolveTrackingRefKey,
+  refTypeOfTrackMode,
+} from "../../../../repobackup/detect.js";
 /**
  * 修改点（状态显示不一致修复）：条目的「状态」与「结果」分开表达。
  * itemResult.status 仍是任务系统的通用条目状态（pending/processing/success/failed/skipped），
@@ -316,10 +322,40 @@ export class RepoBackupTaskHandler implements TaskHandler {
       : [];
     const usePreresolved = preresolvedRefs.length > 0;
 
-    const backupPlan: Array<{ trackRef: string | null; preresolved: RepoBackupResolvedRef | null }> = usePreresolved
-      ? preresolvedRefs.map((item) => ({ trackRef: item.ref ?? null, preresolved: item }))
+    /**
+     * 本次要备份的引用计划
+     *
+     * 修改点（P0 水位键错位）：计划项同时带「展示用 ref」与「跟踪键」两个字段。
+     *   trackRef     —— 展示 / 请求 provider 用（release 模式跟踪「最新」时为 null）
+     *   trackingRef  —— repo_detect_states 的状态键，推进水位只认它
+     * 预解析路径以前直接把 `item.ref`（已经是具体 Tag）当成 trackRef 一路传下去，
+     * 水位就落到了错的行上。现在跟踪键单独取，并用 resolveTrackingRefKey
+     * 对历史 payload（没有该字段）做收敛兜底。
+     */
+    const backupPlan: Array<{
+      trackRef: string | null;
+      trackingRef: string;
+      trackingRefType: "branch" | "tag";
+      preresolved: RepoBackupResolvedRef | null;
+    }> = usePreresolved
+      ? preresolvedRefs.map((item) => ({
+          trackRef: item.ref ?? null,
+          trackingRef:
+            item.trackingRef !== undefined
+              ? normalizeRef(item.trackingRef)
+              : resolveTrackingRefKey(repoRow, item.ref ?? null, item.refType),
+          // 跟踪键的 ref_type 与仓库 track_mode 同源，不取 provider 返回的那个，
+          // 避免「状态键类型」与「状态键」来自两个不同来源
+          trackingRefType: refTypeOfTrackMode(trackMode),
+          preresolved: item,
+        }))
       // 显式标注参数类型：resolveTrackRefs 是 JS 模块（无 .d.ts），不标注会退化成隐式 any
-      : trackRefs.map((ref: string | null) => ({ trackRef: ref ?? null, preresolved: null }));
+      : trackRefs.map((ref: string | null) => ({
+          trackRef: ref ?? null,
+          trackingRef: normalizeRef(ref),
+          trackingRefType: refTypeOfTrackMode(trackMode),
+          preresolved: null,
+        }));
 
     if (backupPlan.length === 0) {
       throw new ValidationError(`仓库未配置任何跟踪引用: ${repoIdentifier}`);
@@ -445,6 +481,9 @@ export class RepoBackupTaskHandler implements TaskHandler {
     // ---------- 3. 逐个引用（分支）备份 ----------
     for (const planItem of backupPlan) {
       const trackRef = planItem.trackRef;
+      // 修改点（P0 水位键错位）：本轮推进水位要用的状态键，与展示用的 trackRef 分开
+      const trackingRef = planItem.trackingRef;
+      const trackingRefType = planItem.trackingRefType;
       currentRef = trackRef ?? null;
       const itemResult: ItemResult = {
         kind: "repo",
@@ -557,13 +596,16 @@ export class RepoBackupTaskHandler implements TaskHandler {
               await advanceBackedUpWatermark(
                 codeRepo,
                 repoRow.id,
-                version.refType,
-                version.ref ?? trackRef ?? null,
+                // 修改点（P0 水位键错位）：用跟踪键，不用 provider 解析出的具体 Tag。
+                // 这里原先传 `version.ref ?? trackRef`，release 模式跟踪「最新」时
+                // 会把水位写到一行全新的 ref='v9.9.9' 上，跟踪行永远不更新
+                trackingRefType,
+                trackingRef,
                 version.commitSha,
                 // 修改点（正常跳过时的状态一致性）：这次跳过恰好证明了
                 // 「当前版本就是已备份的那个版本」，把它记成一次成功检测，
                 // 仓库管理页才会和任务列表一样显示「已是最新」而不是「成功完成」
-                { markDetected: true },
+                { markDetected: true, repoRow },
               );
 
               itemResult.status = "skipped";
@@ -958,9 +1000,15 @@ export class RepoBackupTaskHandler implements TaskHandler {
           await advanceBackedUpWatermark(
             codeRepo,
             repoRow.id,
-            version.refType,
-            version.ref ?? trackRef ?? null,
+            trackingRefType,
+            // 修改点（P0 水位键错位）：这里原先传 `version.ref ?? trackRef ?? null`，
+            // 即 provider 解析出的具体 Tag —— release 模式跟踪「最新」时水位会被写到
+            // 一行新建的 ref='v9.9.9' 状态行上，真正的跟踪行 ref='' 永远拿不到水位，
+            // 于是每轮检测都判「有更新」→ 反复创建备份任务。改用跟踪键，并带上
+            // repoRow 让 advanceBackedUpWatermark 再做一次收敛兜底。
+            trackingRef,
             version.commitSha,
+            { repoRow },
           );
         }
 

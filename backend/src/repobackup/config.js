@@ -115,13 +115,20 @@ export function parseStringArray(raw, options = {}) {
  * - branch 模式：返回分支名数组（来自 track_refs_json）
  * - release 模式：返回单元素数组，元素可能为 null（表示“最新 Release”）
  *
+ * 修改点（P0 跟踪键语义统一）：release 模式下把空 Tag 的两种历史写法
+ * （`track_ref = NULL` 与 `track_ref = ''`）统一归到 `null`。
+ * 这里是「跟踪键」的唯一产地，上层再用 normalizeRef 归到 DB 键形态（空串），
+ * 于是同一个「最新 Release」仓库不会因为列里存的是 '' 还是 NULL
+ * 而在 repo_detect_states 里长出两行状态。
+ *
  * @param {Object} row code_repositories 行
  * @returns {Array<string|null>}
  */
 export function resolveTrackRefs(row) {
   const trackMode = String(row?.track_mode || "branch");
   if (trackMode !== "branch") {
-    return [row?.track_ref ?? null];
+    const tag = row?.track_ref == null ? "" : String(row.track_ref).trim();
+    return [tag === "" ? null : tag];
   }
 
   const fromJson = parseStringArray(row?.track_refs_json);

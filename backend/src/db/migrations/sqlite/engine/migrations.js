@@ -261,11 +261,23 @@ export async function migrateRepoBackupSchedules(db) {
  *   升级后第一轮就会把每个仓库重新下载一遍（既浪费额度也浪费存储）。
  *
  * 回填口径：
- *   直接从 code_repository_backups 里取「每个 (仓库, ref_type, ref) 最近一次成功备份」，
+ *   直接从 code_repository_backups 里取「每个 (仓库, ref_type, 跟踪键) 最近一次成功备份」，
  *   把它的 commit_sha 写成该引用的初始水位。
- *   —— 不去解析 code_repositories.track_refs_json：SQL 里拆 JSON 数组很脆弱，
- *   而且「从未成功备份过的分支」本来就该被判为有更新（它确实需要备份），
+ *   —— 「从未成功备份过的分支」本来就该被判为有更新（它确实需要备份），
  *   不给它建行、让首轮检测自然建行，语义正好是对的。
+ *
+ * 修改点（P0 水位键错位）：回填必须按「跟踪键」落行，不能直接用备份记录的 ref。
+ *   code_repository_backups.ref 存的是 provider 解析出来的**具体版本**
+ *   （release 模式跟踪「最新 Release」时是 `v2.0.0` 这种具体 Tag），
+ *   而 repo_detect_states 的状态键是跟踪键（跟踪「最新」时是空串）。
+ *   原先直接 `COALESCE(b.ref, '')` 回填，会把水位写到一行 `ref='v2.0.0'` 上，
+ *   真正的跟踪行 `ref=''` 永远没有水位 —— 升级后每轮都判「有更新」，
+ *   反复重新备份同一个版本，形成永久空转。
+ *   所以这里 JOIN code_repositories，按 track_mode / track_ref 把 ref 折叠成跟踪键：
+ *     · release 模式 → 跟踪键恒为 track_ref 的归一值（空 Tag → 空串），ref_type 恒为 'tag'
+ *     · branch 模式  → 分支名本身就是跟踪键，保持备份记录的 ref
+ *   折叠后同一个 release 仓库的多条历史备份（v1.0.0 / v2.0.0 …）会落到同一个键上，
+ *   因此「取最近一条」的分组也必须按折叠后的键来做（否则会撞唯一索引）。
  *
  * next_detect_after 留 NULL = 立即到期，沿用 scheduled_jobs.next_run_after 的同一约定。
  * 这里不会造成洪峰：每个仓库各有一行 scheduled_jobs（首次执行时间本来就错开），
@@ -279,6 +291,33 @@ export async function migrateRepoDetectStates(db) {
   const result = await db
     .prepare(
       `
+      WITH keyed AS (
+        SELECT
+          b.id AS backup_id,
+          b.repository_id AS repository_id,
+          b.commit_sha AS commit_sha,
+          COALESCE(b.finished_at, b.created_at) AS backed_up_at,
+          -- 折叠成跟踪键的 ref_type：release 模式恒为 tag
+          CASE
+            WHEN COALESCE(NULLIF(TRIM(r.track_mode), ''), 'branch') <> 'branch' THEN 'tag'
+            ELSE COALESCE(NULLIF(b.ref_type, ''), 'branch')
+          END AS tracking_type,
+          -- 折叠成跟踪键：release 模式一律用 track_ref 的归一值（空 Tag → 空串），
+          -- 不用备份记录里那个具体 Tag；branch 模式分支名本身就是跟踪键
+          CASE
+            WHEN COALESCE(NULLIF(TRIM(r.track_mode), ''), 'branch') <> 'branch'
+              THEN COALESCE(NULLIF(TRIM(r.track_ref), ''), '')
+            ELSE COALESCE(b.ref, '')
+          END AS tracking_ref
+        FROM ${DbTables.CODE_REPOSITORY_BACKUPS} b
+        -- INNER JOIN：仓库已被删除的孤儿备份记录没有跟踪键可言，不回填
+        JOIN ${DbTables.CODE_REPOSITORIES} r ON r.id = b.repository_id
+        WHERE b.status = 'success'
+          AND b.commit_sha IS NOT NULL
+          AND b.commit_sha != ''
+          -- 占位 commit（留痕记录用）不是真实水位，不能拿来回填
+          AND b.commit_sha NOT LIKE 'unresolved-%'
+      )
       INSERT INTO ${DbTables.REPO_DETECT_STATES} (
         id, repository_id, ref_type, ref,
         detect_status, commit_sha, version, published_at,
@@ -290,40 +329,35 @@ export async function migrateRepoDetectStates(db) {
       )
       SELECT
         lower(hex(randomblob(16))),
-        b.repository_id,
-        COALESCE(NULLIF(b.ref_type, ''), 'branch'),
-        COALESCE(b.ref, ''),
+        k.repository_id,
+        k.tracking_type,
+        k.tracking_ref,
         'pending',
         NULL, NULL, NULL,
-        b.commit_sha,
-        COALESCE(b.finished_at, b.created_at),
+        k.commit_sha,
+        k.backed_up_at,
         NULL, NULL, NULL,
         NULL, NULL,
         0, 0,
         CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-      FROM ${DbTables.CODE_REPOSITORY_BACKUPS} b
-      WHERE b.status = 'success'
-        AND b.commit_sha IS NOT NULL
-        AND b.commit_sha != ''
-        -- 每个 (仓库, ref_type, ref) 只取最近那一条成功记录
-        AND b.id = (
-          SELECT b2.id
-          FROM ${DbTables.CODE_REPOSITORY_BACKUPS} b2
-          WHERE b2.repository_id = b.repository_id
-            AND COALESCE(NULLIF(b2.ref_type, ''), 'branch') = COALESCE(NULLIF(b.ref_type, ''), 'branch')
-            AND COALESCE(b2.ref, '') = COALESCE(b.ref, '')
-            AND b2.status = 'success'
-            AND b2.commit_sha IS NOT NULL
-            AND b2.commit_sha != ''
-          ORDER BY COALESCE(b2.finished_at, b2.created_at) DESC, b2.id DESC
+      FROM keyed k
+      -- 每个 (仓库, 跟踪键) 只取最近那一条成功记录。
+      -- 分组按**折叠后**的键做：release 仓库的多条历史备份会落到同一个键上
+      WHERE k.backup_id = (
+          SELECT k2.backup_id
+          FROM keyed k2
+          WHERE k2.repository_id = k.repository_id
+            AND k2.tracking_type = k.tracking_type
+            AND k2.tracking_ref = k.tracking_ref
+          ORDER BY k2.backed_up_at DESC, k2.backup_id DESC
           LIMIT 1
         )
         -- 可重入：已经有状态行就不碰（重跑迁移不会覆盖运行期的新水位）
         AND NOT EXISTS (
           SELECT 1 FROM ${DbTables.REPO_DETECT_STATES} s
-          WHERE s.repository_id = b.repository_id
-            AND s.ref_type = COALESCE(NULLIF(b.ref_type, ''), 'branch')
-            AND s.ref = COALESCE(b.ref, '')
+          WHERE s.repository_id = k.repository_id
+            AND s.ref_type = k.tracking_type
+            AND s.ref = k.tracking_ref
         )
     `,
     )
@@ -335,9 +369,116 @@ export async function migrateRepoDetectStates(db) {
 }
 
 /**
- * 重新分散存量仓库备份计划的执行时间（修改点：第 5 期 错峰调度）
+ * 修复 Release 模式跟踪键错位留下的错行（修改点：P0 水位键错位）
  *
- * 为什么必须做这一步：
+ * 为什么需要一条独立的修复迁移：
+ *   v38 回填时直接把 code_repository_backups.ref 当成状态键，而那个字段存的是
+ *   provider 解析出的**具体 Tag**。于是 release 模式跟踪「最新 Release」的仓库
+ *   （跟踪键是空串）在升级后拿到的是这样两行：
+ *     · ref=''        —— 跟踪键所在行，backed_up_commit_sha 是 NULL
+ *     · ref='v2.0.0'  —— 错行，backed_up_commit_sha 有值
+ *   运行期又不断把水位写回错行，所以「每轮检测都判有更新 → 反复备份同一个版本」。
+ *   修好回填逻辑（上面的 migrateRepoDetectStates）只能救**还没跑过 v38** 的库；
+ *   已经升级过、错行已经在库里的安装必须靠这条迁移纠正。
+ *
+ * 修复动作（只做最小必要的两件事）：
+ *   1. 把错行上的水位搬到真正的跟踪键行上 —— 但只在跟踪键行**还没有水位**时才搬，
+ *      绝不覆盖运行期已经推进过的、更新的水位。
+ *   2. 把错行上的水位清掉（置 NULL），让它不再参与「是否有更新」的判定。
+ *      不直接 DELETE 错行：清掉水位后它就是一个无害的、pending 的空行，
+ *      下一轮 prepareDetectRound 的 pruneDetectStates 会自然把它删掉
+ *      （它是按「当前跟踪的键集合」做清理的）。迁移里少一次硬删，
+ *      就少一次误删用户数据的风险。
+ *
+ * 范围严格限定在 release 模式：branch 模式下 ref 就是跟踪键，一行都不该动。
+ * 可重入：搬完之后错行的水位已是 NULL，再跑一次是空操作。
+ */
+
+export async function repairReleaseTrackingKeys(db) {
+  // 1. 读出全部 release 模式仓库 + 它们的检测状态行
+  const repoRows = (await db
+    .prepare(
+      `SELECT id, track_mode, track_ref FROM ${DbTables.CODE_REPOSITORIES}
+       WHERE COALESCE(NULLIF(TRIM(track_mode), ''), 'branch') <> 'branch'`,
+    )
+    .all()).results || [];
+
+  // 没有 release 仓库就没什么可修的（绝大多数安装走这条）
+  if (repoRows.length === 0) {
+    console.log("版本40：没有 Release 模式仓库，跳过跟踪键纠错");
+    return { ok: true, moved: 0, cleared: 0 };
+  }
+
+  const byRepo = new Map(repoRows.map((row) => [String(row.id), row]));
+
+  // 2. 逐个 release 仓库，把它的状态行分成「跟踪键行」和「错行」
+  //    跟踪键恒为 track_ref 的归一值（空 Tag → 空串），ref_type 恒为 'tag'
+  let moved = 0;
+  let cleared = 0;
+
+  for (const [repositoryId, repoRow] of byRepo) {
+    const trackingRef = String(repoRow.track_ref ?? "").trim();
+    const rows = (await db
+      .prepare(
+        `SELECT id, ref_type, ref, backed_up_commit_sha, backed_up_at, updated_at
+         FROM ${DbTables.REPO_DETECT_STATES}
+         WHERE repository_id = ?`,
+      )
+      .bind(repositoryId)
+      .all()).results || [];
+
+    const tracked = rows.find((row) => row.ref_type === "tag" && String(row.ref ?? "") === trackingRef);
+    const strays = rows.filter((row) => !(row.ref_type === "tag" && String(row.ref ?? "") === trackingRef));
+
+    // 错行里水位最新的那条 —— 它才是真正该被搬到跟踪键行上的水位
+    const straysWithWatermark = strays
+      .filter((row) => row.backed_up_commit_sha)
+      .sort((a, b) => {
+        const at = Date.parse(a.backed_up_at || a.updated_at || 0) || 0;
+        const bt = Date.parse(b.backed_up_at || b.updated_at || 0) || 0;
+        return bt - at;
+      });
+
+    // 2a. 跟踪键行还没有水位时，从错行搬过来（绝不覆盖运行期已推进的更新水位）
+    if (tracked && straysWithWatermark.length > 0 && !tracked.backed_up_commit_sha) {
+      const donor = straysWithWatermark[0];
+      const r = await db
+        .prepare(
+          `UPDATE ${DbTables.REPO_DETECT_STATES}
+           SET backed_up_commit_sha = ?, backed_up_at = ?, updated_at = CURRENT_TIMESTAMP
+           WHERE id = ?
+             AND (backed_up_commit_sha IS NULL OR backed_up_commit_sha = '')`,
+        )
+        .bind(donor.backed_up_commit_sha, donor.backed_up_at ?? donor.updated_at ?? null, tracked.id)
+        .run();
+      moved += Number(r?.meta?.changes ?? r?.changes ?? 0) || 0;
+    }
+    // 跟踪键行不存在（例如错行是唯一一行、且仓库还没建过跟踪行）就不搬：
+    // 让下一轮检测自然建出正确的跟踪行并推进水位，比在这里凭空造行更安全。
+
+    // 2b. 清掉错行上的水位，让它不再参与「是否有更新」的判定。
+    // 不直接 DELETE：清空后它就是一行无害的 pending 空行，
+    // 下一轮 prepareDetectRound 的 pruneDetectStates 会自然把它删掉，
+    // 迁移里少一次硬删就少一次误删用户数据的风险。
+    for (const stray of straysWithWatermark) {
+      const r = await db
+        .prepare(
+          `UPDATE ${DbTables.REPO_DETECT_STATES}
+           SET backed_up_commit_sha = NULL, backed_up_at = NULL, updated_at = CURRENT_TIMESTAMP
+           WHERE id = ? AND backed_up_commit_sha IS NOT NULL`,
+        )
+        .bind(stray.id)
+        .run();
+      cleared += Number(r?.meta?.changes ?? r?.changes ?? 0) || 0;
+    }
+  }
+
+  console.log(`版本40：Release 跟踪键纠错 —— 搬移水位 ${moved} 行，清理错行水位 ${cleared} 行`);
+  return { ok: true, moved, cleared };
+}
+
+/**
+ * 重新分散存量仓库备份计划的执行时间（修改点：第 5 期 错峰调度）
  *   v37 回填存量仓库的备份计划时，所有仓库用的是**同一个** firstRunAt
  *   （now + 默认间隔），而运行期推进又是 `now + intervalSec`，
  *   于是这些仓库永远在同一时刻到期、同一瞬间一起请求 GitHub。
@@ -1194,6 +1335,17 @@ export async function runLegacyMigrationByVersion(db, version) {
         await addRepoDetectStatesDueIndex(db);
       } catch (e) {
         console.warn("版本39：补复合索引失败（可忽略）:", e?.message || e);
+      }
+      break;
+    }
+
+    // 修改点（P0 Release 空 Tag 水位键纠错）
+    case 40: {
+      console.log("版本40：修正 Release 模式跟踪键错位留下的错行（水位搬到跟踪键行）...");
+      try {
+        await repairReleaseTrackingKeys(db);
+      } catch (e) {
+        console.warn("版本40：Release 跟踪键纠错失败（可忽略，运行期已改为只写跟踪键）:", e?.message || e);
       }
       break;
     }

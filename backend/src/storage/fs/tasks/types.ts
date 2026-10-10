@@ -102,6 +102,22 @@ export interface RepoBackupResolvedRef {
   /** 展示用版本串（main@282ea1c7 / v1.9.1） */
   version?: string | null;
   publishedAt?: string | null;
+  /**
+   * 跟踪键（修改点：P0 水位键错位）
+   *
+   * 与上面的 `ref` 的区别，以及为什么必须分成两个字段：
+   *   `ref` 是 provider 解析出来的**具体版本** —— release 模式跟踪「最新 Release」
+   *   时它会是 `v9.9.9` 这种具体 Tag，只能用于展示 / manifest / 备份记录。
+   *   `trackingRef` 才是 repo_detect_states 的状态键（「最新」= null），
+   *   检测、备份、水位推进三处必须统一用它。
+   *   混用会把水位写到一行全新的 `ref='v9.9.9'` 状态行上，真正的跟踪行
+   *   永远拿不到 backed_up_commit_sha，于是每轮都判「有更新」→ 反复备份。
+   *
+   * 可选是为了兼容升级前就已入队、payload 里没有这个字段的历史作业；
+   * 消费侧会用 resolveTrackingRefKey 兜底收敛。
+   */
+  trackingRef?: string | null;
+  trackingRefType?: 'branch' | 'tag';
 }
 
 /** 代码仓库备份任务载荷（修改点：新增功能） */
