@@ -157,7 +157,7 @@ const toggleSecret = (name) => {
 /**
  * 「路径前缀」是否已被用户手动改过（修改点：备份默认目录按仓库源区分）
  *
- * 默认目录由后端 provider 元数据下发（GitHub -> /GitHub），切换仓库源时要跟着变；
+ * 默认目录由后端 provider 元数据下发（GitHub -> /Github），切换仓库源时要跟着变；
  * 但用户一旦自己填过，就不能再被覆盖 —— 所以用一个标记区分
  * 「这还是默认值」和「这是用户写的」。
  */
@@ -167,7 +167,7 @@ const pathPrefixTouched = ref(false);
  * 取某个仓库源的默认备份目录（修改点：备份默认目录按仓库源区分）
  *
  * 目录习惯属于平台知识，由后端 provider 注册表声明（RepoProviderFactory 的
- * defaultPathPrefix），前端不硬编码 "/GitHub" 这类字符串；
+ * defaultPathPrefix），前端不硬编码 "/Github" 这类字符串；
  * 元数据缺失（还没加载完 / 该 provider 未声明）时回退根目录，与改动前一致。
  */
 const defaultPathPrefixFor = (providerType) => {
@@ -239,7 +239,7 @@ const resetForm = () => {
     // 默认选中第一个可写挂载点，减少一次点击
     targetMountIds: props.writableMounts[0]?.id ? [String(props.writableMounts[0].id)] : [],
     // 修改点（备份默认目录按仓库源区分）：新建时按当前仓库源预填默认目录
-    // （GitHub -> /GitHub），用户仍可改成任意目录
+    // （GitHub -> /Github），用户仍可改成任意目录
     targetPathPrefix: defaultPathPrefixFor(props.providers[0]?.provider || "github"),
     retentionCount: DEFAULT_RETENTION,
     scheduleEnabled: true,
@@ -259,7 +259,7 @@ const providerMeta = computed(() => props.providers.find((p) => p.provider === f
 /**
  * 切换仓库源（修改点：备份默认目录按仓库源区分）
  *
- * 默认备份目录随仓库源变化（GitHub -> /GitHub，将来的 Gitea -> /Gitea），
+ * 默认备份目录随仓库源变化（GitHub -> /Github，将来的 Gitea -> /Gitea），
  * 但只在用户还没自己填过前缀时才跟着换 —— 已经写好的目录不能被悄悄改掉。
  *
  * 注意：编辑模式下仓库源是锁定的（select 为 disabled），不会触发这里。

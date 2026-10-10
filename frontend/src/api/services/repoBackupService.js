@@ -42,7 +42,8 @@ import { get, post, put, del } from "../client";
  * @property {Object|null} configSchema - 动态表单 schema
  * @property {Object|null} ui - UI 元数据（图标 / i18nKey）
  * @property {string} [defaultPathPrefix] - 该仓库源的默认备份目录
- *   （修改点：备份默认目录按仓库源区分），如 GitHub 为 "/GitHub"；缺失时按根目录 "/" 处理
+ *   （修改点：备份默认目录按仓库源区分），如 GitHub 为 "/Github"；缺失时按根目录 "/" 处理
+ *   （修改点：默认目录改首字母大写，原为 "/GitHub"）
  */
 
 /**
@@ -86,7 +87,7 @@ import { get, post, put, del } from "../client";
  * @property {string[]} targetMountIds - 备份目标挂载点 ID 列表
  * @property {string|null} targetMountId - 第一个目标（兼容字段）
  * @property {string} targetPathPrefix - 挂载点内的存放目录；新建时默认取该仓库源的
- *   defaultPathPrefix（修改点：备份默认目录按仓库源区分），可由用户改成任意目录
+ *   defaultPathPrefix（修改点：备份默认目录按仓库源区分，如 GitHub 为 "/Github"），可由用户改成任意目录
  * @property {number} retentionCount - 保留版本数
  * @property {boolean} enabled
  * @property {string|null} lastCheckedAt
@@ -98,7 +99,7 @@ import { get, post, put, del } from "../client";
  * @property {RepoTargetMount[]} [targetMounts]
  * @property {string[]} [missingMountIds] - 已被删除的挂载点 ID
  * @property {string|null} [backupFolder] - 备份文件所在目录（可跳转挂载浏览器）；
- *   修改点（备份目录按分支分层）：这里是「仓库根目录」，形如 /GitHub/owner__repo/
+ *   修改点（备份目录按分支分层）：这里是「仓库根目录」，形如 /Github/owner__repo/
  *   （修改点：仓库目录去掉平台前缀），具体的快照在它下面的「分支目录 / 时间_分支_sha 目录」两级里
  * @property {RepoSchedule|null} [schedule] - 独立备份计划，null 表示未配置
  * @property {RepoBackup|null} [latestBackup]
@@ -172,7 +173,7 @@ import { get, post, put, del } from "../client";
  * @property {string|null} version
  * @property {BackupStatus} status
  * @property {string|null} storagePath - 快照文件落盘路径（修改点：备份目录按分支分层、快照按仓库名命名），
- *   形如 /GitHub/owner__repo/main/20261005-155036__main__8a7950d/owner__repo__main__8a7950d.tar.gz
+ *   形如 /Github/owner__repo/main/20261005-155036__main__8a7950d/owner__repo__main__8a7950d.tar.gz
  *   （修改点：仓库目录去掉平台前缀，第二级目录不再带 github__）
  * @property {string|null} manifestPath - 同一备份的 manifest，与快照同目录
  * @property {number|null} sizeBytes

@@ -38,7 +38,8 @@ function normalizeDefaultPathPrefix(prefix) {
  *     configSchema: object|null,
  *     ui: object|null,
  *     webUrlBuilder: Function|null,   // (repoIdentifier, config) => string|null
- *     defaultPathPrefix: string|null, // 备份默认落在挂载点的哪个目录，如 "/GitHub"
+ *     defaultPathPrefix: string|null, // 备份默认落在挂载点的哪个目录，如 "/Github"
+ *                                      // （修改点：默认目录改首字母大写，原为 "/GitHub"）
  *   }
  */
 const registry = new Map();
@@ -55,7 +56,11 @@ export class RepoProviderFactory {
    *        webUrlBuilder（修改点：点击 owner/repo 跳转仓库）—— 把 'owner/repo' 变成可点击的网页地址。
    *        不提供时该 provider 的仓库标识按纯文本展示（不是错误，只是不跳转）。
    *        defaultPathPrefix（修改点：备份默认目录按仓库源区分）—— 该平台的仓库备份默认落在
-   *        挂载点的哪个目录，例如 GitHub 用 "/GitHub"。不提供时回退到根目录 "/"。
+   *        挂载点的哪个目录，例如 GitHub 用 "/Github"。不提供时回退到根目录 "/"。
+   *        命名约定（修改点：默认目录改首字母大写）：目录名一律「首字母大写 + 其余小写」，
+   *        即 Github / Gitea / Gitlab 这种写法，而不是品牌官方的大小写（GitHub）。
+   *        原因是目录名要跟存量数据保持一致 —— 线上老备份就落在 /Github，
+   *        若新默认写成 /GitHub，同一批备份会被拆到两个只差一个字母的目录里
    */
   static registerProvider(type, { ctor, displayName = null, validate = null, trackModes = ["branch", "release"], configSchema = null, ui = null, webUrlBuilder = null, defaultPathPrefix = null } = {}) {
     if (!type || !ctor) {
@@ -135,9 +140,10 @@ export class RepoProviderFactory {
   /**
    * 获取某 provider 的默认备份目录（修改点：备份默认目录按仓库源区分）
    *
-   * 每个平台有自己的目录习惯（GitHub 的仓库放 /GitHub，将来 Gitea 放 /Gitea），
+   * 每个平台有自己的目录习惯（GitHub 的仓库放 /Github，将来 Gitea 放 /Gitea），
    * 让 provider 自己声明，表单默认值与创建接口的兜底值都取自这里，
-   * 不会出现「界面显示 /GitHub、落库却是 /」这种前后端各写一份默认值的偏差。
+   * 不会出现「界面显示 /Github、落库却是 /」这种前后端各写一份默认值的偏差。
+   * （修改点：默认目录改首字母大写，原先注释与取值都是 /GitHub）
    *
    * @param {string} providerType
    * @returns {string} 以 / 开头、不以 / 结尾；未注册或未声明时为根目录 "/"
@@ -223,9 +229,11 @@ RepoProviderFactory.registerProvider(RepoProviderFactory.SUPPORTED_TYPES.GITHUB,
   // 修改点（点击 owner/repo 跳转仓库）：默认跳到 github.com；
   // endpoint_url 指向自建 / GitHub Enterprise 时，反推到该实例的网页地址
   webUrlBuilder: buildGithubRepositoryWebUrl,
-  // 修改点（备份默认目录按仓库源区分）：GitHub 的仓库默认备份到挂载点的 /GitHub 目录，
+  // 修改点（备份默认目录按仓库源区分）：GitHub 的仓库默认备份到挂载点的 /Github 目录，
   // 与将来接入 Gitea（/Gitea）等平台天然分开，多来源备份不再混在同一层
-  defaultPathPrefix: "/GitHub",
+  // 修改点（默认目录改首字母大写）：/GitHub -> /Github，与存量备份所在目录一致
+  // （目录名统一「首字母大写 + 其余小写」，不是品牌官方写法 GitHub）
+  defaultPathPrefix: "/Github",
   ui: {
     icon: "storage-github-api",
     i18nKey: "admin.repoBackup.provider.github",

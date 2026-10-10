@@ -19,7 +19,7 @@
  *   删除某个版本时整目录拿走即可，不会误伤邻居
  *
  * 修改点（仓库目录去掉平台前缀）：仓库目录名由 `{provider}__{owner}__{repo}` 改为 `{owner}__{repo}`。
- * 上级目录本来就按仓库源分（GitHub 默认落到 /GitHub），仓库源在路径里重复出现了一次，
+ * 上级目录本来就按仓库源分（GitHub 默认落到 /Github），仓库源在路径里重复出现了一次，
  * 于是 github__owner__repo 变成 owner__repo，路径更短也更好认。
  *
  * 修改点（快照按仓库名命名）：专属目录里的文件用 owner__repo__ref__sha 命名（不带平台前缀），
@@ -114,7 +114,7 @@ function splitRepoIdentifier(repoIdentifier) {
  *
  * 修改点（仓库目录去掉平台前缀）：原来是 `${provider}__${owner}__${repo}`（例如
  * github__ling-drag0n__CloudPaste），现在只留 owner__repo。上级目录已经按仓库源分
- * （GitHub 默认落到 /GitHub），仓库源没必要在路径里重复一遍。
+ * （GitHub 默认落到 /Github），仓库源没必要在路径里重复一遍。
  * provider 参数保留只是为了不动调用方签名，已不参与拼名。
  *
  * 取舍：默认前缀按仓库源分目录，所以不同仓库源的同名 owner/repo 不会撞在一起；

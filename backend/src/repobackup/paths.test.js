@@ -7,8 +7,12 @@
  *         └ 本次备份专属目录 {yyyyMMdd-HHmmss}__{ref}__{sha7}/
  *             ├ {owner}__{repo}__{ref}__{sha7}.tar.gz
  *             └ {owner}__{repo}__{ref}__{sha7}.manifest.json
- * 例：/GitHub/angusdevgo__IDM_Pro_Tool/test/20261005-155036__test__8a7950d/angusdevgo__IDM_Pro_Tool__test__8a7950d.tar.gz
- * （修改点：仓库目录去掉平台前缀，原先是 github__owner__repo）
+ * 例：/Github/angusdevgo__IDM_Pro_Tool/test/20261005-155036__test__8a7950d/angusdevgo__IDM_Pro_Tool__test__8a7950d.tar.gz
+ * （修改点：仓库目录去掉平台前缀，原先是 github__owner__repo；
+ *   修改点：默认目录改首字母大写，示例里的 /Github 与 provider 默认值一致）
+ *
+ * 注：用例里的 pathPrefix 是「用户/表单传入的前缀」，不是 provider 默认值，
+ * 这里取 /Github 只是为了让示例与线上实际目录一致
  *
  * 这套测试锁三件事：
  * 1. 路径形态本身（分支目录、专属目录、目录名与文件名的分工）
@@ -31,14 +35,14 @@ const AT = new Date(Date.UTC(2026, 9, 5, 15, 50, 36)); // 2026-10-05 15:50:36 UT
 
 const BASE = {
   mountPath: "/backup",
-  pathPrefix: "/GitHub",
+  pathPrefix: "/Github",
   provider: "github",
   repoIdentifier: "angusdevgo/IDM_Pro_Tool",
   commitSha: "8a7950d1234567890abcdef",
   at: AT,
 };
 
-const REPO_DIR = "/backup/GitHub/angusdevgo__IDM_Pro_Tool";
+const REPO_DIR = "/backup/Github/angusdevgo__IDM_Pro_Tool";
 
 test("新结构：分支目录 + 本次备份专属目录，目录名与文件名各司其职", () => {
   const paths = planBackupPaths({ ...BASE, ref: "main" });
@@ -105,7 +109,7 @@ test("分支名带斜杠不会拼出多级目录", () => {
   assert.ok(paths.backupDirPath.includes("/feature-login/20261005-155036__feature-login__8a7950d/"));
   assert.equal(paths.archiveFileName, "angusdevgo__IDM_Pro_Tool__feature-login__8a7950d.tar.gz");
   // 目录层级固定为「仓库 / 分支 / 备份」三层，ref 里的斜杠不能改变层数
-  const depth = paths.backupDirPath.replace("/backup/GitHub/", "").split("/").filter(Boolean).length;
+  const depth = paths.backupDirPath.replace("/backup/Github/", "").split("/").filter(Boolean).length;
   assert.equal(depth, 3);
 });
 
@@ -125,7 +129,8 @@ test("仓库目录名是 owner__repo（修改点：去掉平台前缀）", () =>
     buildRepoFolderName({ provider: "github", repoIdentifier: "angusdevgo/IDM_Pro_Tool" }),
     "angusdevgo__IDM_Pro_Tool",
   );
-  // 仓库源由上级前缀目录体现（GitHub → /GitHub），不再重复进目录名
+  // 仓库源由上级前缀目录体现（GitHub → /Github），不再重复进目录名
+  // （修改点：默认目录改首字母大写，原为 /GitHub）
   assert.equal(
     buildRepoFolderName({ provider: "github", repoIdentifier: "angusdevgo/IDM_Pro_Tool" }),
     buildRepoFolderName({ provider: "anything-else", repoIdentifier: "angusdevgo/IDM_Pro_Tool" }),
