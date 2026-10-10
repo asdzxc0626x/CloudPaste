@@ -154,12 +154,45 @@ const toggleSecret = (name) => {
   secretVisible[name] = !secretVisible[name];
 };
 
+/**
+ * 「路径前缀」是否已被用户手动改过（修改点：备份默认目录按仓库源区分）
+ *
+ * 默认目录由后端 provider 元数据下发（GitHub -> /GitHub），切换仓库源时要跟着变；
+ * 但用户一旦自己填过，就不能再被覆盖 —— 所以用一个标记区分
+ * 「这还是默认值」和「这是用户写的」。
+ */
+const pathPrefixTouched = ref(false);
+
+/**
+ * 取某个仓库源的默认备份目录（修改点：备份默认目录按仓库源区分）
+ *
+ * 目录习惯属于平台知识，由后端 provider 注册表声明（RepoProviderFactory 的
+ * defaultPathPrefix），前端不硬编码 "/GitHub" 这类字符串；
+ * 元数据缺失（还没加载完 / 该 provider 未声明）时回退根目录，与改动前一致。
+ */
+const defaultPathPrefixFor = (providerType) => {
+  const meta = props.providers.find((p) => p.provider === providerType);
+  const prefix = meta?.defaultPathPrefix;
+  return typeof prefix === "string" && prefix.trim() ? prefix.trim() : "/";
+};
+
+/**
+ * 路径前缀输入（修改点：备份默认目录按仓库源区分）
+ * 显式接管 input 而不叠加在 v-model 上，避免依赖「v-model 与 @input 同时存在」的合并语义。
+ */
+const onPathPrefixInput = (value) => {
+  formData.targetPathPrefix = value;
+  pathPrefixTouched.value = true;
+};
+
 /** 用传入的 repo 初始化表单 */
 const resetForm = () => {
   localError.value = "";
   branchDraft.value = "";
   advancedOpen.value = false;
   targetOpen.value = false;
+  // 每次打开（或切换编辑对象）都重新开始，默认目录可以跟随仓库源
+  pathPrefixTouched.value = false;
 
   if (props.repo) {
     const refs = Array.isArray(props.repo.trackRefs) && props.repo.trackRefs.length > 0
@@ -179,7 +212,9 @@ const resetForm = () => {
       trackRefs: props.repo.trackMode === "branch" ? (refs.length > 0 ? refs : ["main"]) : ["main"],
       trackRef: props.repo.trackMode === "branch" ? "" : (refs[0] || ""),
       targetMountIds: mountIds,
-      targetPathPrefix: props.repo.targetPathPrefix || "/",
+      // 修改点（备份默认目录按仓库源区分）：编辑既有仓库时保留它自己的前缀，
+      // 存量数据里为空才回退到该仓库源的默认目录
+      targetPathPrefix: props.repo.targetPathPrefix || defaultPathPrefixFor(props.repo.provider),
       retentionCount: Number(props.repo.retentionCount) || DEFAULT_RETENTION,
       // 修改点（独立备份计划）：计划缺失（v36 及更早的存量仓库）时按默认开启处理
       scheduleEnabled: props.repo.schedule ? props.repo.schedule.enabled !== false : true,
@@ -203,7 +238,9 @@ const resetForm = () => {
     trackRef: "",
     // 默认选中第一个可写挂载点，减少一次点击
     targetMountIds: props.writableMounts[0]?.id ? [String(props.writableMounts[0].id)] : [],
-    targetPathPrefix: "/",
+    // 修改点（备份默认目录按仓库源区分）：新建时按当前仓库源预填默认目录
+    // （GitHub -> /GitHub），用户仍可改成任意目录
+    targetPathPrefix: defaultPathPrefixFor(props.providers[0]?.provider || "github"),
     retentionCount: DEFAULT_RETENTION,
     scheduleEnabled: true,
     scheduleType: "interval",
@@ -218,6 +255,35 @@ watch(() => props.repo, resetForm, { immediate: true });
 
 /** 当前 provider 的元数据 */
 const providerMeta = computed(() => props.providers.find((p) => p.provider === formData.provider) || null);
+
+/**
+ * 切换仓库源（修改点：备份默认目录按仓库源区分）
+ *
+ * 默认备份目录随仓库源变化（GitHub -> /GitHub，将来的 Gitea -> /Gitea），
+ * 但只在用户还没自己填过前缀时才跟着换 —— 已经写好的目录不能被悄悄改掉。
+ *
+ * 注意：编辑模式下仓库源是锁定的（select 为 disabled），不会触发这里。
+ */
+const onProviderChange = (providerType) => {
+  formData.provider = providerType;
+  if (!pathPrefixTouched.value) {
+    formData.targetPathPrefix = defaultPathPrefixFor(providerType);
+  }
+};
+
+/**
+ * provider 元数据是异步加载的（页面 onMounted 才请求）。
+ * 若弹窗先打开、元数据后到，resetForm 那一刻只能拿到根目录兜底值，
+ * 这里补一次 —— 只在新建、且用户尚未手动改动过前缀时生效，
+ * 不会覆盖编辑模式下的既有配置。
+ */
+watch(
+  () => props.providers,
+  () => {
+    if (isEditMode.value || pathPrefixTouched.value) return;
+    formData.targetPathPrefix = defaultPathPrefixFor(formData.provider);
+  },
+);
 
 /** provider 私有字段列表（来自后端 configSchema） */
 const configFields = computed(() => {
@@ -542,7 +608,9 @@ onBeforeUnmount(() => document.removeEventListener("keydown", onEscClose));
             <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
               <div>
                 <label :class="labelClass">{{ $t("admin.repoBackup.form.provider") }}</label>
-                <select v-model="formData.provider" :class="inputClass" :disabled="isEditMode">
+                <!-- 修改点（备份默认目录按仓库源区分）：改走 change 事件，
+                     切换仓库源时同步刷新「路径前缀」的默认目录 -->
+                <select :value="formData.provider" :class="inputClass" :disabled="isEditMode" @change="onProviderChange($event.target.value)">
                   <option v-for="p in providers" :key="p.provider" :value="p.provider">{{ p.displayName }}</option>
                 </select>
               </div>
@@ -691,7 +759,15 @@ onBeforeUnmount(() => document.removeEventListener("keydown", onEscClose));
             <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
               <div>
                 <label :class="labelClass">{{ $t("admin.repoBackup.form.pathPrefix") }}</label>
-                <input v-model="formData.targetPathPrefix" type="text" :class="inputClass" placeholder="/" />
+                <!-- 修改点（备份默认目录按仓库源区分）：默认值随仓库源变化，
+                     用户手动输入后即固定，不再被切换覆盖 -->
+                <input
+                  :value="formData.targetPathPrefix"
+                  type="text"
+                  :class="inputClass"
+                  placeholder="/"
+                  @input="onPathPrefixInput($event.target.value)"
+                />
                 <p :class="hintClass">{{ $t("admin.repoBackup.form.pathPrefixHint") }}</p>
               </div>
 

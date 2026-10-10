@@ -8,8 +8,24 @@
  */
 
 import { ValidationError, NotFoundError } from "../../http/errors.js";
+// 修改点（备份默认目录按仓库源区分）：默认目录与用户手填的前缀走同一套清洗规则
+import { normalizePathPrefix } from "../paths.js";
 // 修改点（点击 owner/repo 跳转仓库）：GitHub 的网页地址推导随 provider 一起注册
 import { GithubRepoProvider, buildGithubRepositoryWebUrl } from "./GithubRepoProvider.js";
+
+/**
+ * 规范化 provider 声明的默认备份目录（修改点：备份默认目录按仓库源区分）
+ * - 复用 paths.js 的 normalizePathPrefix，保证默认值与用户手填值语义一致；
+ *   "." / ".." 之类的非法值会在注册阶段直接抛错，属于开发期就该发现的配置错误
+ * - 空值 / 根目录一律折成 "/"，前端与创建接口都按「根目录」理解
+ * @param {string|null|undefined} prefix
+ * @returns {string} 以 / 开头、不以 / 结尾；根目录为 "/"
+ */
+function normalizeDefaultPathPrefix(prefix) {
+  const raw = String(prefix ?? "").trim();
+  if (!raw) return "/";
+  return normalizePathPrefix(raw) || "/";
+}
 
 /**
  * provider 注册表
@@ -22,6 +38,7 @@ import { GithubRepoProvider, buildGithubRepositoryWebUrl } from "./GithubRepoPro
  *     configSchema: object|null,
  *     ui: object|null,
  *     webUrlBuilder: Function|null,   // (repoIdentifier, config) => string|null
+ *     defaultPathPrefix: string|null, // 备份默认落在挂载点的哪个目录，如 "/GitHub"
  *   }
  */
 const registry = new Map();
@@ -34,11 +51,13 @@ export class RepoProviderFactory {
   /**
    * 注册 provider
    * @param {string} type
-   * @param {{ ctor: Function, displayName?: string, validate?: Function|null, trackModes?: string[], configSchema?: object|null, ui?: object|null, webUrlBuilder?: Function|null }} meta
+   * @param {{ ctor: Function, displayName?: string, validate?: Function|null, trackModes?: string[], configSchema?: object|null, ui?: object|null, webUrlBuilder?: Function|null, defaultPathPrefix?: string|null }} meta
    *        webUrlBuilder（修改点：点击 owner/repo 跳转仓库）—— 把 'owner/repo' 变成可点击的网页地址。
    *        不提供时该 provider 的仓库标识按纯文本展示（不是错误，只是不跳转）。
+   *        defaultPathPrefix（修改点：备份默认目录按仓库源区分）—— 该平台的仓库备份默认落在
+   *        挂载点的哪个目录，例如 GitHub 用 "/GitHub"。不提供时回退到根目录 "/"。
    */
-  static registerProvider(type, { ctor, displayName = null, validate = null, trackModes = ["branch", "release"], configSchema = null, ui = null, webUrlBuilder = null } = {}) {
+  static registerProvider(type, { ctor, displayName = null, validate = null, trackModes = ["branch", "release"], configSchema = null, ui = null, webUrlBuilder = null, defaultPathPrefix = null } = {}) {
     if (!type || !ctor) {
       throw new ValidationError("registerProvider 需要提供 type 和 ctor");
     }
@@ -50,6 +69,7 @@ export class RepoProviderFactory {
       configSchema: configSchema || null,
       ui: ui || null,
       webUrlBuilder: typeof webUrlBuilder === "function" ? webUrlBuilder : null,
+      defaultPathPrefix: normalizeDefaultPathPrefix(defaultPathPrefix),
     });
   }
 
@@ -113,6 +133,20 @@ export class RepoProviderFactory {
   }
 
   /**
+   * 获取某 provider 的默认备份目录（修改点：备份默认目录按仓库源区分）
+   *
+   * 每个平台有自己的目录习惯（GitHub 的仓库放 /GitHub，将来 Gitea 放 /Gitea），
+   * 让 provider 自己声明，表单默认值与创建接口的兜底值都取自这里，
+   * 不会出现「界面显示 /GitHub、落库却是 /」这种前后端各写一份默认值的偏差。
+   *
+   * @param {string} providerType
+   * @returns {string} 以 / 开头、不以 / 结尾；未注册或未声明时为根目录 "/"
+   */
+  static getDefaultPathPrefix(providerType) {
+    return registry.get(providerType)?.defaultPathPrefix || "/";
+  }
+
+  /**
    * 获取单个 provider 的元数据（前端动态表单用）
    * @param {string} providerType
    */
@@ -125,6 +159,8 @@ export class RepoProviderFactory {
       trackModes: entry.trackModes,
       configSchema: entry.configSchema,
       ui: entry.ui,
+      // 修改点（备份默认目录按仓库源区分）：前端表单据此预填「路径前缀」
+      defaultPathPrefix: entry.defaultPathPrefix,
     };
   }
 
@@ -187,6 +223,9 @@ RepoProviderFactory.registerProvider(RepoProviderFactory.SUPPORTED_TYPES.GITHUB,
   // 修改点（点击 owner/repo 跳转仓库）：默认跳到 github.com；
   // endpoint_url 指向自建 / GitHub Enterprise 时，反推到该实例的网页地址
   webUrlBuilder: buildGithubRepositoryWebUrl,
+  // 修改点（备份默认目录按仓库源区分）：GitHub 的仓库默认备份到挂载点的 /GitHub 目录，
+  // 与将来接入 Gitea（/Gitea）等平台天然分开，多来源备份不再混在同一层
+  defaultPathPrefix: "/GitHub",
   ui: {
     icon: "storage-github-api",
     i18nKey: "admin.repoBackup.provider.github",

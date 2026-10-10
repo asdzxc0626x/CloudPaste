@@ -727,7 +727,12 @@ export async function createRepository(db, repositoryFactory, encryptionSecret, 
   const schedule = resolveScheduleInput(body, null);
 
   // 前缀规范化同时承担校验职责（禁止 . 与 ..）
-  const targetPathPrefix = normalizePathPrefix(body?.targetPathPrefix ?? body?.target_path_prefix ?? "/") || "/";
+  // 修改点（备份默认目录按仓库源区分）：调用方（表单 / API）没给前缀时，
+  // 用该 provider 自己声明的目录（GitHub -> /GitHub），而不是一律根目录；
+  // 显式传了值（包括显式传 "/"）则完全按传的来，不改用户意图。
+  const rawPathPrefix = body?.targetPathPrefix ?? body?.target_path_prefix;
+  const targetPathPrefix =
+    normalizePathPrefix(rawPathPrefix ?? RepoProviderFactory.getDefaultPathPrefix(provider)) || "/";
 
   const duplicates = await codeRepo.findRepositoriesByIdentity({ provider, repoIdentifier, trackMode });
   if (duplicates.length > 0) {

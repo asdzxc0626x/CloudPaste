@@ -192,8 +192,9 @@ export default {
       mountMissingCount: "{count} missing",
       noWritableMount: "No writable mount available. Add a writable mount in \"Mount Management\" first.",
       pathPrefix: "Path prefix",
+      // 修改点（备份默认目录按仓库源区分）：默认目录不再是根目录，而是按仓库类型分目录
       pathPrefixHint:
-        "Directory inside the mount, root by default; each repository gets its own subdirectory",
+        "Directory inside the mount, by default a per-type folder (GitHub → /GitHub); each repository gets its own subdirectory",
       retentionCount: "Versions to keep",
       retentionCountHint: "Older versions are deleted automatically beyond this count; default {count}",
 

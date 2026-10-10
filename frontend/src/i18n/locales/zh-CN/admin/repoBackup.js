@@ -195,7 +195,8 @@ export default {
       mountMissingCount: "{count} 个已丢失",
       noWritableMount: "没有可写入的挂载点，请先在「挂载管理」中添加一个支持写入的挂载点",
       pathPrefix: "路径前缀",
-      pathPrefixHint: "挂载点内的存放目录，默认根目录；每个仓库会在其下自动建子目录",
+      // 修改点（备份默认目录按仓库源区分）：默认目录不再是根目录，而是按仓库类型分目录
+      pathPrefixHint: "挂载点内的存放目录，默认按仓库类型分目录（GitHub 对应 /GitHub）；每个仓库会在其下自动建子目录",
       retentionCount: "保留版本数",
       retentionCountHint: "超过该数量后自动删除最旧的版本，默认 {count} 个",
 

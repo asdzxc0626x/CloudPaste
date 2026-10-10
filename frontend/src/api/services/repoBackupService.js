@@ -41,6 +41,8 @@ import { get, post, put, del } from "../client";
  * @property {TrackMode[]} trackModes - 支持的跟踪模式
  * @property {Object|null} configSchema - 动态表单 schema
  * @property {Object|null} ui - UI 元数据（图标 / i18nKey）
+ * @property {string} [defaultPathPrefix] - 该仓库源的默认备份目录
+ *   （修改点：备份默认目录按仓库源区分），如 GitHub 为 "/GitHub"；缺失时按根目录 "/" 处理
  */
 
 /**
@@ -83,7 +85,8 @@ import { get, post, put, del } from "../client";
  * @property {string|null} trackRef - 主引用（兼容字段）
  * @property {string[]} targetMountIds - 备份目标挂载点 ID 列表
  * @property {string|null} targetMountId - 第一个目标（兼容字段）
- * @property {string} targetPathPrefix
+ * @property {string} targetPathPrefix - 挂载点内的存放目录；新建时默认取该仓库源的
+ *   defaultPathPrefix（修改点：备份默认目录按仓库源区分），可由用户改成任意目录
  * @property {number} retentionCount - 保留版本数
  * @property {boolean} enabled
  * @property {string|null} lastCheckedAt
