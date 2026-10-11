@@ -613,50 +613,52 @@ export class CodeRepositoryRepository extends BaseRepository {
   }
 
   /**
-   * 取某仓库在某挂载点上「仍被数据库引用」的落盘路径
+   * 取某仓库「仍被数据库引用」的全部落盘路径
    * （修改点：同分支同 sha 只保留一个目录）
    *
    * 用途：目录去重要删掉「同分支同 sha 的多余目录」，但绝不能删掉任何
    * 还挂在备份记录上的目录 —— 那会让备份历史里的下载链接指向不存在的文件。
    * 所以删之前先问一句「这个目录还有记录引用吗」。
    *
-   * 口径说明：
-   * - 不限 status。deferred / failed 的目标行也可能带着 storage_path（上一轮写成功、
-   *   这一轮才失败的补写场景），它们指向的文件仍然是有效快照，不能删；
-   * - 同时取 targets 表与 backups 表（v35 及更早的记录把路径直接存在备份记录上），
-   *   与 retention.groupPathsByMount 的兼容口径保持一致。
+   * 口径说明（故意取"宽"而不是"准"）：
+   * - 不按挂载点过滤：返回的是**完整 FS 路径**（已含挂载点前缀），调用方按路径前缀
+   *   匹配即可。不过滤就不必关心 mount_id 在两张表里的类型差异（TEXT/INTEGER 比较
+   *   在 SQLite 下不会隐式转换，过滤反而容易漏掉本该保护的路径）；
+   * - 不按 status 过滤：deferred / failed 的目标行也可能带着 storage_path
+   *   （上一轮写成功、这一轮补写才失败），它们指向的文件仍是有效快照；
+   * - 这个集合是**保护名单**，宁可多列几条（多保留一个目录，下次备份再收）
+   *   也不能少列（少列就会误删仍被引用的快照）。
    *
    * @param {string} repositoryId
-   * @param {string|number} mountId
-   * @returns {Promise<string[]>} 该挂载点上仍被引用的文件路径（未去重）
+   * @returns {Promise<string[]>} 仍被引用的完整 FS 路径（未去重）
    */
-  async findReferencedPathsByMount(repositoryId, mountId) {
-    if (!repositoryId || mountId === undefined || mountId === null) return [];
+  async findReferencedPaths(repositoryId) {
+    if (!repositoryId) return [];
 
     const paths = [];
+    const collect = (rows) => {
+      for (const row of rows || []) {
+        if (row?.storage_path) paths.push(String(row.storage_path));
+        if (row?.manifest_path) paths.push(String(row.manifest_path));
+      }
+    };
 
     const targetRows = await this.query(
       `SELECT t.storage_path AS storage_path, t.manifest_path AS manifest_path
        FROM ${DbTables.CODE_REPOSITORY_BACKUP_TARGETS} t
        JOIN ${DbTables.CODE_REPOSITORY_BACKUPS} b ON b.id = t.backup_id
-       WHERE b.repository_id = ? AND t.mount_id = ?`,
-      [repositoryId, mountId],
+       WHERE b.repository_id = ?`,
+      [repositoryId],
     );
-    for (const row of targetRows.results || []) {
-      if (row?.storage_path) paths.push(String(row.storage_path));
-      if (row?.manifest_path) paths.push(String(row.manifest_path));
-    }
+    collect(targetRows.results);
 
-    // 兼容 v35 数据：路径直接存在备份记录上，挂载点由 target_mount_id 标识
+    // 兼容 v35 及更早的数据：路径直接存在备份记录上，没有 targets 行
     const legacyRows = await this.query(
       `SELECT storage_path, manifest_path FROM ${DbTables.CODE_REPOSITORY_BACKUPS}
-       WHERE repository_id = ? AND target_mount_id = ?`,
-      [repositoryId, mountId],
+       WHERE repository_id = ?`,
+      [repositoryId],
     );
-    for (const row of legacyRows.results || []) {
-      if (row?.storage_path) paths.push(String(row.storage_path));
-      if (row?.manifest_path) paths.push(String(row.manifest_path));
-    }
+    collect(legacyRows.results);
 
     return paths;
   }

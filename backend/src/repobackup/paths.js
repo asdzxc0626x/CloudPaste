@@ -24,6 +24,12 @@
  *
  * 修改点（快照按仓库名命名）：专属目录里的文件用 owner__repo__ref__sha 命名（不带平台前缀），
  * 文件名自身就能说明「哪个仓库的哪个分支哪个版本」，单独拿出去也认得出来
+ *
+ * 修改点（同分支同 sha 只保留一个目录）：新增 parseBackupDirName / buildBackupGroupKey。
+ * 目录名里的时间戳是「本次写入时刻」，同一个 (分支, sha) 重跑一次就多一个目录，
+ * 于是挂载浏览里出现多个只有时间不同的同分支同 sha 文件夹。
+ * 去重需要的「目录名 -> (分支, sha) 身份」这一步放在这里，与路径规划共用同一套命名规则，
+ * 命名规则将来改了也不会出现「生成用一套、解析用另一套」的错位。
  */
 
 import { ValidationError } from "../http/errors.js";
@@ -45,6 +51,52 @@ const DEFAULT_REF_SEGMENT = "default";
  * - 末段是 7 个字符的短 sha（commitSha 缺失时代码会写成 "unknown"，也正好 7 位）
  */
 const BACKUP_DIR_NAME_PATTERN = /^\d{8}-\d{6}__.+__[0-9a-zA-Z]{7}$/;
+
+/**
+ * 拆解「本次备份专属目录」的目录名（修改点：同分支同 sha 只保留一个目录）
+ *
+ * 为什么需要它：目录名里带「本次写入时刻」的时间戳，于是同一个
+ * (分支, sha) 在 force 重跑 / 失败补写 / 并发 时会各生成一个新目录，
+ * 挂载浏览里就出现多个「同分支同 sha、只有时间不同」的文件夹。
+ * 去重要先能从目录名里把 (分支, sha) 这个身份摘出来，才能判断谁和谁是同一份。
+ *
+ * 解析规则：第一个 "__" 之前是时间戳，最后一个 "__" 之后是短 sha，中间整段是分支。
+ * 不能用 split("__")，因为分支名本身允许含下划线（sanitizeSegment 不动下划线），
+ * 例如 20261005-155036__feat__new_ui__8a7950d 的分支是 feat__new_ui。
+ *
+ * @param {string} dirName 目录名（不带斜杠）
+ * @returns {{ timestamp: string, refSegment: string, shortSha: string }|null} 不是本结构时返回 null
+ */
+export function parseBackupDirName(dirName) {
+  const name = String(dirName || "").trim();
+  // 判定沿用与 resolveBackupDirFromFilePath 完全相同的严格形态，避免两处口径分叉
+  if (!BACKUP_DIR_NAME_PATTERN.test(name)) return null;
+
+  const firstSep = name.indexOf("__");
+  const lastSep = name.lastIndexOf("__");
+  // 形态已由正则兜住，这里只防御性地要求三段都非空
+  if (firstSep <= 0 || lastSep <= firstSep) return null;
+
+  return {
+    timestamp: name.slice(0, firstSep),
+    refSegment: name.slice(firstSep + 2, lastSep),
+    shortSha: name.slice(lastSep + 2),
+  };
+}
+
+/**
+ * 「同一份备份」的身份键：分支 + 短 sha（修改点：同分支同 sha 只保留一个目录）
+ *
+ * 时间戳**不进** key —— 正因为它不同才产生了重复目录，它恰恰是要被忽略的维度。
+ * 用 \u0000 连接而不是 "__"：分支名可以含下划线，用 "__" 会让
+ * ("a__b", "sha") 与 ("a", "b__sha") 撞成同一个 key。
+ *
+ * @param {{ refSegment: string, shortSha: string }} parsed parseBackupDirName 的结果
+ * @returns {string}
+ */
+export function buildBackupGroupKey({ refSegment, shortSha }) {
+  return `${refSegment}\u0000${shortSha}`;
+}
 
 /**
  * 把任意片段规范成安全的单层目录/文件名

@@ -13,6 +13,9 @@ import {
 } from "../../../../repobackup/config.js";
 import { planBackupPaths } from "../../../../repobackup/paths.js";
 import { pruneOldVersions, describePruneResult } from "../../../../repobackup/retention.js";
+// 修改点（同分支同 sha 只保留一个目录）：目录名带「写入时刻」，同一个 (分支, sha)
+// 被重复写入（force 重跑 / 补写 / 并发）会各留一个孤儿目录，写成功后顺手去重
+import { dedupeBackupDirs, toReferencedDirs } from "../../../../repobackup/dedupeDirs.js";
 // 修改点（第 2 期 错误分类 + 延迟重试）：
 // 限流/暂时性故障不记失败，而是算出「最早可重试时间」交给调度层
 // 修改点（大仓库备份超 CPU 限制）：再引入两类自产错误 ——
@@ -1196,6 +1199,43 @@ export class RepoBackupTaskHandler implements TaskHandler {
             if (manifestWarning) targetErrors.push(`${mount.name || mount.mount_path}: ${manifestWarning}`);
 
             console.log(`[RepoBackupTaskHandler] 目标写入完成: ${storagePath}`);
+
+            /**
+             * 收掉同分支同 sha 的重复目录（修改点：同分支同 sha 只保留一个目录）
+             *
+             * 为什么放在「这个目标刚写完」而不是统一收尾：
+             * - 分支目录路径带挂载点前缀，本来就得逐挂载点扫一遍；
+             * - 写完就扫，哪怕后面的目标撞上预算用尽、或整个 isolate 被 CPU 限制杀掉，
+             *   已经写完的这个挂载点也已经是干净的了。
+             *
+             * 保护名单（referencedDirs）在 upsertBackupTarget **之后**才查 ——
+             * 这样本次刚写的目录必然在名单里，绝不会被自己的去重删掉。
+             *
+             * 时间上限已过就不扫了：和旧版本清理同一个理由，它是一串网络往返，
+             * 在快撞上步骤超时的时候开这个头很可能半途被打断；而重复目录多留一轮毫无影响，
+             * 下一次该分支备份成功后照样会扫。
+             */
+            if (deadlinePassed()) {
+              console.warn("[RepoBackupTaskHandler] 本次运行已达时间上限，跳过重复目录去重（下一轮继续）");
+            } else {
+              try {
+                const referencedDirs = toReferencedDirs(await codeRepo.findReferencedPaths(repoRow.id));
+                await dedupeBackupDirs({
+                  fileSystem,
+                  refDirPath: paths.refDirPath,
+                  referencedDirs,
+                  userId: job.userId,
+                  userType: job.userType,
+                });
+              } catch (dedupeError: any) {
+                // 去重是收拾现场，失败绝不能改变备份结论（本目标已经写成功了）
+                console.warn(
+                  "[RepoBackupTaskHandler] 重复目录去重失败（不影响备份结论）:",
+                  dedupeError?.message || dedupeError,
+                );
+              }
+            }
+
             await report(processed);
           } catch (targetError: any) {
             guard.dispose();
