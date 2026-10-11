@@ -247,7 +247,7 @@ export class S3StorageDriver extends BaseDriver {
   async uploadStream(subPath, stream, ctx = {}) {
     this._ensureInitialized();
 
-    const { mount, db, userIdOrInfo, userType, filename, contentType, contentLength, uploadId } = ctx;
+    const { mount, db, userIdOrInfo, userType, filename, contentType, contentLength, uploadId, uploadTuning } = ctx;
     const fsPath = ctx?.path || "";
 
     const s3SubPath = normalizeS3SubPath(subPath, false);
@@ -265,6 +265,10 @@ export class S3StorageDriver extends BaseDriver {
         contentType,
         contentLength,
         uploadId,
+        // 修改点（大仓库备份 CPU/耗时优化）：透传分片参数覆盖。
+        // 仓库备份会把 queueSize 提到 2，让下载与上传重叠；
+        // 其余调用方不传，行为与改动前完全一致
+        uploadTuning,
       });
     } catch (error) {
       throw this._rethrow(error, "流式上传失败");

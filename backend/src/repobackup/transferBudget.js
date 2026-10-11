@@ -50,6 +50,8 @@ export const REPO_BACKUP_BUDGET_ENV_KEYS = {
   JOB_BYTE_BUDGET_MB: "REPO_BACKUP_JOB_BYTE_BUDGET_MB",
   MAX_ARCHIVE_MB: "REPO_BACKUP_MAX_ARCHIVE_MB",
   STALL_TIMEOUT_MS: "REPO_BACKUP_STALL_TIMEOUT_MS",
+  // 修改点（大仓库备份 CPU/耗时优化）：分片上传并发度
+  UPLOAD_QUEUE_SIZE: "REPO_BACKUP_UPLOAD_QUEUE_SIZE",
 };
 
 /**
@@ -68,6 +70,21 @@ const WORKER_DEFAULTS = {
   jobByteBudget: 2 * 1024 * MIB,
   maxArchiveBytes: 2 * 1024 * MIB,
   stallTimeoutMs: 120 * 1000,
+  /**
+   * 分片上传并发度 2（修改点：大仓库备份 CPU/耗时优化）
+   *
+   * lib-storage 的 queueSize 同时决定**消费源流的并发度**：只有 1 个消费者时
+   * 它必须「读满一片 → 传完这一片 → 再读下一片」，于是下载与上传完全串行，
+   * 单趟 wall-clock ≈ 下载耗时 + 上传耗时。提到 2 之后两段重叠，
+   * 单趟 ≈ max(下载, 上传)。
+   *
+   * 这省的是 wall-clock 而不是 CPU，但对本模块的目标同样关键：
+   * 软截止是按 wall-clock 算的，一趟省下的时间直接变成「这一轮还能多做一个目标」，
+   * 轮次少了，每轮固定开销（解析计划、查目标、建目录、写 manifest）也跟着少。
+   * 代价是峰值内存从 partSize × 2 升到约 partSize × 3（6MB → 约 18MB），
+   * 在 Workers 的 128MB 下仍有大量余量。
+   */
+  uploadQueueSize: 2,
 };
 
 /**
@@ -81,6 +98,8 @@ const NODE_DEFAULTS = {
   jobByteBudget: 0,
   maxArchiveBytes: 0,
   stallTimeoutMs: 120 * 1000,
+  // 0 = 不覆盖，沿用 getEnvironmentOptimizedUploadConfig 的 Node 默认值（本就是 4 并发）
+  uploadQueueSize: 0,
 };
 
 /**
@@ -138,6 +157,7 @@ function resolveOptionalLimit(value, min, max, fallback) {
  *   jobByteBudget: number,
  *   maxArchiveBytes: number,
  *   stallTimeoutMs: number,
+ *   uploadQueueSize: number,
  *   environment: string,
  * }}
  */
@@ -149,6 +169,7 @@ export function resolveTransferBudget(env = null) {
   const rawBudgetMb = readEnvNumber(env, REPO_BACKUP_BUDGET_ENV_KEYS.JOB_BYTE_BUDGET_MB);
   const rawMaxArchiveMb = readEnvNumber(env, REPO_BACKUP_BUDGET_ENV_KEYS.MAX_ARCHIVE_MB);
   const rawStall = readEnvNumber(env, REPO_BACKUP_BUDGET_ENV_KEYS.STALL_TIMEOUT_MS);
+  const rawQueueSize = readEnvNumber(env, REPO_BACKUP_BUDGET_ENV_KEYS.UPLOAD_QUEUE_SIZE);
 
   // 截止时间下限 30 秒：比这还短等于一开工就收手，什么都备不成
   const softDeadlineMs = resolveOptionalLimit(rawDeadline, 30 * 1000, 60 * 60 * 1000, defaults.softDeadlineMs);
@@ -172,8 +193,59 @@ export function resolveTransferBudget(env = null) {
     maxArchiveBytes: maxArchiveMb * MIB,
     // 停滞看门狗不允许关：0 会让「连接挂死」一直挂着，直到步骤超时才被动失败
     stallTimeoutMs: clampInt(rawStall, 5 * 1000, 30 * 60 * 1000, defaults.stallTimeoutMs),
+    // 0 表示「不覆盖上传驱动的默认并发」；上限 4 是内存余量的保守取值
+    // （峰值约 partSize × (queueSize + 1)，6MB × 5 = 30MB）
+    uploadQueueSize: resolveOptionalLimit(rawQueueSize, 1, 4, defaults.uploadQueueSize),
     environment: isWorker ? "Cloudflare Worker" : "Docker/Server",
   };
+}
+
+/**
+ * 按实测吞吐估算「再搬 bytes 字节」还要多久（修改点：大仓库备份 CPU/耗时优化）
+ *
+ * @param {number} bytes 预计要搬的字节数（用同仓库上一趟的实际体积作代理值）
+ * @param {number} bytesPerMs 实测吞吐（字节/毫秒）
+ * @returns {number} 毫秒；缺少任一观测值时返回 0，表示**无从估算**
+ */
+export function estimateTransferMs(bytes, bytesPerMs) {
+  const size = Number(bytes);
+  const rate = Number(bytesPerMs);
+  if (!Number.isFinite(size) || size <= 0) return 0;
+  if (!Number.isFinite(rate) || rate <= 0) return 0;
+  return Math.ceil(size / rate);
+}
+
+/**
+ * 软截止之前还塞得下这一趟吗（修改点：大仓库备份 CPU/耗时优化）
+ *
+ * 为什么需要它：原先的预算检查只问「软截止到了吗」，没到就放手去领下一个目标。
+ * 于是一个在 6 分 59 秒开工、要跑 4 分钟的目标照样会被放进去 ——
+ * 传输一旦开始就没有中途收手的机制（刻意如此，中断只会留下半个文件），
+ * 它只能一路跑到 Workflow 步骤超时被动失败：那一趟的字节、CPU、GitHub 流量全部白费，
+ * 而且撞的是「被动失败」这条最差的路。
+ * 有了上一趟的实测吞吐，这里就能提前判断「这一趟根本跑不完」，
+ * 把它原样留给下一轮（下一轮它是第一个目标，会无条件执行）。
+ *
+ * @param {object} params
+ * @param {number} params.estimateMs estimateTransferMs 的结果，0 = 估不出来
+ * @param {number} params.nowMs 当前时间
+ * @param {number} params.deadlineAtMs 软截止时刻，0 = 不限制（Node 口径）
+ * @param {number} [params.safetyRatio] 余量系数，默认 1.3 ——
+ *        估算依据是**上一趟**的吞吐，下一趟可能更慢（不同分支体积不同、上游限速波动）
+ * @returns {{ fits: boolean, remainingMs: number, requiredMs: number }}
+ *          fits=true 表示放行；估不出来或没有截止时一律放行，
+ *          **保证至少有一趟能跑**（否则大仓库会每轮都推迟、永远备不上）
+ */
+export function fitsBeforeDeadline({ estimateMs, nowMs, deadlineAtMs, safetyRatio = 1.3 }) {
+  const deadline = Number(deadlineAtMs);
+  const estimate = Number(estimateMs);
+  if (!Number.isFinite(deadline) || deadline <= 0 || !Number.isFinite(estimate) || estimate <= 0) {
+    return { fits: true, remainingMs: 0, requiredMs: 0 };
+  }
+  const ratio = Number.isFinite(safetyRatio) && safetyRatio > 0 ? safetyRatio : 1;
+  const remainingMs = deadline - Number(nowMs);
+  const requiredMs = Math.ceil(estimate * ratio);
+  return { fits: remainingMs >= requiredMs, remainingMs, requiredMs };
 }
 
 /**
@@ -211,6 +283,9 @@ export function formatDuration(ms) {
 export default {
   REPO_BACKUP_BUDGET_ENV_KEYS,
   resolveTransferBudget,
+  // 修改点（大仓库备份 CPU/耗时优化）：按实测吞吐判断「这一趟还跑得完吗」
+  estimateTransferMs,
+  fitsBeforeDeadline,
   formatBytes,
   formatDuration,
 };

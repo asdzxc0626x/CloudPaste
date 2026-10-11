@@ -28,7 +28,14 @@ import {
   ArchiveTooLargeError,
 } from "../../../../repobackup/errors.js";
 // 修改点（大仓库备份超 CPU 限制）：单次作业的时间 / 流量预算，见该模块文件头
-import { resolveTransferBudget, formatBytes, formatDuration } from "../../../../repobackup/transferBudget.js";
+// 修改点（大仓库备份 CPU/耗时优化）：再引入「按实测吞吐判断这一趟还跑不跑得完」
+import {
+  resolveTransferBudget,
+  estimateTransferMs,
+  fitsBeforeDeadline,
+  formatBytes,
+  formatDuration,
+} from "../../../../repobackup/transferBudget.js";
 import { deferRepositoryBackupSchedule } from "../../../../repobackup/schedule.js";
 // 修改点（第 4 期）：备份成功后推进该引用在 repo_detect_states 里的「已备份水位」，
 // 否则下一轮检测仍会认为有更新，同一个版本会被反复备份
@@ -117,6 +124,25 @@ import { REPO_OUTCOME } from "../../../../repobackup/status.js";
  *
  * 配套改动在 wrangler.toml 的 [limits] cpu_ms（默认 30 秒抬到平台上限 5 分钟）
  * 与 src/repobackup/transferBudget.js（预算口径与环境变量）。
+ *
+ * 修改点（大仓库备份 CPU/耗时优化）：再审计一轮逐字节开销后的两处收紧
+ * --------------------------------------------------------------
+ * 实测（Node 同款 V8，354MB/6MB 分片）各"每个字节都要过一遍"的动作：
+ *   lib-storage 组片 Buffer.concat   0.08s   SigV4 载荷哈希（crypto.subtle）0.31s
+ *   传输护栏 TransformStream 直通    0.17s（上游 16KB 分片）/ 0.78s（1KB 分片）
+ *   AWS SDK 的 CRC32 校验和（纯 JS） 2.70s  ← 唯一的大头，而它本不该被算
+ * 结论是逐字节的 JS 开销总计约 0.6s/趟，**护栏不是瓶颈**（所以没有为了省掉
+ * 它那 0.17s 去换掉按块计数 —— 那会把停滞检测的精度从"按分片"降到"按 6MB 分片完成"）。
+ * 真正值得动的是"趟数"和"每趟的 wall-clock"：
+ *  d) 分片上传并发度提到 2：lib-storage 的 queueSize 同时是消费源流的并发度，
+ *     为 1 时下载与上传完全串行，单趟 wall-clock 是两者之和。重叠之后一次运行
+ *     能完成的目标更多，轮次更少（见下面 uploadTuning 的说明）
+ *  e) 领下一个目标前增加"按实测吞吐估算还跑不跑得完"：原先只看软截止有没有到，
+ *     于是截止前 1 秒开工、要跑 4 分钟的目标照样被放进去，然后一路跑到步骤超时
+ *     被动失败，整趟白费。现在估着来不及就直接让给下一轮（见 budgetExhausted）
+ * 另外修掉了 S3 客户端的一处配置漏网：provider_type 取 "Other" 的挂载点从来没命中
+ * createS3Client 里的 case（常量写的是 "Other S3 Compatible"），于是关校验和这件事
+ * 对它一直没生效 —— 在 AWS SDK ≥ 3.729 上这正好等于给每次上传加一遍上面那 2.70s。
  */
 
 type RepoBackupPayload = {
@@ -408,6 +434,20 @@ export class RepoBackupTaskHandler implements TaskHandler {
      */
     let budgetBytes = 0;
 
+    /**
+     * 本次作业实测到的传输吞吐（修改点：大仓库备份 CPU/耗时优化）
+     *
+     * 只累计「真的从 openSourceArchive 到 uploadFile 走完一趟」的样本：
+     *   observedBytes / observedMs = 字节/毫秒
+     * 用途是在领下一个目标之前估一下「这一趟跑得完吗」（见 budgetExhausted）。
+     * 取整个作业的累计值而不是最后一趟的瞬时值：样本少的时候更稳，
+     * 也不会因为某一趟恰好碰上上游抽风就把后面全推迟掉。
+     */
+    let observedBytes = 0;
+    let observedMs = 0;
+    /** 上一趟归档的实际体积，作为「下一趟大概多大」的代理值（同仓库各分支体积相近） */
+    let lastArchiveBytes = 0;
+
     // ---------- 1. 读取仓库配置 ----------
     const repoRow = await codeRepo.findRepositoryById(payload.repositoryId);
     if (!repoRow) {
@@ -543,6 +583,12 @@ export class RepoBackupTaskHandler implements TaskHandler {
      * 只在「准备领一份新活」之前调用（下一个引用、下一个目标），
      * 不在传输中途调用 —— 中途掐断只会留下半个文件，而我们宁可让这一趟走完。
      *
+     * 修改点（大仓库备份 CPU/耗时优化）：除了「截止到了没」「流量用完没」，
+     * 再加一问「这一趟按实测速度还跑得完吗」。
+     * 原先只看前两项，于是一个在软截止前 1 秒开工、要跑 4 分钟的目标照样会被放进去 ——
+     * 传输开始后没有收手机制，它只能一路跑到 Workflow 步骤超时被动失败，
+     * 整趟的 CPU、流量全白费。有了上一趟的实测吞吐就能提前让位。
+     *
      * @returns 耗尽原因（给管理员看的文本）；还够用则返回 null
      */
     const budgetExhausted = (): string | null => {
@@ -556,6 +602,25 @@ export class RepoBackupTaskHandler implements TaskHandler {
         return (
           `本次运行已传输 ${formatBytes(budgetBytes)}，` +
           `达到单次作业的流量上限（${formatBytes(budget.jobByteBudget)}）`
+        );
+      }
+
+      /**
+       * 来不及再搬一趟了
+       *
+       * estimateTransferMs 在「没有任何实测样本」时返回 0，fitsBeforeDeadline 对 0
+       * 一律放行 —— 这条就是前进保证：本次运行的第一趟永远无条件执行，
+       * 不会出现「每轮都估着来不及、于是永远备不上」。
+       * 而第二趟起之所以敢推迟，是因为下一轮它就是第一个目标（既有的
+       * 「只补写缺失目标」自愈路径），到那时会无条件跑。
+       */
+      const estimateMs = estimateTransferMs(lastArchiveBytes, observedMs > 0 ? observedBytes / observedMs : 0);
+      const fit = fitsBeforeDeadline({ estimateMs, nowMs: Date.now(), deadlineAtMs });
+      if (!fit.fits) {
+        return (
+          `按本次实测速度（${formatBytes(Math.round((observedBytes / observedMs) * 1000))}/秒）估算，` +
+          `再搬一趟约需 ${formatDuration(estimateMs)}，` +
+          `而距本次运行的时间上限只剩 ${formatDuration(Math.max(0, fit.remainingMs))}，来不及`
         );
       }
       return null;
@@ -979,6 +1044,15 @@ export class RepoBackupTaskHandler implements TaskHandler {
             const counter = guard.counter;
 
             let uploadResult: any;
+            /**
+             * 只掐「真的在搬字节」这一段（修改点：大仓库备份 CPU/耗时优化）
+             *
+             * 不从 openSourceArchive 开始计时：那一段可能包含限流退避与重试等待，
+             * 把它算进吞吐会让速度被严重低估，于是后面的目标被过度推迟。
+             * 建目录、写 manifest 这些固定开销同样不计入，由 fitsBeforeDeadline
+             * 的余量系数一并兜住。
+             */
+            const transferStartedMs = Date.now();
             try {
               uploadResult = await fileSystem.uploadFile(
                 paths.archivePath,
@@ -991,6 +1065,19 @@ export class RepoBackupTaskHandler implements TaskHandler {
                   // GitHub tarball 通常是 chunked 无 content-length，此时传 0 表示未知，
                   // 上游的配额守卫会跳过 best-effort 判断，S3 走 lib-storage 自动分片
                   contentLength: archive.contentLength || 0,
+                  /**
+                   * 修改点（大仓库备份 CPU/耗时优化）：把分片上传并发提到 2
+                   *
+                   * S3 驱动默认在 Workers 下用 queueSize = 1，而 lib-storage 的
+                   * queueSize 同时是**消费源流的并发度** —— 只有 1 个消费者时它必须
+                   * 「读满一片 → 传完这一片 → 再读下一片」，下载与上传完全串行，
+                   * 单趟 wall-clock ≈ 下载 + 上传。备份搬的是几百 MB 的归档，
+                   * 串行会让一次运行能完成的目标数直接腰斩。
+                   * 该字段只有 S3 驱动认（其余驱动忽略多余的 option），
+                   * 0 表示不覆盖，此时行为与改动前完全一致。
+                   */
+                  uploadTuning:
+                    budget.uploadQueueSize > 0 ? { queueSize: budget.uploadQueueSize } : undefined,
                 },
               );
             } catch (uploadError: any) {
@@ -1031,6 +1118,21 @@ export class RepoBackupTaskHandler implements TaskHandler {
             const sizeBytes = counter.value > 0 ? counter.value : null;
             totalBytes += sizeBytes ?? 0;
             bytesTransferred += counter.value;
+
+            /**
+             * 记一条吞吐样本（修改点：大仓库备份 CPU/耗时优化）
+             *
+             * 只在传输**成功走完**时记：失败那趟的字节数是半截的、耗时却可能很长
+             * （停滞要等满看门狗阈值），拿它算速度会把后续目标全判成「来不及」。
+             * 失败趟的流量仍然计入 budgetBytes（在上面的 finally 里），两者口径不同：
+             * 预算问「花掉了多少」，吞吐问「正常情况下多快」。
+             */
+            const transferMs = Date.now() - transferStartedMs;
+            if (counter.value > 0 && transferMs > 0) {
+              observedBytes += counter.value;
+              observedMs += transferMs;
+              lastArchiveBytes = counter.value;
+            }
 
             // manifest 是归档旁的便利副本，元信息在数据库记录中已完整保存。
             // 这里不因它失败而判定该目标失败，但必须把问题暴露给管理员。

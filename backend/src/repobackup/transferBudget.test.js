@@ -19,7 +19,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { resolveTransferBudget, formatBytes, formatDuration, REPO_BACKUP_BUDGET_ENV_KEYS } from "./transferBudget.js";
+import {
+  resolveTransferBudget,
+  estimateTransferMs,
+  fitsBeforeDeadline,
+  formatBytes,
+  formatDuration,
+  REPO_BACKUP_BUDGET_ENV_KEYS,
+} from "./transferBudget.js";
 import {
   BudgetExhaustedError,
   ArchiveTooLargeError,
@@ -132,6 +139,71 @@ test("空串/非数字一律当「没配置」，回落默认值（Number(null)=
 test("停滞看门狗不允许关：配 0 也会回到有效区间", () => {
   const budget = resolveTransferBudget({ [REPO_BACKUP_BUDGET_ENV_KEYS.STALL_TIMEOUT_MS]: "0" });
   assert.ok(budget.stallTimeoutMs >= 5 * 1000, "关掉它等于让挂死的连接一直挂着");
+});
+
+// ==================== 分片上传并发度（修改点：大仓库备份 CPU/耗时优化）====================
+
+test("Workers 下把上传并发提到 2：queueSize=1 会让下载与上传完全串行", () => {
+  const budget = withWorkerEnv(() => resolveTransferBudget({}));
+  assert.equal(budget.uploadQueueSize, 2);
+});
+
+test("Node 下不覆盖上传并发（那里驱动默认就是 4，没有串行问题）", () => {
+  assert.equal(resolveTransferBudget({}).uploadQueueSize, 0);
+});
+
+test("上传并发可被环境变量覆盖，且夹在内存吃得住的区间内", () => {
+  const raise = withWorkerEnv(() =>
+    resolveTransferBudget({ [REPO_BACKUP_BUDGET_ENV_KEYS.UPLOAD_QUEUE_SIZE]: "99" }),
+  );
+  assert.equal(raise.uploadQueueSize, 4, "并发越高峰值内存越大，必须夹住");
+
+  const off = withWorkerEnv(() =>
+    resolveTransferBudget({ [REPO_BACKUP_BUDGET_ENV_KEYS.UPLOAD_QUEUE_SIZE]: "0" }),
+  );
+  assert.equal(off.uploadQueueSize, 0, "显式 0 = 回到驱动默认值，用于一键退回改动前行为");
+});
+
+// ==================== 「这一趟还跑得完吗」 ====================
+
+test("没有实测样本时估不出耗时（返回 0，调用方据此放行）", () => {
+  assert.equal(estimateTransferMs(354 * MIB, 0), 0, "还没跑过一趟，无从估算");
+  assert.equal(estimateTransferMs(0, 1024), 0, "不知道要搬多大，同样无从估算");
+});
+
+test("按实测吞吐估算耗时", () => {
+  // 10 MB/s = 10485.76 字节/毫秒；354MB 约 35.4 秒
+  const ms = estimateTransferMs(354 * MIB, 10 * 1024);
+  assert.ok(ms > 34 * 1000 && ms < 37 * 1000, `估算 ${ms}ms 不在预期区间`);
+});
+
+test("估不出来或没有截止时一律放行 —— 这是前进保证，否则大仓库永远备不上", () => {
+  // 本次运行的第一趟必然落在这个分支（还没有任何样本）
+  assert.equal(fitsBeforeDeadline({ estimateMs: 0, nowMs: 1000, deadlineAtMs: 1200 }).fits, true);
+  // Node 口径：没有软截止
+  assert.equal(fitsBeforeDeadline({ estimateMs: 9e9, nowMs: 1000, deadlineAtMs: 0 }).fits, true);
+});
+
+test("剩余时间够就放行，不够就拦住（并带上余量系数）", () => {
+  const now = 0;
+  const deadline = 60 * 1000;
+
+  // 估 30s，余量 1.3 → 需要 39s，剩 60s：放行
+  const ok = fitsBeforeDeadline({ estimateMs: 30 * 1000, nowMs: now, deadlineAtMs: deadline });
+  assert.equal(ok.fits, true);
+  assert.equal(ok.requiredMs, 39 * 1000);
+
+  // 估 50s → 需要 65s > 剩 60s：拦住。
+  // 这正是修复前会"放进去然后撞步骤超时"的那一类
+  const tight = fitsBeforeDeadline({ estimateMs: 50 * 1000, nowMs: now, deadlineAtMs: deadline });
+  assert.equal(tight.fits, false);
+  assert.equal(tight.remainingMs, 60 * 1000);
+});
+
+test("软截止已经过去时必然拦住（remainingMs 为负）", () => {
+  const past = fitsBeforeDeadline({ estimateMs: 1000, nowMs: 5000, deadlineAtMs: 4000 });
+  assert.equal(past.fits, false);
+  assert.ok(past.remainingMs < 0);
 });
 
 // ==================== 错误分类：收手 ≠ 失败 ====================

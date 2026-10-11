@@ -52,10 +52,15 @@ ADMIN_TOKEN_EXPIRY_DAYS = "7"
 # - REPO_BACKUP_JOB_BYTE_BUDGET_MB：单次作业的累计传输量上限，Workers 默认 2048；0 = 不限制
 # - REPO_BACKUP_MAX_ARCHIVE_MB：单个归档体积上限，超过即中断并记永久性失败，Workers 默认 2048；0 = 不限制
 # - REPO_BACKUP_STALL_TIMEOUT_MS：传输停滞判定（毫秒），默认 120000，不可关闭
+# - REPO_BACKUP_UPLOAD_QUEUE_SIZE：分片上传并发度（修改点：大仓库备份 CPU/耗时优化），Workers 默认 2
+#   lib-storage 的并发度同时决定「消费源流的并发度」：为 1 时下载与上传完全串行，
+#   单趟耗时是两者之和；为 2 时两段重叠，一次运行能完成的目标更多。
+#   代价是峰值内存约 分片大小 × (并发 + 1)（6MB × 3 ≈ 18MB）。0 = 用上传驱动的默认值（即改动前行为）
 # REPO_BACKUP_SOFT_DEADLINE_MS = "420000"
 # REPO_BACKUP_JOB_BYTE_BUDGET_MB = "2048"
 # REPO_BACKUP_MAX_ARCHIVE_MB = "2048"
 # REPO_BACKUP_STALL_TIMEOUT_MS = "120000"
+# REPO_BACKUP_UPLOAD_QUEUE_SIZE = "2"
 
 # 绑定D1数据库
 # 需要替换为实际的数据库ID

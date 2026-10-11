@@ -23,16 +23,54 @@ export function isCloudflareWorkerEnvironment() {
 }
 
 /**
+ * 分片上传参数的允许区间（修改点：大仓库备份 CPU/耗时优化）
+ *
+ * 用于夹取调用方传入的覆盖值，避免把 lib-storage 配成非法参数：
+ * - S3 协议规定除最后一片外每片不得小于 5MiB，配小了分片上传会被服务端拒绝；
+ * - 上限按 Workers 的 128MB 内存反推：峰值约为 partSize × (queueSize + 1)
+ *   （在传的 queueSize 片 + 正在攒的下一片）。
+ */
+const UPLOAD_TUNING_LIMITS = {
+  MIN_PART_SIZE: 5 * 1024 * 1024,
+  MAX_PART_SIZE: 64 * 1024 * 1024,
+  MIN_QUEUE_SIZE: 1,
+  MAX_QUEUE_SIZE: 8,
+};
+
+/** 取整并夹到区间内；非数字视为「没给」，返回 fallback */
+function clampTuning(value, min, max, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.min(max, Math.max(min, Math.trunc(n)));
+}
+
+/**
  * 获取环境自适应的上传配置
+ *
+ * 修改点（大仓库备份 CPU/耗时优化）：允许调用方按场景覆盖 partSize / queueSize。
+ *
+ * 为什么要开这个口子：默认值是给「用户在页面上传文件」定的，Workers 下取
+ * queueSize = 1。但 lib-storage 的 queueSize 同时决定**消费源流的并发度** ——
+ * 只有 1 个消费者时，它必须「读满一片 → 传完这一片 → 再读下一片」，
+ * 下载与上传完全串行，整趟耗时是两者之和。仓库备份搬的是几百 MB 的归档，
+ * 串行会让单个目标的 wall-clock 翻倍，于是一次运行里能完成的目标更少、
+ * 要跑的轮次更多（每多一轮就要把前面的目标重新走一遍判定）。
+ * 调用方自己清楚内存余量时，应当能把并发提到 2 让两段重叠。
+ *
+ * 不改默认值的原因：这里是所有 S3 流式上传的公共入口（含 WebDAV PUT 与页面上传），
+ * 默认值一动就是全局行为变化；备份是唯一明确知道自己在搬大文件的调用方。
+ *
+ * @param {{ partSize?: number, queueSize?: number }|null} [overrides] 覆盖值，
+ *        非法/缺省的字段按环境默认值处理
  * @returns {Object} 上传配置对象
  */
-export function getEnvironmentOptimizedUploadConfig() {
+export function getEnvironmentOptimizedUploadConfig(overrides = null) {
   const isWorker = isCloudflareWorkerEnvironment();
 
-  return isWorker
+  const base = isWorker
     ? {
         partSize: 6 * 1024 * 1024, // 6MB - Worker环境内存限制
-        queueSize: 1, // 1并发 - 避免CPU时间超限
+        queueSize: 1, // 1并发 - 页面上传的保守默认值（备份路径会按需覆盖）
         environment: "Cloudflare Worker",
         maxConcurrency: 1, // 最大并发数
         bufferSize: 6 * 1024 * 1024, // 缓冲区大小
@@ -44,7 +82,33 @@ export function getEnvironmentOptimizedUploadConfig() {
         maxConcurrency: 4, // 最大并发数
         bufferSize: 32 * 1024 * 1024, // 缓冲区大小
       };
+
+  if (!overrides) return base;
+
+  const partSize = clampTuning(
+    overrides.partSize,
+    UPLOAD_TUNING_LIMITS.MIN_PART_SIZE,
+    UPLOAD_TUNING_LIMITS.MAX_PART_SIZE,
+    base.partSize,
+  );
+  const queueSize = clampTuning(
+    overrides.queueSize,
+    UPLOAD_TUNING_LIMITS.MIN_QUEUE_SIZE,
+    UPLOAD_TUNING_LIMITS.MAX_QUEUE_SIZE,
+    base.queueSize,
+  );
+
+  return {
+    ...base,
+    partSize,
+    queueSize,
+    // maxConcurrency 与 queueSize 是同一件事的两个名字，一起跟着走，
+    // 避免下游按 maxConcurrency 做判断时拿到和实际并发不符的值
+    maxConcurrency: queueSize,
+  };
 }
+
+export { UPLOAD_TUNING_LIMITS };
 
 /**
  * 获取环境名称

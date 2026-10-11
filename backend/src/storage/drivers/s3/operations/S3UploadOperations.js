@@ -65,10 +65,15 @@ export class S3UploadOperations {
    * @param {string} s3SubPath - S3子路径
    * @param {ReadableStream} stream - 数据流
    * @param {Object} options - 选项参数
+   * @param {{partSize?: number, queueSize?: number}} [options.uploadTuning] 分片参数覆盖
+   *        （修改点：大仓库备份 CPU/耗时优化）调用方明确知道自己在搬大文件时，
+   *        可以把 queueSize 提到 2 让「读下一片」和「传当前片」重叠 ——
+   *        queueSize = 1 时 lib-storage 只有一个消费者，下载与上传完全串行。
+   *        缺省/非法值一律回落到环境默认值，见 getEnvironmentOptimizedUploadConfig
    * @returns {Promise<Object>} 上传结果
    */
   async uploadStream(s3SubPath, stream, options = {}) {
-    const { mount, db, filename, contentType, contentLength } = options;
+    const { mount, db, filename, contentType, contentLength, uploadTuning } = options;
 
     return handleFsError(
       async () => {
@@ -81,9 +86,9 @@ export class S3UploadOperations {
 
         // 2. 构造适配当前环境的 Body，并统一使用 Upload（lib-storage）
         const { Upload } = await import("@aws-sdk/lib-storage");
-        const uploadConfig = getEnvironmentOptimizedUploadConfig();
+        const uploadConfig = getEnvironmentOptimizedUploadConfig(uploadTuning);
         console.log(
-          `[StorageUpload] type=S3 mode=流式分片 status=开始 路径=${finalS3Path}`
+          `[StorageUpload] type=S3 mode=流式分片 status=开始 分片=${Math.round(uploadConfig.partSize / 1024 / 1024)}MB 并发=${uploadConfig.queueSize} 路径=${finalS3Path}`
         );
 
         /** @type {any} */
