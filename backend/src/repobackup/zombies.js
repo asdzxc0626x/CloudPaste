@@ -41,8 +41,13 @@ function buildZombieReason(minutes) {
     `备份记录已停留在「进行中」超过 ${minutes} 分钟且执行进程未再回报，判定为异常中断。` +
     `常见原因：Cloudflare Workers CPU 时间超限（该情况下运行时会直接终止执行，` +
     `程序无法写入失败原因）、Workflows 步骤超时，或容器/进程被重启。` +
-    `如为大仓库，可减少备份目标数量，或参考 wrangler.toml 的 [limits] cpu_ms ` +
-    `与 REPO_BACKUP_* 预算配置`
+    // 修改点（免费计划部署被 100328 拒绝）：不再引导用户去改 [limits] cpu_ms。
+    // 那一项只有付费计划能设，免费计划填了会直接部署失败（code 100328），
+    // 现在 wrangler 配置里默认是注释状态。真正可用的手段是 REPO_BACKUP_* 预算：
+    // 把单次作业的工作量压到 CPU 上限之内，剩下的留给下一轮补写。
+    `如为大仓库，可减少备份目标数量，或用 REPO_BACKUP_* 预算配置` +
+    `（REPO_BACKUP_SOFT_DEADLINE_MS / REPO_BACKUP_JOB_BYTE_BUDGET_MB）` +
+    `缩小单次作业的工作量；付费计划还可取消 wrangler 配置中 [limits] cpu_ms 的注释`
   );
 }
 

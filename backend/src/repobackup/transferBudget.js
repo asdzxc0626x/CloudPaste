@@ -8,7 +8,8 @@
  * 工作量上界由「用户跟踪了几个分支」和「仓库有多大」决定，代码侧没有任何约束。
  *
  * 而在 Cloudflare Workers 下，这一整串动作跑在**同一个** Workflow 步骤里，于是同时受两道限制：
- * - 该次调用的 CPU 累计上限（wrangler.toml 的 [limits] cpu_ms，不配就是 30 秒）
+ * - 该次调用的 CPU 累计上限（wrangler 配置的 [limits] cpu_ms；该段默认注释掉了，
+ *   不配就是平台默认的 30 秒 —— 免费计划只能这样，见下方 WORKER_DEFAULTS 的说明）
  * - Workflow 步骤的 wall-clock 上限（JobWorkflow 里 execute-task 配的 600 秒）
  *
  * 实测数据（真 workerd，与线上同 compatibility_date / nodejs_compat）：
@@ -62,8 +63,14 @@ export const REPO_BACKUP_BUDGET_ENV_KEYS = {
  * 留得太少，收手的动作本身会撞上步骤超时，白收手一场。
  *
  * jobByteBudget 与 maxArchive 都取 2GiB：
- * - 2GiB 单趟在实测里远在 CPU 上限之内（配了 cpu_ms = 300000 之后），留足余量；
+ * - 2GiB 单趟在实测里远在 CPU 上限之内（按付费计划配了 cpu_ms = 300000 计），留足余量；
  * - 比它更大的仓库靠调大 cpu_ms 也救不回来，真正该做的是分轮或者换 Node 部署。
+ *
+ * 修改点（免费计划部署被 100328 拒绝）：cpu_ms 在 wrangler 配置里默认是注释状态，
+ * 因为免费计划填这一项会直接部署失败。也就是说免费计划下 CPU 上限是平台默认的
+ * 30 秒，上面这套默认值（7 分钟软截止 / 2GiB 单次预算）是按 5 分钟上限定的，
+ * 在免费计划上**挡不住** CPU 超限 —— 那时要用 [vars] 里的
+ * REPO_BACKUP_SOFT_DEADLINE_MS / REPO_BACKUP_JOB_BYTE_BUDGET_MB 主动压小。
  */
 const WORKER_DEFAULTS = {
   softDeadlineMs: 7 * 60 * 1000,

@@ -125,8 +125,11 @@ import { REPO_OUTCOME } from "../../../../repobackup/status.js";
  *     只能边传边数，超了当场中止并记**永久性**失败（重试只会再浪费一遍流量）
  *  c) 传输护栏改用单个巡检定时器，不再每个分片 clearTimeout + setTimeout
  *
- * 配套改动在 wrangler.toml 的 [limits] cpu_ms（默认 30 秒抬到平台上限 5 分钟）
- * 与 src/repobackup/transferBudget.js（预算口径与环境变量）。
+ * 配套改动在 wrangler 配置的 [limits] cpu_ms 与 src/repobackup/transferBudget.js
+ * （预算口径与环境变量）。
+ * 修改点（免费计划部署被 100328 拒绝）：[limits] cpu_ms 现在默认是注释状态 ——
+ * 免费计划填这一项会直接部署失败，代价是 CPU 上限回到平台默认的 30 秒。
+ * 因此真正在每个部署形态下都生效的是 transferBudget.js 的预算收手。
  *
  * 修改点（大仓库备份 CPU/耗时优化）：再审计一轮逐字节开销后的两处收紧
  * --------------------------------------------------------------
