@@ -6,7 +6,7 @@ import { S3Client, PutObjectCommand, GetObjectCommand, ListObjectsV2Command, Del
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { ConfiguredRetryStrategy } from "@smithy/util-retry";
 import { decryptValue } from "../../../../utils/crypto.js";
-import { S3ProviderTypes } from "../../../../constants/index.js";
+import { S3ProviderTypes, S3_PROVIDER_TYPE_LEGACY_OTHER } from "../../../../constants/index.js";
 import { getEffectiveMimeType, getContentTypeAndDisposition } from "../../../../utils/fileUtils.js";
 import { ValidationError, S3DriverError } from "../../../../http/errors.js";
 /**
@@ -38,11 +38,33 @@ async function createS3Client(config, encryptionSecret) {
   // 设置适当的超时时间
   clientConfig.requestTimeout = 30000; // 全局默认超时30秒
 
+  /**
+   * 关闭 SDK 的校验和计算与校验（修改点：大仓库备份 CPU/耗时优化）
+   *
+   * 这两行原先写在下面 switch 的每个 case 里，于是只要 provider_type 没命中
+   * 任何分支就会被漏掉 —— 而 S3ProviderTypes.OTHER 的取值和前端存的
+   * "Other" 不相等（见 constants/index.js 的说明），「其他 S3 兼容服务」
+   * 恰好就是漏掉的那一类。提到 switch 外面，让它对所有服务商都成立。
+   *
+   * 为什么必须关：
+   * - CPU。校验和算在 JS 里（Workers 下是 @aws-crypto/crc32 纯 JS 实现），
+   *   等于在每个上传分片上再过一遍全量字节。实测 354MB 归档约 2.7 秒 CPU
+   *   （131 MB/s），下载侧的 responseChecksumValidation 同理。
+   *   当前锁定的 @aws-sdk/client-s3 3.726.1 只在调用方显式指定
+   *   ChecksumAlgorithm 时才算（lib-storage 不指定，所以眼下并不会触发），
+   *   但 3.729.0 起 WHEN_SUPPORTED 会默认选 CRC32 —— 届时一次例行的依赖
+   *   升级就会让所有上传凭空多出这笔开销，而且极难定位。
+   * - 兼容性。不少 S3 兼容实现不认 x-amz-checksum-* / x-amz-sdk-checksum-algorithm，
+   *   会直接 400（这也是各 case 里原本写它的理由）。
+   */
+  clientConfig.requestChecksumCalculation = "WHEN_REQUIRED";
+  clientConfig.responseChecksumValidation = "WHEN_REQUIRED";
+
   // 设置默认重试策略
   let maxRetries = 3; // 默认最大重试次数
   let retryBackoffStrategy = (attempt) => Math.min(Math.pow(2, attempt) * 500, 10000); // 默认指数退避策略
 
-  // 为不同服务商设置特定配置
+  // 为不同服务商设置特定配置（校验和开关已在上面统一关闭，这里只放真正因服务商而异的项）
   switch (config.provider_type) {
     case S3ProviderTypes.B2:
       // Backblaze B2特定配置
@@ -50,17 +72,11 @@ async function createS3Client(config, encryptionSecret) {
       clientConfig.customUserAgent = "CloudPaste/1.0";
       clientConfig.requestTimeout = 60000;
       maxRetries = 4;
-      // 禁用 B2 不支持的校验和功能
-      clientConfig.requestChecksumCalculation = "WHEN_REQUIRED";
-      clientConfig.responseChecksumValidation = "WHEN_REQUIRED";
       break;
 
     case S3ProviderTypes.R2:
       // Cloudflare R2配置
       clientConfig.requestTimeout = 30000;
-      // 禁用 R2 不支持的校验和功能
-      clientConfig.requestChecksumCalculation = "WHEN_REQUIRED";
-      clientConfig.responseChecksumValidation = "WHEN_REQUIRED";
       break;
 
     case S3ProviderTypes.AWS:
@@ -68,9 +84,6 @@ async function createS3Client(config, encryptionSecret) {
       clientConfig.signatureVersion = "v4";
       clientConfig.requestTimeout = 30000;
       maxRetries = 3;
-      // 禁用校验和功能以保持一致性
-      clientConfig.requestChecksumCalculation = "WHEN_REQUIRED";
-      clientConfig.responseChecksumValidation = "WHEN_REQUIRED";
       break;
 
     case S3ProviderTypes.ALIYUN_OSS:
@@ -78,16 +91,12 @@ async function createS3Client(config, encryptionSecret) {
       clientConfig.signatureVersion = "v4";
       clientConfig.requestTimeout = 30000;
       maxRetries = 3;
-      // 禁用校验和功能以保持兼容性
-      clientConfig.requestChecksumCalculation = "WHEN_REQUIRED";
-      clientConfig.responseChecksumValidation = "WHEN_REQUIRED";
       break;
 
     case S3ProviderTypes.OTHER:
+    // 历史取值兜底：库里若存着长名，走同一分支
+    case S3_PROVIDER_TYPE_LEGACY_OTHER:
       clientConfig.signatureVersion = "v4";
-      // 禁用可能不兼容的校验和功能
-      clientConfig.requestChecksumCalculation = "WHEN_REQUIRED";
-      clientConfig.responseChecksumValidation = "WHEN_REQUIRED";
       break;
   }
 

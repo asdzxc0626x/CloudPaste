@@ -84,8 +84,25 @@ export const S3ProviderTypes = {
   B2: "Backblaze B2",
   AWS: "AWS S3",
   ALIYUN_OSS: "Aliyun OSS",
-  OTHER: "Other S3 Compatible",
+  /**
+   * 修改点（大仓库备份 CPU/耗时优化）：取值从 "Other S3 Compatible" 改成 "Other"
+   *
+   * 前端表单的枚举项（StorageFactory 的 configSchema）一直只会存 "Other"，
+   * 而这里写的是 "Other S3 Compatible" —— 两者不相等，于是 s3Utils.createS3Client
+   * 里的 `case S3ProviderTypes.OTHER` **从来没有命中过**：所有「其他 S3 兼容服务」
+   * 的挂载点都从 switch 里漏了出去，拿不到该分支本该给的 signatureVersion 与
+   * 校验和开关（后者在 AWS SDK ≥ 3.729 会默认开启 CRC32，实测 354MB 归档
+   * 要多花约 2.7 秒纯 JS CPU）。
+   * 其余四个取值与枚举项一字不差，本来就是对的。
+   */
+  OTHER: "Other",
 };
+
+/**
+ * provider_type 的历史取值（只出现在 switch 的兼容分支里）
+ * - 留着是为了万一有库里已经存成长名的行（纯 SQL 回填等），别再漏一次
+ */
+export const S3_PROVIDER_TYPE_LEGACY_OTHER = "Other S3 Compatible";
 
 // 统一的用户类型常量（供服务层/能力层使用）
 export const UserType = {
