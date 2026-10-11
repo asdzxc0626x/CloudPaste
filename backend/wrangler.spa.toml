@@ -7,13 +7,14 @@ main = "unified-entry.js"
 compatibility_date = "2025-09-01"
 compatibility_flags = ["nodejs_compat"]
 
-# CPU 时间上限（修改点：大仓库备份超 CPU 限制）
-# 与 wrangler.toml 保持一致，理由同见该文件的说明：
-# 代码仓库备份的一次作业（N 个引用 × M 个目标，各自完整下载 + 上传一遍）
-# 跑在同一个 Workflow 步骤里，CPU 累计，默认 30 秒必然不够；
-# 超限会直接杀掉 isolate，连失败原因都写不进数据库。
-[limits]
-cpu_ms = 300000
+# CPU 时间上限：默认不设置（修改点：免费计划部署被 100328 拒绝）
+#
+# 与 wrangler.toml 保持一致，理由同见该文件的说明。一句话版本：
+# 写死 cpu_ms 会让免费计划在部署时报
+#   CPU limits are not supported for the Free plan. [code: 100328]
+# 因此默认不写，什么都不用填；付费计划想恢复 5 分钟上限就取消下面两行的注释。
+# [limits]
+# cpu_ms = 300000
 
 # 开发服务器配置
 [dev]

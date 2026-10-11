@@ -3,27 +3,31 @@ main = "unified-entry.js"
 compatibility_date = "2025-09-01"
 compatibility_flags = ["nodejs_compat"]
 
-# CPU 时间上限（修改点：大仓库备份超 CPU 限制）
+# CPU 时间上限：默认不设置（修改点：免费计划部署被 100328 拒绝）
 #
-# 不配这一项的默认值是 30 秒，对「代码仓库备份」太紧：
-# 一次备份作业整个跑在同一个 Workflow 步骤里（JobWorkflow 的 execute-task），
-# N 个跟踪引用 × M 个备份目标，每个组合都要完整拉一遍归档再完整写一遍，
-# CPU 是整次调用累计的。真 workerd 实测：354MB 归档走 lib-storage（6MB 分片）
-# 单趟就要 3.5~20 秒 CPU（上游分片越小越贵），多引用 / 多目标必然超 30 秒。
+# 这里曾经写死 cpu_ms = 300000，理由是「代码仓库备份」一次作业整个跑在同一个
+# Workflow 步骤里（JobWorkflow 的 execute-task），N 个跟踪引用 × M 个备份目标，
+# 每个组合都要完整拉一遍归档再完整写一遍，CPU 是整次调用累计的；
+# 真 workerd 实测 354MB 归档走 lib-storage（6MB 分片）单趟就要 3.5~20 秒 CPU，
+# 多引用 / 多目标必然超默认的 30 秒。
 #
-# 超限的后果是运行时直接杀掉 isolate，JS 捕获不到：
-# 备份记录停在 running、失败原因写不进去，管理员只看到一句
-# `Worker exceeded CPU time limit.`，而且该仓库接下来还会被
-# 「上一次备份仍在进行中」挡住。所以这里直接抬到平台上限。
+# 但那一行会让**免费计划直接部署失败**：
+#   ✘ A request to the Cloudflare API (.../workers/scripts/<name>/versions) failed.
+#     CPU limits are not supported for the Free plan. [code: 100328]
+# 原来那段注释假设「本配置含 Workflows 绑定，因此必然已是付费计划」——
+# 该假设不成立，Workflows 免费计划也能用，于是这一行成了纯粹的部署拦路虎。
 #
-# 说明：
-# - cpu_ms 是「上限」不是「预约」，计费按实际消耗，抬高它本身不产生费用
-# - 300000（5 分钟）是 Workers 付费计划的最大值；本配置已含 Workflows 绑定，
-#   本就要求付费计划，因此不会让免费计划的部署多出一道坎
-# - 真正约束工作量的是 src/repobackup/transferBudget.js 里的软截止与流量预算，
-#   它们会在撞线之前主动收手，把剩下的目标留给下一轮补写
-[limits]
-cpu_ms = 300000
+# 所以默认不写：什么都不用填，用平台默认值，免费计划也能正常部署。
+# 付费计划（Pro 及以上）想恢复原来的 5 分钟上限，把下面两行取消注释即可，
+# 它是「上限」不是「预约」，计费按实际消耗，抬高本身不产生费用。
+#
+# 免费计划请注意：此时 CPU 上限是平台默认的 30 秒，大仓库备份仍可能被直接杀掉
+# （isolate 被杀，JS 捕获不到：备份记录停在 running、失败原因写不进去，
+#   仓库随后被「上一次备份仍在进行中」挡住）。缓解手段是把工作量压到 30 秒以内，
+# 用 [vars] 里的 REPO_BACKUP_SOFT_DEADLINE_MS / REPO_BACKUP_JOB_BYTE_BUDGET_MB
+# 提前收手（见文件末尾的说明），让没轮到的目标留到下一轮补写。
+# [limits]
+# cpu_ms = 300000
 
 # 开发服务器配置
 [dev]
