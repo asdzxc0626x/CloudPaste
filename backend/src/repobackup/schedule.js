@@ -62,6 +62,25 @@ export const MAX_SCHEDULE_INTERVAL_SEC = 30 * 24 * 60 * 60;
 export const STALE_RUNNING_BACKUP_SEC = 6 * 60 * 60;
 
 /**
+ * 「僵尸 running 记录」的判定窗口（修改点：大仓库备份超 CPU 限制）
+ *
+ * 与 STALE_RUNNING_BACKUP_SEC 的区别是**用途**，所以必须是两个值：
+ * - STALE_RUNNING_BACKUP_SEC 回答「还要不要把它当成进行中、继续挡住调度」，
+ *   偏保守（6 小时），宁可多等也不要和真的还在跑的作业撞上；
+ * - 这个值回答「可以断定它已经死了、把记录收尾成 failed 吗」。
+ *   收尾是写操作，判早了会把真在跑的作业的记录改掉，所以要有充分余量；
+ *   但也不能等 6 小时 —— 那期间备份历史里一直显示「进行中」，
+ *   管理员查不到任何原因（这正是 CPU 超限被静默吞掉时的现场）。
+ *
+ * 取 50 分钟的依据：Workers 侧单个作业的真实上界是
+ * execute-task 步骤超时 10 分钟 × 最多 3 次重试 + 指数退避（10s / 20s / 40s）≈ 31 分钟，
+ * 再留一轮余量。Node 侧没有这个上界，但进程被 kill 掉的记录同样需要收尾，
+ * 用同一个值即可（真的跑了 50 分钟还没完的作业，记录被改成 failed 也不影响它继续跑完 ——
+ * 它结束时会自己 updateBackup 覆盖回去）。
+ */
+export const ZOMBIE_RUNNING_BACKUP_SEC = 50 * 60;
+
+/**
  * 「上一次备份仍在进行中」时，本次调度往后推迟多久再看（修改点：第 2 期）
  *
  * 原实现直接按正常间隔（默认 6 小时）计算下次执行时间，意味着
@@ -411,6 +430,8 @@ export default {
   MIN_SCHEDULE_INTERVAL_SEC,
   MAX_SCHEDULE_INTERVAL_SEC,
   STALE_RUNNING_BACKUP_SEC,
+  // 修改点（大仓库备份超 CPU 限制）：僵尸 running 记录的收尾窗口
+  ZOMBIE_RUNNING_BACKUP_SEC,
   // 修改点（第 2 期）：延迟重试相关
   RUNNING_GUARD_RETRY_DELAY_MS,
   MIN_DEFER_RETRY_DELAY_MS,

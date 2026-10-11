@@ -15,7 +15,20 @@ import { planBackupPaths } from "../../../../repobackup/paths.js";
 import { pruneOldVersions, describePruneResult } from "../../../../repobackup/retention.js";
 // 修改点（第 2 期 错误分类 + 延迟重试）：
 // 限流/暂时性故障不记失败，而是算出「最早可重试时间」交给调度层
-import { planRetryForError, describeRetryAt, describeErrorKind } from "../../../../repobackup/errors.js";
+// 修改点（大仓库备份超 CPU 限制）：再引入两类自产错误 ——
+//   BudgetExhaustedError  本次运行额度用尽（可延迟，下一轮接着干）
+//   ArchiveTooLargeError  归档体积超上限（永久性，重试也没用）
+//   TransientError        传输停滞改抛这个，让它真正落进「可延迟」类别
+import {
+  planRetryForError,
+  describeRetryAt,
+  describeErrorKind,
+  TransientError,
+  BudgetExhaustedError,
+  ArchiveTooLargeError,
+} from "../../../../repobackup/errors.js";
+// 修改点（大仓库备份超 CPU 限制）：单次作业的时间 / 流量预算，见该模块文件头
+import { resolveTransferBudget, formatBytes, formatDuration } from "../../../../repobackup/transferBudget.js";
 import { deferRepositoryBackupSchedule } from "../../../../repobackup/schedule.js";
 // 修改点（第 4 期）：备份成功后推进该引用在 repo_detect_states 里的「已备份水位」，
 // 否则下一轮检测仍会认为有更新，同一个版本会被反复备份
@@ -76,6 +89,34 @@ import { REPO_OUTCOME } from "../../../../repobackup/status.js";
  * - 调度器抛出的 RateLimitedError 由上面的第 2 期逻辑接住：依旧不记失败、不累计失败数、
  *   只把「最早可重试时间」交给调度层
  * - 源码归档走 codeload.github.com，不消耗 API 额度，因此不经过调度器（第 1 期成果不变）
+ *
+ * 修改点（大仓库备份超 CPU 限制）：单次作业的工作量必须自己设上限
+ * ------------------------------------------------------------
+ * 上面那条「取舍说明」带来一个后果：本作业的工作量是 N 个引用 × M 个目标，
+ * 每个组合都要完整下载 + 完整上传一遍，而 N、M、仓库体积全由用户配置决定，
+ * 代码侧原先没有任何约束。
+ *
+ * 在 Workers 下这一整串动作跑在**同一个** Workflow 步骤里（JobWorkflow 的 execute-task），
+ * 于是同时吃两道限制：该次调用的累计 CPU，以及步骤的 wall-clock 超时。
+ * 实测 354MB 归档单趟就要 3.5~20 秒 CPU（上游分片越小越贵），多引用 / 多目标必然撞线。
+ *
+ * 撞线的后果比「失败」严重得多：CPU 超限是运行时直接杀 isolate，**JS 捕获不到** ——
+ * 下面所有 catch、updateBackup({status:'failed'})、last_error 一个都不会执行，
+ * 备份记录永远停在 running，于是 ScheduledRepoBackupTask 的「上一次备份仍在进行中」
+ * 会继续挡住这个仓库（原先要挡满 6 小时），管理员看不到任何原因。
+ * 这正是 yetone/magpie（归档在、manifest 缺失、没有目标行）与
+ * FCL-Team/FoldCraftLauncher（354MB，什么都没落下来）的现场。
+ *
+ * 所以这里加了三道口子，共同的原则是「撞线之前自己收手」：
+ *  a) 开工前检查预算（软截止 + 单次作业流量上限），不够就不再领新活，
+ *     把没轮到的引用 / 目标记成 deferred 并安排短延迟重试 ——
+ *     已成功的目标照常落库，下一轮由既有的「只补写缺失目标」自愈路径接着干
+ *  b) 归档体积硬上限：codeload 是 chunked 无 Content-Length，开传之前没人知道多大，
+ *     只能边传边数，超了当场中止并记**永久性**失败（重试只会再浪费一遍流量）
+ *  c) 传输护栏改用单个巡检定时器，不再每个分片 clearTimeout + setTimeout
+ *
+ * 配套改动在 wrangler.toml 的 [limits] cpu_ms（默认 30 秒抬到平台上限 5 分钟）
+ * 与 src/repobackup/transferBudget.js（预算口径与环境变量）。
  */
 
 type RepoBackupPayload = {
@@ -116,6 +157,9 @@ type BackupStage = "preparing" | "resolving" | "transferring" | "manifest" | "pr
  * GitHub/加速代理的连接可能在中途停止吐数据而不断开，此时下载与上传都会无限期等待，
  * 任务永远停在 running。这里在字节流上挂一个看门狗：超过该时长没有新分片就 abort 掉
  * 整个响应，让这个目标以明确的错误失败（下次运行会自动补写）。
+ *
+ * 修改点（大仓库备份超 CPU 限制）：实际生效值改由 transferBudget 解析
+ * （支持 REPO_BACKUP_STALL_TIMEOUT_MS 覆盖），这里只作为 createTransferGuard 的默认值。
  */
 const STALL_TIMEOUT_MS = 120 * 1000;
 
@@ -156,19 +200,31 @@ function generateId(prefix: string): string {
 /**
  * 归档传输的护栏（修改点：任务卡住排查）
  *
- * 一次性解决三件事：
+ * 一次性解决四件事：
  * - 字节计数：counter.value 在流被消费的过程中持续累加
- * - 停滞检测：每收到一个分片就重置计时器，超时则 abort 整个响应
+ * - 停滞检测：超过 stallTimeoutMs 没有新分片就 abort 整个响应
+ * - 体积上限：累计字节超过 maxBytes 就当场掐断（修改点：大仓库备份超 CPU 限制）
  * - 实时进度：按节流回调 onProgress，让前端能看到字节在涨（不涨就是真卡住了）
  *
  * controller.signal 必须在发起请求前就交给 provider，所以本函数先于 openSourceArchive 调用，
  * 拿到响应后再用 wrap() 套住 body。
+ *
+ * 修改点（大仓库备份超 CPU 限制）：停滞检测由「每个分片都 clearTimeout + setTimeout」
+ * 改成「一个巡检定时器 + 一个时间戳」。原写法在 354MB 归档上要重建十几万次定时器，
+ * 纯属浪费 —— 而这里的每一点 CPU 都直接计入 Workers 那条会把 isolate 杀掉的配额。
+ * 判定精度从「精确到分片」降为「精确到 stallTimeoutMs/4」，对一个 120 秒的阈值无关紧要。
+ *
+ * 导出仅供回归测试使用（transferBudget.test.js）：护栏里的体积上限是会「中途掐断传输」
+ * 的逻辑，一旦算错就会悄悄产出半个归档，必须能单独验证。业务代码只在本文件内调用。
  */
-function createTransferGuard({
+export function createTransferGuard({
   stallTimeoutMs = STALL_TIMEOUT_MS,
+  maxBytes = 0,
   onProgress,
 }: {
   stallTimeoutMs?: number;
+  /** 累计字节上限，0 表示不限制 */
+  maxBytes?: number;
   onProgress?: (bytes: number) => void;
 } = {}) {
   const controller = new AbortController();
@@ -176,34 +232,54 @@ function createTransferGuard({
 
   let timer: any = null;
   let stalled = false;
+  let oversize = false;
   let disposed = false;
-  let lastFlushMs = Date.now();
+  let lastChunkAtMs = Date.now();
+  let lastFlushMs = lastChunkAtMs;
   let lastFlushBytes = 0;
 
-  /** 重新武装停滞计时器 */
-  const arm = () => {
-    if (disposed) return;
-    if (timer) clearTimeout(timer);
-    timer = setTimeout(() => {
-      stalled = true;
-      console.error(`[RepoBackupTaskHandler] 传输停滞超过 ${Math.round(stallTimeoutMs / 1000)}s，中止本次下载`);
-      try {
-        controller.abort();
-      } catch {
-        // ignore
-      }
-    }, stallTimeoutMs);
+  const abortQuietly = () => {
+    try {
+      controller.abort();
+    } catch {
+      // ignore
+    }
   };
 
   const dispose = () => {
     disposed = true;
-    if (timer) clearTimeout(timer);
+    if (timer) clearInterval(timer);
     timer = null;
   };
 
-  const flushProgress = (force = false) => {
+  /**
+   * 启动停滞巡检（幂等：重复调用不会建出第二个定时器）
+   * wrap() 内部会自动调一次，调用方在拿到响应后再调一次也无妨
+   */
+  const arm = () => {
+    if (disposed || timer) return;
+    lastChunkAtMs = Date.now();
+    // 巡检周期取阈值的 1/4：最坏情况下晚 1/4 个阈值才判定停滞，完全够用
+    const tickMs = Math.max(1000, Math.floor(stallTimeoutMs / 4));
+    timer = setInterval(() => {
+      if (disposed) return;
+      if (Date.now() - lastChunkAtMs < stallTimeoutMs) return;
+      stalled = true;
+      console.error(`[RepoBackupTaskHandler] 传输停滞超过 ${Math.round(stallTimeoutMs / 1000)}s，中止本次下载`);
+      abortQuietly();
+      dispose();
+    }, tickMs);
+    // Node 下让定时器不要拖着事件循环（Workers 上 timer 是数字，可选调用自动跳过）
+    try {
+      timer?.unref?.();
+    } catch {
+      // ignore
+    }
+  };
+
+  /** @param nowMs 复用调用方已经取过的时间戳，省掉每个分片一次 Date.now() */
+  const flushProgress = (nowMs: number, force = false) => {
     if (!onProgress) return;
-    const nowMs = Date.now();
     const grown = counter.value - lastFlushBytes;
     if (!force && nowMs - lastFlushMs < PROGRESS_FLUSH_INTERVAL_MS && grown < PROGRESS_FLUSH_BYTES) {
       return;
@@ -217,19 +293,42 @@ function createTransferGuard({
     }
   };
 
-  /** 套在归档 body 外层：边转发边计数、重置看门狗、上报进度 */
+  /** 套在归档 body 外层：边转发边计数、刷新停滞时间戳、上报进度、拦住超大归档 */
   const wrap = (stream: ReadableStream): ReadableStream => {
+    arm();
     // TransformStream 在 Cloudflare Workers 与 Node 18+ 均为全局可用
     const transform = new TransformStream({
       transform(chunk: any, ctrl: any) {
-        arm();
+        const nowMs = Date.now();
+        lastChunkAtMs = nowMs;
+
+        let size = 0;
         try {
-          const size = chunk?.byteLength ?? chunk?.length ?? 0;
-          if (Number.isFinite(size)) counter.value += size;
+          const raw = chunk?.byteLength ?? chunk?.length ?? 0;
+          if (Number.isFinite(raw)) size = raw;
         } catch {
           // 计数失败不应中断传输
         }
-        flushProgress();
+        counter.value += size;
+
+        /**
+         * 体积硬上限（修改点：大仓库备份超 CPU 限制）
+         *
+         * 这是唯一一处「传输中途主动掐断」。之所以必须能中途掐断：
+         * codeload 的响应是 chunked 不带 Content-Length，开传之前拿不到体积，
+         * 而一个远超预算的归档会把整次调用（以及它后面排着的引用 / 目标）全拖死。
+         * 掐断留下的是半个文件，但目标行会记 failed、原因写得清清楚楚，
+         * 比被运行时静默杀掉强得多。
+         */
+        if (maxBytes > 0 && counter.value > maxBytes) {
+          oversize = true;
+          abortQuietly();
+          dispose();
+          ctrl.error(new Error(`归档体积超过上限 ${formatBytes(maxBytes)}，已中止传输`));
+          return;
+        }
+
+        flushProgress(nowMs);
         ctrl.enqueue(chunk);
       },
       flush() {
@@ -246,6 +345,8 @@ function createTransferGuard({
     dispose,
     wrap,
     isStalled: () => stalled,
+    /** 是否因为超过体积上限而被掐断（修改点：大仓库备份超 CPU 限制） */
+    isOversize: () => oversize,
   };
 }
 
@@ -289,6 +390,23 @@ export class RepoBackupTaskHandler implements TaskHandler {
     const mountRepository = factory.getMountRepository();
 
     const startedMs = Date.now();
+
+    /**
+     * 本次作业的传输预算（修改点：大仓库备份超 CPU 限制）
+     *
+     * Workers 下是「软截止 + 流量上限 + 单归档体积上限」，Node 下默认全关
+     * （那里没有 CPU 配额也没有步骤超时，加限制只会让大仓库备份不成）。
+     * 口径与环境变量见 repobackup/transferBudget.js 的文件头。
+     */
+    const budget = resolveTransferBudget(env);
+    const deadlineAtMs = budget.softDeadlineMs > 0 ? startedMs + budget.softDeadlineMs : 0;
+    /**
+     * 本次作业已经实际搬过的字节数（含失败/中止的那一趟）
+     *
+     * 与 stats 里的 bytesTransferred 分开记：后者是给前端看的进度，
+     * 只累计写成功的部分；预算要算的是「这次调用真花掉了多少」，失败的那趟也算。
+     */
+    let budgetBytes = 0;
 
     // ---------- 1. 读取仓库配置 ----------
     const repoRow = await codeRepo.findRepositoryById(payload.repositoryId);
@@ -416,6 +534,45 @@ export class RepoBackupTaskHandler implements TaskHandler {
       return plan;
     };
 
+    /** 软截止是否已过（修改点：大仓库备份超 CPU 限制） */
+    const deadlinePassed = () => deadlineAtMs > 0 && Date.now() >= deadlineAtMs;
+
+    /**
+     * 预算是否已耗尽（修改点：大仓库备份超 CPU 限制）
+     *
+     * 只在「准备领一份新活」之前调用（下一个引用、下一个目标），
+     * 不在传输中途调用 —— 中途掐断只会留下半个文件，而我们宁可让这一趟走完。
+     *
+     * @returns 耗尽原因（给管理员看的文本）；还够用则返回 null
+     */
+    const budgetExhausted = (): string | null => {
+      if (deadlinePassed()) {
+        return (
+          `本次运行已持续 ${formatDuration(Date.now() - startedMs)}，` +
+          `达到单次作业的时间上限（${formatDuration(budget.softDeadlineMs)}）`
+        );
+      }
+      if (budget.jobByteBudget > 0 && budgetBytes >= budget.jobByteBudget) {
+        return (
+          `本次运行已传输 ${formatBytes(budgetBytes)}，` +
+          `达到单次作业的流量上限（${formatBytes(budget.jobByteBudget)}）`
+        );
+      }
+      return null;
+    };
+
+    /**
+     * 把「预算用尽」登记成一次延迟重试（修改点：大仓库备份超 CPU 限制）
+     *
+     * 复用第 2 期那套延迟机制，不另起一套状态：BudgetExhaustedError 在
+     * repobackup/errors.js 里就归在「可延迟」类别，所以 noteDeferral 必然返回计划。
+     */
+    const noteBudgetDeferral = (reason: string) => {
+      const plan = noteDeferral(new BudgetExhaustedError(reason));
+      // BudgetExhaustedError 一定可延迟，这里只是满足类型收窄
+      return plan!;
+    };
+
     // 修改点（任务卡住排查 / 详情完善）：当前执行阶段与目标，让「任务管理」能看出卡在哪一步
     let currentStage: BackupStage = "preparing";
     let currentRef: string | null = null;
@@ -497,6 +654,35 @@ export class RepoBackupTaskHandler implements TaskHandler {
       let backupId: string | null = null;
       /** 本引用内出现的可延迟重试错误（修改点：第 2 期），决定这个引用记「失败」还是「已安排重试」 */
       let refDeferral: ReturnType<typeof noteDeferral> = null;
+
+      /**
+       * 开工前先看预算（修改点：大仓库备份超 CPU 限制）
+       *
+       * 到这一步连 GitHub 都还没请求，什么都没做，所以这里只记任务条目留痕，
+       * 不往 code_repository_backups 里写「什么都没干」的记录 —— 备份历史是给人
+       * 核对快照用的，塞进一堆「没轮到」会把它变成噪音。重试时间由收尾统一交给调度层。
+       *
+       * 用 continue 而不是 break：剩下的每个引用都留一条说明，
+       * 否则任务详情里它们会是一排永远停在 processing 的条目。
+       */
+      const refBudgetReason = budgetExhausted();
+      if (refBudgetReason) {
+        const plan = noteBudgetDeferral(refBudgetReason);
+        const retryAtText = describeRetryAt(plan.retryAtMs as number);
+        itemResult.status = "skipped";
+        itemResult.message = `${refBudgetReason}，本引用留到下一轮（${retryAtText}）继续`;
+        itemResult.durationMs = Date.now() - refStartedMs;
+        itemResult.meta = {
+          ...(itemResult.meta || {}),
+          outcome: REPO_OUTCOME.DEFERRED,
+          retryAt: retryAtText,
+        };
+        outcomes.push({ ref: trackRef ?? null, status: "deferred" });
+        processed += 1;
+        await report(processed);
+        console.warn(`[RepoBackupTaskHandler] ${repoIdentifier}@${trackRef || ""} 预算用尽，推迟：${refBudgetReason}`);
+        continue;
+      }
 
       try {
         if (await context.isCancelled(job.jobId)) {
@@ -664,6 +850,16 @@ export class RepoBackupTaskHandler implements TaskHandler {
 
         // 3.4 逐个目标写入
         const targetErrors: string[] = [];
+        /**
+         * 因预算用尽而没轮到的目标说明（修改点：大仓库备份超 CPU 限制）
+         *
+         * 与 targetErrors 分开装，因为两者的去向不同：
+         * targetErrors 会写进 code_repositories.last_error，前端看到它非空就渲染红色失败；
+         * 而「没轮到」是设计内的正常流程，大仓库每轮都会出现，
+         * 混进 last_error 会让这类仓库长期显示成故障。它只进备份记录的 error_message
+         * 与任务条目说明 —— 能查到，但不报警。
+         */
+        const budgetNotes: string[] = [];
         let primaryStoragePath: string | null = null;
         let primaryManifestPath: string | null = null;
         let primarySizeBytes: number | null = null;
@@ -672,6 +868,49 @@ export class RepoBackupTaskHandler implements TaskHandler {
         for (const mount of missingMounts) {
           if (await context.isCancelled(job.jobId)) {
             throw new Error("cancelled");
+          }
+
+          /**
+           * 领下一个目标之前先看预算（修改点：大仓库备份超 CPU 限制）
+           *
+           * 这是最关键的一道口子：多目标的代价是「每个目标都要把整个归档重新拉一遍」，
+           * 一个 354MB 的仓库写三个目标就是三趟 354MB。前面的目标跑完之后预算往往
+           * 已经见底，此时领下一个目标必然撞上 CPU / 步骤超时 —— 而撞上就什么都留不下。
+           *
+           * 这里记 deferred（不是 failed）：已写成功的目标照常落库，
+           * 下一轮 3.2 的去重逻辑会发现「只缺这几个目标」并只补写它们，
+           * 即既有的自愈路径，不需要为此另写一套续传。
+           */
+          const targetBudgetReason = budgetExhausted();
+          if (targetBudgetReason) {
+            const plan = noteBudgetDeferral(targetBudgetReason);
+            if (!refDeferral) refDeferral = plan;
+
+            const label = mount.name || mount.mount_path;
+            budgetNotes.push(`${label}: ${targetBudgetReason}，已安排下一轮补写`);
+
+            const pendingSummary = summaryOf(mount.id);
+            if (pendingSummary) {
+              pendingSummary.status = "deferred";
+              pendingSummary.error = `本次未轮到：${targetBudgetReason}`;
+            }
+
+            await codeRepo
+              .upsertBackupTarget({
+                id: generateId("bkt"),
+                backup_id: backupId,
+                mount_id: mount.id,
+                mount_path: mount.mount_path,
+                status: "deferred",
+                error_message: targetBudgetReason,
+              })
+              .catch((e: any) =>
+                console.warn("[RepoBackupTaskHandler] 记录目标延迟状态出错:", e?.message || e),
+              );
+
+            console.warn(`[RepoBackupTaskHandler] 目标未轮到（${label}）：${targetBudgetReason}`);
+            await report(processed);
+            continue;
           }
 
           const paths = planBackupPaths({
@@ -689,7 +928,10 @@ export class RepoBackupTaskHandler implements TaskHandler {
 
           // 修改点（任务卡住排查）：传输护栏必须在发起请求前创建，
           // 它的 signal 要交给 provider，才能在停滞时把整个响应中止掉
+          // 修改点（大仓库备份超 CPU 限制）：停滞阈值与体积上限都取自本次作业的预算
           const guard = createTransferGuard({
+            stallTimeoutMs: budget.stallTimeoutMs,
+            maxBytes: budget.maxArchiveBytes,
             onProgress: (bytes) => {
               // 只补 bytesTransferred 这一个字段，避免与 report() 的完整快照互相覆盖；
               // 失败不影响传输（updateProgress 在 Workers 下是异步 D1 写）
@@ -752,16 +994,38 @@ export class RepoBackupTaskHandler implements TaskHandler {
                 },
               );
             } catch (uploadError: any) {
+              /**
+               * 体积超限优先判（修改点：大仓库备份超 CPU 限制）
+               *
+               * 护栏掐断时底层报的是 stream/abort 错误，必须换成真实原因，
+               * 否则管理员看到的是一句莫名其妙的 "aborted"。
+               * 这里抛**永久性**错误：这个仓库在当前环境下就是传不动，
+               * 安排重试只会每轮都白拉一遍几 GB 的流量。
+               */
+              if (guard.isOversize()) {
+                throw new ArchiveTooLargeError(
+                  `归档体积超过单次备份上限 ${formatBytes(budget.maxArchiveBytes)}` +
+                    `（传输到 ${formatBytes(counter.value)} 时中止）。` +
+                    `如确需备份该仓库，请调大 REPO_BACKUP_MAX_ARCHIVE_MB，或改用 Docker/Node 部署`,
+                );
+              }
               // 看门狗触发时底层报的是 abort/stream 错误，换成人看得懂的原因
+              // 修改点（大仓库备份超 CPU 限制）：这里原先抛的是普通 Error，
+              // 会被 classifyRepoBackupError 判成永久性错误 —— 与本文件
+              // 「传输停滞属于暂时性错误」的设计说明不符，连接抽风被记成了备份失败。
+              // 改抛 TransientError，让它真正落进「可延迟重试」类别。
               if (guard.isStalled()) {
-                throw new Error(
-                  `传输停滞超过 ${Math.round(STALL_TIMEOUT_MS / 1000)} 秒（已传 ${counter.value} 字节）已中止，` +
-                    `可能是 GitHub 或加速代理无响应`,
+                throw new TransientError(
+                  `传输停滞超过 ${Math.round(budget.stallTimeoutMs / 1000)} 秒` +
+                    `（已传 ${formatBytes(counter.value)}）已中止，可能是 GitHub 或加速代理无响应`,
                 );
               }
               throw uploadError;
             } finally {
               guard.dispose();
+              // 修改点（大仓库备份超 CPU 限制）：成功与否都要计入本次作业的流量预算 ——
+              // 失败的那一趟同样花掉了 CPU 与带宽，不记的话预算就形同虚设
+              budgetBytes += counter.value;
             }
 
             const sizeBytes = counter.value > 0 ? counter.value : null;
@@ -890,10 +1154,14 @@ export class RepoBackupTaskHandler implements TaskHandler {
         const allDone = doneCount === mounts.length;
 
         const backupWarning = targetErrors.length > 0 ? targetErrors.join("；") : null;
+        // 修改点（大仓库备份超 CPU 限制）：「没轮到」的说明单独成句，不进 last_error
+        const budgetNote = budgetNotes.length > 0 ? budgetNotes.join("；") : null;
 
         if (!anyDone) {
           // 所有目标都没有副本
-          const message = backupWarning || "所有备份目标均写入失败";
+          // 修改点（大仓库备份超 CPU 限制）：可能一个目标都没轮到（预算在本引用之前就见底），
+          // 此时 targetErrors 是空的，不能笼统地说「均写入失败」—— 那是在谎报故障
+          const message = backupWarning || budgetNote || "所有备份目标均写入失败";
 
           // 修改点（第 2 期 延迟重试）：写入阶段撞上限流/暂时性故障时不算失败。
           // 记录必须离开 running（否则会挡住下一次定时备份），但绝不能写 failed，
@@ -951,26 +1219,39 @@ export class RepoBackupTaskHandler implements TaskHandler {
         try {
           currentStage = "pruning";
           await report(processed);
-          const pruneSummary = await pruneOldVersions({
-            codeRepo,
-            fileSystem,
-            repositoryRow: repoRow,
-            userId: job.userId,
-            userType: job.userType,
-          });
-          pruneMessage = describePruneResult(pruneSummary);
-          if (pruneSummary.removedCount > 0) {
-            console.log(`[RepoBackupTaskHandler] ${pruneMessage}`);
-          }
-          for (const err of pruneSummary.errors) {
-            console.warn(`[RepoBackupTaskHandler] 版本清理提示: ${err}`);
+          /**
+           * 修改点（大仓库备份超 CPU 限制）：软截止已过就不清理了
+           *
+           * 清理要逐个目标删文件删目录，是一串网络往返，在已经快撞上步骤超时的时候
+           * 开这个头很可能半途被打断 —— 而它不是必须现在做的事：
+           * 旧版本多留一轮毫无影响，下一次备份成功后照样会清。
+           */
+          if (deadlinePassed()) {
+            console.warn("[RepoBackupTaskHandler] 本次运行已达时间上限，跳过旧版本清理（下一轮继续）");
+          } else {
+            const pruneSummary = await pruneOldVersions({
+              codeRepo,
+              fileSystem,
+              repositoryRow: repoRow,
+              userId: job.userId,
+              userType: job.userType,
+            });
+            pruneMessage = describePruneResult(pruneSummary);
+            if (pruneSummary.removedCount > 0) {
+              console.log(`[RepoBackupTaskHandler] ${pruneMessage}`);
+            }
+            for (const err of pruneSummary.errors) {
+              console.warn(`[RepoBackupTaskHandler] 版本清理提示: ${err}`);
+            }
           }
         } catch (pruneError: any) {
           // 清理失败不影响本次备份结论
           console.warn("[RepoBackupTaskHandler] 版本清理失败:", pruneError?.message || pruneError);
         }
 
-        const backupNote = [backupWarning, pruneMessage].filter(Boolean).join("；") || null;
+        // 修改点（大仓库备份超 CPU 限制）：budgetNote 进备份记录的 error_message
+        // （备份历史里能查到「这个版本还缺哪几个目标、为什么」），但不进 last_error
+        const backupNote = [backupWarning, budgetNote, pruneMessage].filter(Boolean).join("；") || null;
 
         await codeRepo.updateBackup(backupId, {
           status,
@@ -1017,12 +1298,18 @@ export class RepoBackupTaskHandler implements TaskHandler {
 
         // 部分目标成功时：备份记录记为 partial（历史里能看出哪些目标缺副本），
         // 但任务条目仍记为 failed —— 用户要求"写入全部目标"，没写全就不算成功
-        itemResult.status = allDone ? "success" : "failed";
+        //
+        // 修改点（大仓库备份超 CPU 限制）：没写全的原因要分开看 ——
+        // 真有目标写挂了（targetErrors 非空）才是 failed；
+        // 如果只是本次预算用尽、剩下的目标留到下一轮，那是「还没干完」而不是「干坏了」，
+        // 记 skipped。大仓库每轮都会走这条路，记成 failed 会让它永远显示红色。
+        itemResult.status = allDone ? "success" : targetErrors.length > 0 ? "failed" : "skipped";
         itemResult.targetPath = primaryStoragePath || undefined;
         itemResult.fileSize = primarySizeBytes ?? undefined;
         itemResult.durationMs = Date.now() - refStartedMs;
         if (backupNote) itemResult.message = backupNote;
-        if (!allDone) itemResult.error = backupWarning || "部分目标写入失败";
+        // 同理：只有真失败才填 error（前端据此渲染红字），预算用尽的说明已在 message 里
+        if (!allDone && targetErrors.length > 0) itemResult.error = backupWarning || "部分目标写入失败";
 
         /**
          * 修改点（状态显示不一致修复）：统一结果词汇
@@ -1035,6 +1322,9 @@ export class RepoBackupTaskHandler implements TaskHandler {
         itemResult.meta = {
           ...(itemResult.meta || {}),
           outcome: allDone ? REPO_OUTCOME.SUCCESS : REPO_OUTCOME.PARTIAL,
+          // 修改点（大仓库备份超 CPU 限制）：partial 且已安排续写时，把时间也给出来，
+          // 任务详情才能说清「剩下的目标什么时候补」
+          ...(refDeferral ? { retryAt: describeRetryAt(refDeferral.retryAtMs as number) } : {}),
         };
 
         outcomes.push({
@@ -1192,7 +1482,8 @@ export class RepoBackupTaskHandler implements TaskHandler {
 
     // ---------- 4. 延迟重试收尾（修改点：第 2 期 限流 = 延迟，不是失败）----------
     //
-    // 走到这里说明本轮至少有一处撞上了限流/暂时性故障。此时：
+    // 走到这里说明本轮至少有一处撞上了限流/暂时性故障，或者（修改点：大仓库备份超
+    // CPU 限制）本次作业的预算用尽、还有引用 / 目标没轮到。此时：
     // - 不写任何失败记录（上面已经处理过）
     // - 把该仓库的备份计划提前到「最早可重试时间」，让调度层到点自动重跑，
     //   而不是白等一个完整周期（默认 6 小时）
@@ -1201,7 +1492,9 @@ export class RepoBackupTaskHandler implements TaskHandler {
     if (deferredRetryAtMs !== null) {
       const retryAtText = describeRetryAt(deferredRetryAtMs);
       const kindText = describeErrorKind(deferredKind || "");
-      const note = `${kindText}，本次未备份，已安排在 ${retryAtText} 自动重试：${deferredMessage || ""}`;
+      // 修改点（大仓库备份超 CPU 限制）：原文是「本次未备份」—— 预算用尽的场景下
+      // 往往已经备成了好几个引用 / 目标，那句话会把日志读成「这轮什么都没干」
+      const note = `${kindText}，已安排在 ${retryAtText} 继续：${deferredMessage || ""}`;
 
       // 只前移、不后移，也不会碰 schedule_type / interval_sec / enabled 等其他字段；
       // 仓库未启用定时备份时返回 false，这种情况下只能由管理员手动重试

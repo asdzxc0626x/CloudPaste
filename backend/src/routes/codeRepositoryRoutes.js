@@ -28,6 +28,8 @@ import {
   getGlobalCredentialPool,
   updateGlobalCredentialPool,
 } from "../services/codeRepositoryService.js";
+// 修改点（大仓库备份超 CPU 限制）：僵尸 running 记录收尾，与定时备份共用同一份实现
+import { finalizeZombieBackups } from "../repobackup/zombies.js";
 
 const codeRepositoryRoutes = new Hono();
 const requireAdmin = usePolicy("admin.all");
@@ -261,6 +263,25 @@ codeRepositoryRoutes.post("/api/admin/repo-backup/repositories/:id/backup", requ
 
   // 仓库不存在时这里会抛 NotFound，避免创建注定失败的作业
   const repo = await getRepository(db, repositoryFactory, encryptionSecret, id, env);
+
+  /**
+   * 修改点（大仓库备份超 CPU 限制）：顺手收尾僵尸 running 备份记录
+   *
+   * 为什么手动路径也要做：收尾原本只在 ScheduledRepoBackupTask 里跑，于是
+   * **关掉了定时备份的仓库永远没人清理** —— 备份历史里那条 CPU 超限留下的
+   * 「进行中」会一直挂着，管理员查不到任何原因。手动「立即备份」是这类仓库
+   * 唯一会被触发的入口，所以把同一份收尾逻辑挂在这里。
+   *
+   * 放在 enabled 校验之前：脏记录是历史遗留，与仓库现在是否启用无关
+   * （否则「仓库一禁用，进行中记录就永远留着」）。
+   * 它不影响下面的并发守卫 —— 那个守卫看的是 tasks 表，与备份记录是两套状态。
+   */
+  await finalizeZombieBackups({
+    codeRepo: repositoryFactory.getCodeRepositoryRepository(),
+    repositoryId: id,
+    repoLabel: repo.name || repo.repoIdentifier,
+  });
+
   if (!repo.enabled) {
     throw new ValidationError("该代码仓库已禁用，请先启用后再备份");
   }

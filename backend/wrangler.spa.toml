@@ -7,6 +7,14 @@ main = "unified-entry.js"
 compatibility_date = "2025-09-01"
 compatibility_flags = ["nodejs_compat"]
 
+# CPU 时间上限（修改点：大仓库备份超 CPU 限制）
+# 与 wrangler.toml 保持一致，理由同见该文件的说明：
+# 代码仓库备份的一次作业（N 个引用 × M 个目标，各自完整下载 + 上传一遍）
+# 跑在同一个 Workflow 步骤里，CPU 累计，默认 30 秒必然不够；
+# 超限会直接杀掉 isolate，连失败原因都写不进数据库。
+[limits]
+cpu_ms = 300000
+
 # 开发服务器配置
 [dev]
 port = 8787
@@ -29,6 +37,16 @@ ADMIN_TOKEN_EXPIRY_DAYS = "7"
 # REPO_BACKUP_GITHUB_MAX_CONCURRENCY = "2"
 # REPO_BACKUP_GITHUB_MIN_INTERVAL_MS = "800"
 # REPO_BACKUP_GITHUB_HOURLY_BUDGET = "45"
+# 代码仓库备份：单次作业传输预算（修改点：大仓库备份超 CPU 限制，均可选，注释掉即用默认值）
+# 作用是在撞上 CPU / 步骤超时之前主动收手，把没轮到的目标留给下一轮补写
+# - REPO_BACKUP_SOFT_DEADLINE_MS：软截止（毫秒），Workers 默认 420000（7 分钟，步骤超时 10 分钟留收尾余量）；0 = 不限制
+# - REPO_BACKUP_JOB_BYTE_BUDGET_MB：单次作业的累计传输量上限，Workers 默认 2048；0 = 不限制
+# - REPO_BACKUP_MAX_ARCHIVE_MB：单个归档体积上限，超过即中断并记永久性失败，Workers 默认 2048；0 = 不限制
+# - REPO_BACKUP_STALL_TIMEOUT_MS：传输停滞判定（毫秒），默认 120000，不可关闭
+# REPO_BACKUP_SOFT_DEADLINE_MS = "420000"
+# REPO_BACKUP_JOB_BYTE_BUDGET_MB = "2048"
+# REPO_BACKUP_MAX_ARCHIVE_MB = "2048"
+# REPO_BACKUP_STALL_TIMEOUT_MS = "120000"
 
 # 绑定D1数据库
 # 需要替换为实际的数据库ID

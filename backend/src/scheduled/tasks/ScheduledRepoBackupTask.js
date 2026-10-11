@@ -10,6 +10,8 @@ import {
   // 修改点（第 5 期 错峰调度）：单轮派发上限
   REPO_BACKUP_MAX_DISPATCH_PER_TICK,
 } from "../../repobackup/schedule.js";
+// 修改点（大仓库备份超 CPU 限制）：僵尸 running 记录收尾，手动备份路由也用同一份实现
+import { finalizeZombieBackups } from "../../repobackup/zombies.js";
 
 /**
  * 仓库定时备份任务（修改点：独立备份计划优化）
@@ -99,11 +101,29 @@ export class ScheduledRepoBackupTask {
 
     const repoLabel = repoRow.name || repoRow.repo_identifier;
 
+    /**
+     * 修改点（大仓库备份超 CPU 限制）：先收尾僵尸 running 记录
+     *
+     * 放在最前面（连「仓库已禁用」的判断都在它之后）的原因：
+     * 这些脏记录是**历史遗留**，仓库现在是启用还是禁用、这轮要不要备份都与它无关；
+     * 放到后面就会出现「仓库一禁用，备份历史永远挂着一条进行中」。
+     *
+     * 具体收尾逻辑见 repobackup/zombies.js —— 手动「立即备份」路由共用同一份实现，
+     * 这样关掉定时备份的仓库也能自愈。
+     */
+    const { summary: zombieSummary } = await finalizeZombieBackups({
+      codeRepo,
+      repositoryId,
+      repoLabel,
+    });
+    /** 把收尾说明接到本次运行摘要后面（没有收尾过就原样返回） */
+    const withZombieNote = (text) => (zombieSummary ? `${text}。${zombieSummary}` : text);
+
     // 仓库被禁用：跳过而不是失败。计划行的 enabled 只表达「是否启用定时备份」，
     // 不随仓库启用状态联动，这样仓库重新启用后用户原先的计划选择还在
     if (!(repoRow.enabled === 1 || repoRow.enabled === true)) {
       return {
-        summary: `仓库「${repoLabel}」当前已禁用，本次定时备份跳过`,
+        summary: withZombieNote(`仓库「${repoLabel}」当前已禁用，本次定时备份跳过`),
         repositoryId,
         skipped: true,
       };
@@ -115,7 +135,9 @@ export class ScheduledRepoBackupTask {
     const runningCount = await codeRepo.countRunningBackupsSince(repositoryId, staleBefore);
     if (runningCount > 0) {
       return {
-        summary: `仓库「${repoLabel}」上一次备份仍在进行中（${runningCount} 个版本），本次定时备份跳过`,
+        summary: withZombieNote(
+          `仓库「${repoLabel}」上一次备份仍在进行中（${runningCount} 个版本），本次定时备份跳过`,
+        ),
         repositoryId,
         runningCount,
         skipped: true,
@@ -144,7 +166,9 @@ export class ScheduledRepoBackupTask {
     );
     if (activeCheckCount > 0) {
       return {
-        summary: `仓库「${repoLabel}」上一次版本检测仍在进行中（${activeCheckCount} 个作业），本次跳过`,
+        summary: withZombieNote(
+          `仓库「${repoLabel}」上一次版本检测仍在进行中（${activeCheckCount} 个作业），本次跳过`,
+        ),
         repositoryId,
         activeCheckCount,
         skipped: true,
@@ -177,7 +201,9 @@ export class ScheduledRepoBackupTask {
     );
 
     return {
-      summary: `已为仓库「${repoLabel}」创建版本检测作业（repo_backup_check 作业 ID=${job.jobId}）；只有检测到新版本才会继续创建备份作业`,
+      summary: withZombieNote(
+        `已为仓库「${repoLabel}」创建版本检测作业（repo_backup_check 作业 ID=${job.jobId}）；只有检测到新版本才会继续创建备份作业`,
+      ),
       repositoryId,
       repoIdentifier: repoRow.repo_identifier,
       jobId: job.jobId,

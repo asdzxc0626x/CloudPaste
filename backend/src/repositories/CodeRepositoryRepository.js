@@ -406,6 +406,37 @@ export class CodeRepositoryRepository extends BaseRepository {
   }
 
   /**
+   * 找出「卡在 running 的僵尸备份记录」（修改点：大仓库备份超 CPU 限制）
+   *
+   * 为什么需要它：Workers 的 CPU 超限是运行时直接杀掉 isolate，JS 捕获不到 ——
+   * 备份任务里所有 catch、updateBackup({status:'failed'}) 一个都不会执行，
+   * 于是记录永久停在 running。countRunningBackupsSince 的时间窗口只是
+   * 「超过窗口后不再把它算作进行中」，脏记录本身还在，备份历史里永远显示进行中，
+   * 管理员看不到任何失败原因。
+   *
+   * 这里把它们查出来，由调度任务改写成 failed 并补上原因（见 ScheduledRepoBackupTask）。
+   *
+   * @param {string} repositoryId
+   * @param {string} beforeIso 判定为僵尸的时间上界（ISO 字符串）
+   * @param {number} [limit] 单次最多返回多少条，避免一次性改写过多
+   * @returns {Promise<Object[]>} 备份记录（由旧到新）
+   */
+  async findRunningBackupsBefore(repositoryId, beforeIso, limit = 20) {
+    if (!repositoryId || !beforeIso) return [];
+    const max = Number.isFinite(Number(limit)) ? Math.max(1, Math.min(200, Math.trunc(Number(limit)))) : 20;
+    const sql = `
+      SELECT * FROM ${DbTables.CODE_REPOSITORY_BACKUPS}
+      WHERE repository_id = ?
+        AND status = 'running'
+        AND COALESCE(started_at, created_at) < ?
+      ORDER BY COALESCE(started_at, created_at) ASC
+      LIMIT ?
+    `;
+    const result = await this.query(sql, [repositoryId, beforeIso, max]);
+    return result.results || [];
+  }
+
+  /**
    * 找出超出保留数量、需要清理的最旧成功备份
    *
    * 修改点（版本保留优化）
