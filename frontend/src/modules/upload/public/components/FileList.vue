@@ -330,7 +330,8 @@ import { ref, watch, onUnmounted } from "vue";
 import { useI18n } from "vue-i18n";
 import { useDeleteSettingsStore } from "@/stores/deleteSettingsStore.js";
 import { copyToClipboard } from "@/utils/clipboard.js";
-import { formatDateTime } from "@/utils/timeUtils.js";
+// 修改点（前台时区一期）：公开上传页属于前台，时间按前台时区显示
+import { formatFrontendDateTime } from "@/utils/timeUtils.js";
 import { getRemainingViews as getRemainingViewsUtil, formatFileSize } from "@/utils/fileUtils.js";
 import { getFileIcon } from "@/utils/fileTypeIcons.js";
 import { generateQRCode as createQRCodeImage } from "@/utils/qrcodeUtils.js";
@@ -577,7 +578,7 @@ const downloadQRCode = () => {
 
 const formatDate = (dateString) => {
   if (!dateString) return t("common.unknown");
-  return formatDateTime(dateString);
+  return formatFrontendDateTime(dateString);
 };
 
 watch(

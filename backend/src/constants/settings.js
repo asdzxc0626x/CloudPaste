@@ -360,7 +360,7 @@ export const DEFAULT_SETTINGS = {
     default_value: "true",
   },
 
-  // 修改点（站点时区一期）：全站时间显示所用的时区
+  // 修改点（站点时区一期）：管理后台页面显示时间所用的时区
   // - 后端存储与下发的时间一律是 UTC，这个设置只影响前端怎么把它显示出来
   // - 本期不参与 cron 求值，调度仍按原样执行（cron 时区语义另立一期）
   // - options 留空：可选项由前端用 Intl.supportedValuesOf("timeZone") 动态生成，
@@ -369,11 +369,26 @@ export const DEFAULT_SETTINGS = {
     key: "site_timezone",
     type: SETTING_TYPES.SELECT,
     group_id: SETTING_GROUPS.SITE,
-    help: "站点时间显示所用的时区（IANA 名称，如 Asia/Shanghai、Europe/Berlin）。仅影响显示，不改变后端存储与定时任务的实际执行时间。",
+    help: "管理后台页面显示时间所用的时区（IANA 名称，如 Asia/Shanghai、Europe/Berlin）。仅影响显示，不改变后端存储与定时任务的实际执行时间。",
     options: null,
     sort_order: 11,
     flag: SETTING_FLAGS.PUBLIC,
     default_value: "UTC",
+  },
+
+  // 修改点（前台时区一期）：前台公开页面显示时间所用的时区，与 site_timezone（后台）相互独立
+  // - 覆盖范围：挂载浏览、公开分享页（文本/文件）、公开上传页等前台页面
+  // - 留空（默认）= 跟随后台时区，因此存量站点升级后行为与升级前完全一致
+  // - 同样只影响显示，不参与 cron 求值，也不改变后端时间存储格式
+  site_frontend_timezone: {
+    key: "site_frontend_timezone",
+    type: SETTING_TYPES.SELECT,
+    group_id: SETTING_GROUPS.SITE,
+    help: "前台页面（挂载浏览、分享页、上传页）显示时间所用的时区（IANA 名称，如 Asia/Shanghai）。留空则跟随后台时区。仅影响显示。",
+    options: null,
+    sort_order: 12,
+    flag: SETTING_FLAGS.PUBLIC,
+    default_value: "",
   },
 
   // 系统内部设置（不在前端显示）
@@ -458,6 +473,12 @@ export function validateSettingValue(key, value, type) {
       // Intl.supportedValuesOf 给出（浏览器 ICU 完整），这里只拦明显的脏数据。
       if (key === "site_timezone") {
         return isTimeZoneNameShaped(value);
+      }
+      // 修改点（前台时区一期）：前台时区允许「留空」—— 空串表示跟随后台时区，
+      // 是合法业务值，不能按脏数据拦下来；非空时仍按 IANA 形状校验
+      if (key === "site_frontend_timezone") {
+        const text = value === null || value === undefined ? "" : String(value).trim();
+        return text === "" || isTimeZoneNameShaped(text);
       }
       return true;
 

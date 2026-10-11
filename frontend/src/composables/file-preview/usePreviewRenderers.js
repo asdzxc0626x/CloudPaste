@@ -5,7 +5,8 @@
 
 import { ref, computed, watch, onMounted, onUnmounted } from "vue";
 import { useEventListener } from "@vueuse/core";
-import { formatDateTime } from "@/utils/timeUtils.js";
+// 修改点（前台时区一期）：本文件只被前台文件预览（modules/fs）使用，故用前台口径
+import { formatFrontendDateTime } from "@/utils/timeUtils.js";
 import { formatFileSize as formatFileSizeUtil, FileType, getExtension, isArchiveFile } from "@/utils/fileTypes.js";
 import { decodeImagePreviewUrlToPngObjectUrl, revokeObjectUrl, shouldAttemptDecodeImagePreview } from "@/utils/imageDecode.js";
 import { createLogger } from "@/utils/logger.js";
@@ -287,10 +288,11 @@ export function usePreviewRenderers(file, emit, darkMode) {
 
   /**
    * 格式化日期
+   * 修改点（前台时区一期）：预览渲染器只服务前台预览（挂载浏览），走前台时区口径
    */
   const formatDate = (dateString) => {
     if (!dateString) return "";
-    return formatDateTime(dateString);
+    return formatFrontendDateTime(dateString);
   };
 
   // ===== 初始化和清理 =====

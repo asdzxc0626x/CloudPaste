@@ -1,4 +1,5 @@
-import { formatNowForFilename, formatLocalDateTimeWithSeconds } from "@/utils/timeUtils.js";
+// 修改点（前台时区一期）：文件篮只服务挂载浏览（前台），导出文件名与清单时间按前台时区
+import { formatFrontendNowForFilename, formatFrontendLocalDateTimeWithSeconds } from "@/utils/timeUtils.js";
 
 /**
  * 文件篮工具函数
@@ -146,7 +147,7 @@ export function groupFilesByDirectory(files) {
 export function generateZipFileName(options = {}) {
   const { fileCount = 0, directoryCount = 0, prefix = "CloudPaste" } = options;
 
-  const timestamp = formatNowForFilename();
+  const timestamp = formatFrontendNowForFilename();
 
   if (directoryCount > 1) {
     return `${prefix}_CrossDirectory_${fileCount}files_${directoryCount}dirs_${timestamp}.zip`;
@@ -192,7 +193,7 @@ export function createErrorReport(failedFiles, options = {}) {
   const lines = [title];
 
   if (includeTimestamp) {
-    lines.push(`生成时间: ${formatLocalDateTimeWithSeconds(new Date())}`);
+    lines.push(`生成时间: ${formatFrontendLocalDateTimeWithSeconds(new Date())}`);
   }
 
   lines.push("");
@@ -332,7 +333,7 @@ export function createTaskSummary(taskResult) {
   }
 
   lines.push("");
-  lines.push(`完成时间: ${formatLocalDateTimeWithSeconds(new Date())}`);
+  lines.push(`完成时间: ${formatFrontendLocalDateTimeWithSeconds(new Date())}`);
 
   return lines.join("\n");
 }

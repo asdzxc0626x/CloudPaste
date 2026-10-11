@@ -120,7 +120,8 @@
 <script setup>
 import { computed, ref, watch, onBeforeUnmount } from "vue";
 import { formatFileSize } from "@/utils/fileUtils";
-import { formatDateTime } from "@/utils/timeUtils";
+// 修改点（前台时区一期）：媒体信息面板属于挂载浏览（前台），时间按前台时区显示
+import { formatFrontendDateTime } from "@/utils/timeUtils";
 import { buildExifRows, isImageLikeForExif, loadExifTagsFromArrayBufferAsync, resolveGpsCoordinates } from "@/utils/exifReaderUtils";
 import { useFsService } from "@/modules/fs";
 import { getFileName, getMimeTypeDescription } from "@/utils/fileTypes";
@@ -166,7 +167,7 @@ const formattedSize = computed(() => {
 const formattedModified = computed(() => {
   const ts = props.item?.modified || props.item?.updatedAt || props.item?.updated_at || "";
   if (!ts) return "未知";
-  return formatDateTime(ts);
+  return formatFrontendDateTime(ts);
 });
 
 const dimensions = computed(() => {

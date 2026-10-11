@@ -10,7 +10,9 @@ import { api } from "@/api";
 import { createLogger } from "@/utils/logger.js";
 // 修改点（站点时区一期）：站点时区由本 store 负责下发给 timeUtils，
 // timeUtils 是全站时间显示的唯一格式化入口（它不依赖 Pinia，所以这里推给它）
-import { setSiteTimeZone, DEFAULT_TIME_ZONE } from "@/utils/timeUtils.js";
+// 修改点（前台时区一期）：时区拆成「后台/前台」两套，两条都要下发——
+// 后台用 siteTimezone（管理后台页面），前台用 siteFrontendTimezone（留空=跟随后台）
+import { setSiteTimeZone, setSiteFrontendTimeZone, DEFAULT_TIME_ZONE } from "@/utils/timeUtils.js";
 
 // 配置常量
 const STORAGE_KEY = "cloudpaste_site_config";
@@ -113,7 +115,12 @@ export const useSiteConfigStore = defineStore("siteConfig", () => {
 
   // 修改点（站点时区一期）：全站时间显示所用的时区（IANA 名称）
   // 默认 UTC，与后端存储一致，且对所有访问者稳定一致
+  // 修改点（前台时区一期）：语义收窄为「管理后台页面显示时区」
   const siteTimezone = ref(DEFAULT_TIME_ZONE);
+
+  // 修改点（前台时区一期）：前台公开页面显示时区
+  // 空串 = 跟随后台时区（存量站点没有这一项时走的就是这条路径）
+  const siteFrontendTimezone = ref("");
 
   const isLoading = ref(false);
   const lastUpdated = ref(null);
@@ -149,6 +156,8 @@ export const useSiteConfigStore = defineStore("siteConfig", () => {
     mountExplorerEnabled: siteMountExplorerEnabled.value,
     // 修改点（站点时区一期）
     timezone: siteTimezone.value,
+    // 修改点（前台时区一期）
+    frontendTimezone: siteFrontendTimezone.value,
     lastUpdated: lastUpdated.value,
     isInitialized: isInitialized.value,
   }));
@@ -156,7 +165,25 @@ export const useSiteConfigStore = defineStore("siteConfig", () => {
   // 修改点（站点时区一期）：时区一变就同步给 timeUtils。
   // 用 watch 而不是在各处手动调用，确保「从缓存加载」「从接口拉取」
   // 「管理员保存后」三条路径都不会漏掉下发。
-  watch(siteTimezone, (value) => setSiteTimeZone(value), { immediate: true });
+  // 修改点（前台时区一期）：两个时区都要下发，后台那个同时是前台的回落值
+  watch([siteTimezone, siteFrontendTimezone], ([backendZone, frontendZone]) => {
+    setSiteTimeZone(backendZone);
+    setSiteFrontendTimeZone(frontendZone);
+  }, { immediate: true });
+
+  // 修改点（前台时区一期）：顺带修掉「另一个标签页改了时区，当前页不跟随」。
+  // useLocalStorage 会监听 storage 事件把新缓存写进 storedConfig，
+  // 但原来没人把它再读回 siteTimezone，于是同一浏览器另一个标签页里
+  // 已经按新时区显示了，这一页还停在旧时区，直到刷新或缓存过期（24h）。
+  watch(storedConfig, (config) => {
+    if (!config || typeof config !== "object") return;
+    if (config.timezone !== undefined) {
+      siteTimezone.value = config.timezone || DEFAULT_TIME_ZONE;
+    }
+    if (config.frontendTimezone !== undefined) {
+      siteFrontendTimezone.value = config.frontendTimezone || "";
+    }
+  });
 
   // ===== 私有方法 =====
 
@@ -201,12 +228,23 @@ export const useSiteConfigStore = defineStore("siteConfig", () => {
         if (config.timezone !== undefined) {
           siteTimezone.value = config.timezone || DEFAULT_TIME_ZONE;
         }
+        // 修改点（前台时区一期）：前台时区同样走首帧，且「未设置」要保留成空串
+        // （空串 = 跟随后台时区，不能落回 UTC）
+        if (config.frontendTimezone !== undefined) {
+          siteFrontendTimezone.value = config.frontendTimezone || "";
+        }
         if (config.lastUpdated) {
           lastUpdated.value = config.lastUpdated;
         }
 
         // 兼容旧缓存：如果缓存里没有公告字段，则强制视为“缓存不新鲜”，让初始化阶段走一次 API 拉取
         if (config.announcementEnabled === undefined && config.announcementContent === undefined) {
+          lastUpdated.value = null;
+        }
+        // 修改点（前台时区一期）：同理，升级前写下的缓存里没有 frontendTimezone。
+        // 缓存 TTL 是 24 小时，不强制刷新的话，管理员改完前台时区后老访问者
+        // 最长要等一天才看得到变化——这正是「设置了时区却没生效」的典型症状。
+        if (config.frontendTimezone === undefined) {
           lastUpdated.value = null;
         }
         log.debug("从缓存加载站点配置:", config);
@@ -238,6 +276,8 @@ export const useSiteConfigStore = defineStore("siteConfig", () => {
         mountExplorerEnabled: siteMountExplorerEnabled.value,
         // 修改点（站点时区一期）
         timezone: siteTimezone.value,
+        // 修改点（前台时区一期）
+        frontendTimezone: siteFrontendTimezone.value,
         lastUpdated: lastUpdated.value,
       };
       storedConfig.value = config;
@@ -293,6 +333,12 @@ export const useSiteConfigStore = defineStore("siteConfig", () => {
         // 取不到就按默认 UTC 处理，不影响其它字段
         const timezoneSetting = response.data.find((setting) => setting.key === "site_timezone");
         siteTimezone.value = timezoneSetting?.value || DEFAULT_TIME_ZONE;
+
+        // 修改点（前台时区一期）：前台时区。
+        // 存量库同样可能没有这一行；取不到就保持空串 = 跟随后台时区，
+        // 这正是升级后应有的默认行为，不要在这里补 UTC
+        const frontendTimezoneSetting = response.data.find((setting) => setting.key === "site_frontend_timezone");
+        siteFrontendTimezone.value = frontendTimezoneSetting?.value || "";
 
         // 查找页脚Markdown设置
         const footerSetting = response.data.find((setting) => setting.key === "site_footer_markdown");
@@ -457,6 +503,21 @@ export const useSiteConfigStore = defineStore("siteConfig", () => {
       lastUpdated.value = Date.now();
       saveToStorage();
       log.debug("站点时区已更新:", siteTimezone.value);
+    }
+  };
+
+  /**
+   * 更新前台页面时区（修改点：前台时区一期）
+   *
+   * 与前者的唯一区别：**允许留空**，空串表示跟随后台时区。
+   * 时区合法性同样由 timeUtils 的 setSiteFrontendTimeZone 兜底（非法值按未设置处理）。
+   */
+  const updateSiteFrontendTimezone = (newTimezone) => {
+    if (typeof newTimezone === "string") {
+      siteFrontendTimezone.value = newTimezone.trim();
+      lastUpdated.value = Date.now();
+      saveToStorage();
+      log.debug("前台时区已更新:", siteFrontendTimezone.value || "(跟随后台时区)");
     }
   };
 
@@ -702,6 +763,8 @@ export const useSiteConfigStore = defineStore("siteConfig", () => {
     siteMountExplorerEnabled.value = true;
     // 修改点（站点时区一期）
     siteTimezone.value = DEFAULT_TIME_ZONE;
+    // 修改点（前台时区一期）：重置为「跟随后台时区」
+    siteFrontendTimezone.value = "";
     lastUpdated.value = null;
     isInitialized.value = false;
     storedConfig.remove?.();
@@ -750,6 +813,8 @@ export const useSiteConfigStore = defineStore("siteConfig", () => {
     siteMountExplorerEnabled,
     // 修改点（站点时区一期）
     siteTimezone,
+    // 修改点（前台时区一期）
+    siteFrontendTimezone,
     isLoading,
     lastUpdated,
     isInitialized,
@@ -764,6 +829,8 @@ export const useSiteConfigStore = defineStore("siteConfig", () => {
     updateSiteTitle,
     // 修改点（站点时区一期）
     updateSiteTimezone,
+    // 修改点（前台时区一期）
+    updateSiteFrontendTimezone,
     updateSiteFavicon,
     updateSiteFooter,
     updateCustomHead,

@@ -13,6 +13,12 @@
  * - 所有 Intl.DateTimeFormat 统一注入站点时区，不再隐式跟随访问者浏览器时区
  * - 新增 datetime-local 输入框的双向转换，保证「UTC → 站点时区 → 用户编辑 → UTC」不漂移
  *
+ * 修改点（前台时区一期）：
+ * - 站点时区一分为二：site_timezone = 管理后台页面口径（本文件所有**原有**导出保持这个口径，
+ *   因此后台调用点零改动），新增 site_frontend_timezone = 前台公开页面口径
+ * - 前台口径由 formatFrontend* 系列导出提供，未单独设置时自动回落后台时区
+ * - 两个口径共用同一套解析与墙上时钟换算，只是注入的 timeZone 不同
+ *
  * 本期不改动：后端时间存储/下发格式、调度器、cron 语义。
  */
 
@@ -57,26 +63,54 @@ const normalizeTimeZone = (timeZone) => {
   return isValidTimeZone(text) ? text : DEFAULT_TIME_ZONE;
 };
 
-/** 从 localStorage 缓存里取出时区，用于模块加载时的首帧值 */
+/**
+ * 前台时区的归一化（修改点：前台时区一期）
+ *
+ * 与 normalizeTimeZone 的区别只有一点：**空值是合法的**，表示「跟随后台时区」。
+ * 非法值同样当作未设置（回落后台时区），避免一条脏配置让前台整片时间格式化成
+ * 错误结果——宁可显示后台时区，也不要显示一个没人配过的时区。
+ */
+const normalizeOptionalTimeZone = (timeZone) => {
+  const text = String(timeZone || "").trim();
+  if (!text) return "";
+  return isValidTimeZone(text) ? text : "";
+};
+
+/** 从 localStorage 缓存里取出两套时区，用于模块加载时的首帧值 */
 const readTimeZoneFromCache = () => {
   try {
     const raw = localStorage.getItem(SITE_CONFIG_STORAGE_KEY);
-    if (!raw) return DEFAULT_TIME_ZONE;
+    if (!raw) return { timezone: DEFAULT_TIME_ZONE, frontendTimezone: "" };
     const parsed = JSON.parse(raw);
-    return normalizeTimeZone(parsed?.timezone);
+    return {
+      timezone: normalizeTimeZone(parsed?.timezone),
+      // 修改点（前台时区一期）：前台时区也走首帧，否则挂载浏览会先用后台时区渲染再跳一次
+      frontendTimezone: normalizeOptionalTimeZone(parsed?.frontendTimezone),
+    };
   } catch {
     // 隐私模式 / 缓存损坏：按默认时区工作
-    return DEFAULT_TIME_ZONE;
+    return { timezone: DEFAULT_TIME_ZONE, frontendTimezone: "" };
   }
 };
 
+// 模块加载时一次性读出，避免首帧出现两种时区
+const cachedTimeZones = readTimeZoneFromCache();
+
 /**
- * 当前生效的站点时区
+ * 当前生效的站点时区（管理后台页面用，修改点：前台时区一期改为「后台口径」）
  *
  * 用 ref 而不是普通变量：格式化函数在渲染期间读它，
  * 管理员改完时区（或站点配置拉取完成）后，页面上已显示的时间会自动重新渲染。
  */
-const siteTimeZone = ref(readTimeZoneFromCache());
+const siteTimeZone = ref(cachedTimeZones.timezone);
+
+/**
+ * 前台公开页面用的时区（修改点：前台时区一期）
+ *
+ * 空串表示「跟随后台时区」——存量站点没有这一项时走的正是这条路径，
+ * 因此升级后前台显示与升级前完全一致。
+ */
+const frontendTimeZone = ref(cachedTimeZones.frontendTimezone);
 
 /**
  * 设置当前站点时区（由 siteConfigStore 调用，是唯一的写入口）
@@ -89,8 +123,25 @@ export const setSiteTimeZone = (timeZone) => {
   }
 };
 
-/** 获取当前站点时区 */
+/**
+ * 设置前台页面时区（由 siteConfigStore 调用，是唯一的写入口）
+ * @param {string} timeZone IANA 时区名；空值表示跟随后台时区
+ */
+export const setSiteFrontendTimeZone = (timeZone) => {
+  const next = normalizeOptionalTimeZone(timeZone);
+  if (next !== frontendTimeZone.value) {
+    frontendTimeZone.value = next;
+  }
+};
+
+/** 获取当前站点时区（管理后台页面口径） */
 export const getSiteTimeZone = () => siteTimeZone.value;
+
+/**
+ * 获取前台页面**实际**使用的时区：未单独设置时回落到后台时区
+ * 所有前台格式化都走它，不要在调用点自己写 `||` 回落
+ */
+export const getFrontendTimeZone = () => frontendTimeZone.value || siteTimeZone.value;
 
 /** 访问者浏览器所在时区，仅用于设置界面上给管理员做参考 */
 export const getBrowserTimeZone = () => {
@@ -248,16 +299,25 @@ const TIME_FORMAT_OPTIONS = {
 };
 
 /**
- * 给格式化选项补上站点时区（修改点：站点时区一期）
+ * 给格式化选项补上指定时区
  *
  * 调用方传进来的 options 一律不带 timeZone（原来就不带，于是 Intl 隐式用浏览器时区）。
  * 这里统一补上，是整个项目时间显示的唯一注入点。
  * 若调用方自己显式指定了 timeZone，尊重它，不覆盖。
  */
-const withSiteTimeZone = (options = {}) => {
+const withTimeZone = (options, timeZone) => {
   if (options && options.timeZone) return options;
-  return { ...options, timeZone: getSiteTimeZone() };
+  return { ...options, timeZone };
 };
+
+/** 后台（管理后台页面）口径：保持站点时区一期的原语义 */
+const withSiteTimeZone = (options = {}) => withTimeZone(options, getSiteTimeZone());
+
+/**
+ * 前台口径（修改点：前台时区一期）
+ * 未单独配置前台时区时，getFrontendTimeZone() 已回落到后台时区
+ */
+const withFrontendTimeZone = (options = {}) => withTimeZone(options, getFrontendTimeZone());
 
 /**
  * 将 UTC 时间转换为 Date 对象
@@ -350,13 +410,11 @@ export const getUserLocale = () => {
 };
 
 /**
- * 格式化日期时间为本地时间显示
- * @param {string} utcDateString - UTC 时间字符串
- * @param {Object} options - 格式化选项，默认为完整日期时间格式
- * @param {string} locale - 地区设置，默认自动检测用户语言
- * @returns {string} 格式化后的本地时间字符串
+ * 按指定 withTimeZone 包装器格式化（修改点：前台时区一期）
+ * 抽出来是为了让「后台口径」与「前台口径」共用同一套解析/兜底逻辑，
+ * 两边只有注入的 timeZone 不同，不会各自演化出不同的错误文案。
  */
-export const formatDateTime = (utcDateString, options = TIME_FORMAT_OPTIONS.FULL_DATETIME, locale = getUserLocale()) => {
+const formatDateTimeWith = (utcDateString, options, locale, wrapOptions) => {
   if (!utcDateString) return t("unknown");
 
   const date = parseUTCDate(utcDateString);
@@ -366,7 +424,7 @@ export const formatDateTime = (utcDateString, options = TIME_FORMAT_OPTIONS.FULL
   }
 
   try {
-    return new Intl.DateTimeFormat(locale, withSiteTimeZone(options)).format(date);
+    return new Intl.DateTimeFormat(locale, wrapOptions(options)).format(date);
   } catch (error) {
     log.error("日期格式化错误:", error, "输入:", utcDateString);
     return t("dateFormatError");
@@ -374,13 +432,37 @@ export const formatDateTime = (utcDateString, options = TIME_FORMAT_OPTIONS.FULL
 };
 
 /**
- * 格式化日期时间（包含秒）
+ * 格式化日期时间为本地时间显示（管理后台页面口径）
+ * @param {string} utcDateString - UTC 时间字符串
+ * @param {Object} options - 格式化选项，默认为完整日期时间格式
+ * @param {string} locale - 地区设置，默认自动检测用户语言
+ * @returns {string} 格式化后的本地时间字符串
+ */
+export const formatDateTime = (utcDateString, options = TIME_FORMAT_OPTIONS.FULL_DATETIME, locale = getUserLocale()) => {
+  return formatDateTimeWith(utcDateString, options, locale, withSiteTimeZone);
+};
+
+/**
+ * 格式化日期时间（前台公开页面口径，修改点：前台时区一期）
+ * 与 formatDateTime 同名同参，只是换成前台时区（未设置时回落后台时区）
+ */
+export const formatFrontendDateTime = (utcDateString, options = TIME_FORMAT_OPTIONS.FULL_DATETIME, locale = getUserLocale()) => {
+  return formatDateTimeWith(utcDateString, options, locale, withFrontendTimeZone);
+};
+
+/**
+ * 格式化日期时间（包含秒，管理后台页面口径）
  * @param {string} utcDateString - UTC 时间字符串
  * @param {string} locale - 地区设置，默认自动检测用户语言
  * @returns {string} 格式化后的时间字符串
  */
 export const formatDateTimeWithSeconds = (utcDateString, locale = getUserLocale()) => {
   return formatDateTime(utcDateString, TIME_FORMAT_OPTIONS.FULL_DATETIME_WITH_SECONDS, locale);
+};
+
+/** 格式化日期时间（包含秒，前台公开页面口径，修改点：前台时区一期） */
+export const formatFrontendDateTimeWithSeconds = (utcDateString, locale = getUserLocale()) => {
+  return formatFrontendDateTime(utcDateString, TIME_FORMAT_OPTIONS.FULL_DATETIME_WITH_SECONDS, locale);
 };
 
 /**
@@ -439,6 +521,19 @@ export const formatRelativeTime = (utcDateString, baseDate = new Date()) => {
  * @returns {string} 格式化后的过期时间描述
  */
 export const formatExpiry = (expiryDateString) => {
+  return formatExpiryWith(expiryDateString, formatDateTime);
+};
+
+/**
+ * 格式化过期时间显示（前台公开页面口径，修改点：前台时区一期）
+ * 分享页的过期时间要和分享页其它时间同一个时区，不能跟着后台口径走
+ */
+export const formatFrontendExpiry = (expiryDateString) => {
+  return formatExpiryWith(expiryDateString, formatFrontendDateTime);
+};
+
+/** formatExpiry / formatFrontendExpiry 的公共实现，差异只有「用哪个口径格式化日期」 */
+function formatExpiryWith(expiryDateString, formatDateTimeFn) {
   if (!expiryDateString) return t("neverExpires");
 
   const expiryDate = parseUTCDate(expiryDateString);
@@ -455,7 +550,7 @@ export const formatExpiry = (expiryDateString) => {
     }
 
     // 显示具体日期和相对时间
-    const formattedDate = formatDateTime(expiryDateString);
+    const formattedDate = formatDateTimeFn(expiryDateString);
     const relativeTime = formatRelativeTime(expiryDateString, now);
 
     return `${formattedDate} (${relativeTime})`;
@@ -463,7 +558,7 @@ export const formatExpiry = (expiryDateString) => {
     log.error("过期时间格式化错误:", error);
     return t("dateFormatError");
   }
-};
+}
 
 /**
  * 检查时间是否已过期
@@ -621,7 +716,20 @@ export const parseDateTimeLocalInput = (text) => {
  * 让导出文件名里的时间和界面上显示的时间对得上。
  */
 export const formatNowForFilename = () => {
-  const shifted = new Date(wallClockAsUTC(new Date(), getSiteTimeZone()));
+  return nowForFilenameIn(getSiteTimeZone());
+};
+
+/**
+ * 获取当前日期时间的文件名存档格式（前台公开页面口径，修改点：前台时区一期）
+ * 挂载浏览的文件篮压缩包在下载目录里落地，文件名时间和页面上看到的时间必须一致
+ */
+export const formatFrontendNowForFilename = () => {
+  return nowForFilenameIn(getFrontendTimeZone());
+};
+
+/** formatNowForFilename / formatFrontendNowForFilename 的公共实现 */
+const nowForFilenameIn = (timeZone) => {
+  const shifted = new Date(wallClockAsUTC(new Date(), timeZone));
   const pad = (n) => String(n).padStart(2, "0");
 
   return (
@@ -645,6 +753,26 @@ export const formatLocalDateTimeWithSeconds = (date) => {
 
   try {
     return new Intl.DateTimeFormat(getUserLocale(), withSiteTimeZone(TIME_FORMAT_OPTIONS.FULL_DATETIME_WITH_SECONDS)).format(parsed);
+  } catch (error) {
+    log.error("日期格式化错误:", error, "输入:", date);
+    return t("dateFormatError");
+  }
+};
+
+/**
+ * 同 formatLocalDateTimeWithSeconds，但走前台时区（修改点：前台时区一期）
+ * 用于挂载浏览里生成的清单文本（文件篮导出、压缩包内的说明）
+ */
+export const formatFrontendLocalDateTimeWithSeconds = (date) => {
+  if (!date) return t("unknown");
+
+  const parsed = parseUTCDate(date);
+  if (!parsed) {
+    return t("dateInvalid");
+  }
+
+  try {
+    return new Intl.DateTimeFormat(getUserLocale(), withFrontendTimeZone(TIME_FORMAT_OPTIONS.FULL_DATETIME_WITH_SECONDS)).format(parsed);
   } catch (error) {
     log.error("日期格式化错误:", error, "输入:", date);
     return t("dateFormatError");

@@ -145,7 +145,6 @@ import LoadingIndicator from "@/components/common/LoadingIndicator.vue";
 import { copyToClipboard } from "@/utils/clipboard";
 import { getFileIcon as getFileIconUtil } from "@/utils/fileTypeIcons.js";
 import { formatFileSize } from "@/utils/fileUtils.js";
-import { formatDateTime } from "@/utils/timeUtils.js";
 import { createLogger } from "@/utils/logger.js";
 
 // 组件属性

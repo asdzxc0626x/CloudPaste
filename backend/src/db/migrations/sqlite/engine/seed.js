@@ -441,14 +441,25 @@ export async function addSiteSettings(db) {
       flags: 0,
     },
     {
-      // 修改点（站点时区一期）：全站时间显示所用的时区
+      // 修改点（站点时区一期）：管理后台页面显示时间所用的时区
       // 默认 UTC，与后端存储一致；仅影响显示，不改变定时任务的实际执行时间
       key: "site_timezone",
       value: "UTC",
-      description: "站点时间显示所用的时区（IANA 名称，如 Asia/Shanghai、Europe/Berlin）。仅影响显示，不改变后端存储与定时任务的实际执行时间。",
+      description: "管理后台页面显示时间所用的时区（IANA 名称，如 Asia/Shanghai、Europe/Berlin）。仅影响显示，不改变后端存储与定时任务的实际执行时间。",
       type: "select",
       group_id: 4,
       sort_order: 11,
+      flags: 0,
+    },
+    {
+      // 修改点（前台时区一期）：前台公开页面显示时间所用的时区
+      // 留空 = 跟随后台时区（site_timezone），保证存量站点升级后行为不变
+      key: "site_frontend_timezone",
+      value: "",
+      description: "前台页面（挂载浏览、分享页、上传页）显示时间所用的时区（IANA 名称，如 Asia/Shanghai）。留空则跟随后台时区。仅影响显示。",
+      type: "select",
+      group_id: 4,
+      sort_order: 12,
       flags: 0,
     },
   ];

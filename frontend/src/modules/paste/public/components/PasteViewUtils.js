@@ -2,7 +2,8 @@
 // - 提供 PasteView* 系列组件共享的工具函数（调试日志、过期时间格式化等）
 // - 不直接依赖具体组件状态，只依赖传入参数和全局工具
 
-import { formatExpiry as formatExpiryUtil } from "@/utils/timeUtils.js";
+// 修改点（前台时区一期）：文本分享的公开页属于前台，过期时间按前台时区显示
+import { formatFrontendExpiry as formatExpiryUtil } from "@/utils/timeUtils.js";
 import { createLogger } from "@/utils/logger.js";
 
 const log = createLogger("PasteView");
@@ -25,7 +26,9 @@ export function debugLog(enableDebug, isDev, ...args) {
  * 文本过期时间格式化封装
  *
  * 说明：
- * - 实际逻辑委托给全局 timeUtils.formatExpiry，保证 admin 视图与 public 视图展示一致
+ * - 实际逻辑委托给全局 timeUtils.formatFrontendExpiry（修改点：前台时区一期），
+ *   前台分享页用前台时区；管理后台的文本列表用的是 formatExpiry（后台时区），
+ *   两边口径自此有意不同，不再追求显示一致
  * - 这里保留一个简单的包装，方便未来在不影响其他调用方的前提下调整展示文案
  *
  * @param {string|null} expiryDateString - 过期时间字符串（UTC ISO）

@@ -35,6 +35,8 @@ const siteSettings = ref({
   site_mount_explorer_enabled: true,
   // 修改点（站点时区一期）：全站时间显示所用的时区
   site_timezone: DEFAULT_TIME_ZONE,
+  // 修改点（前台时区一期）：前台公开页面显示时区；空串 = 跟随后台时区
+  site_frontend_timezone: "",
 });
 
 // 修改点（站点时区一期）：可选时区列表。
@@ -57,7 +59,19 @@ const groupedTimezones = computed(() => {
 
 /** 当前选中时区的实时预览，让管理员存之前就能确认选对了 */
 const timezonePreview = computed(() => {
-  const zone = siteSettings.value.site_timezone;
+  return previewTimeZone(siteSettings.value.site_timezone);
+});
+
+/**
+ * 前台时区的实时预览（修改点：前台时区一期）
+ * 留空时预览的是**实际生效**的后台时区，避免管理员以为「留空 = UTC」
+ */
+const frontendTimezonePreview = computed(() => {
+  return previewTimeZone(siteSettings.value.site_frontend_timezone || siteSettings.value.site_timezone);
+});
+
+/** 按指定时区渲染「当前时间」预览，非法时区返回空串 */
+const previewTimeZone = (zone) => {
   if (!isValidTimeZone(zone)) return "";
   try {
     return new Intl.DateTimeFormat(undefined, {
@@ -68,7 +82,7 @@ const timezonePreview = computed(() => {
   } catch {
     return "";
   }
-});
+};
 
 /** 访问者浏览器时区，仅作参考显示 */
 const browserTimezone = getBrowserTimeZone();
@@ -123,6 +137,10 @@ onMounted(async () => {
         case "site_timezone":
           siteSettings.value.site_timezone = setting.value || DEFAULT_TIME_ZONE;
           break;
+        // 修改点（前台时区一期）：取不到就保持空串 = 跟随后台时区
+        case "site_frontend_timezone":
+          siteSettings.value.site_frontend_timezone = setting.value || "";
+          break;
       }
     });
   } catch (error) {
@@ -145,6 +163,8 @@ const handleSaveBasic = async () => {
       site_footer_markdown: siteSettings.value.site_footer_markdown || "",
       // 修改点（站点时区一期）：时区归在「基础站点信息」一起保存
       site_timezone: siteSettings.value.site_timezone || DEFAULT_TIME_ZONE,
+      // 修改点（前台时区一期）：前台时区允许留空（跟随后台时区），不要在这里补默认值
+      site_frontend_timezone: siteSettings.value.site_frontend_timezone || "",
     });
     showSuccess(t("admin.site.messages.updateSuccess"));
     await updateSiteConfigStore();
@@ -203,6 +223,8 @@ const updateSiteConfigStore = async () => {
     siteConfigStore.updateSiteTitle(siteSettings.value.site_title);
     // 修改点（站点时区一期）：立刻生效，不等 refresh 的网络往返
     siteConfigStore.updateSiteTimezone(siteSettings.value.site_timezone);
+    // 修改点（前台时区一期）：前台时区也立刻生效（留空 = 跟随后台时区）
+    siteConfigStore.updateSiteFrontendTimezone(siteSettings.value.site_frontend_timezone);
     siteConfigStore.updateSiteFavicon(siteSettings.value.site_favicon_url);
     siteConfigStore.updateSiteFooter(siteSettings.value.site_footer_markdown);
     siteConfigStore.updateCustomHead(siteSettings.value.site_custom_head);
@@ -237,6 +259,8 @@ const resetSettings = async () => {
   siteSettings.value.site_custom_body = "";
   // 修改点（站点时区一期）
   siteSettings.value.site_timezone = DEFAULT_TIME_ZONE;
+  // 修改点（前台时区一期）：重置为「跟随后台时区」
+  siteSettings.value.site_frontend_timezone = "";
 };
 
 // 清空公告内容
@@ -382,7 +406,7 @@ const handleClearAnnouncementContent = () => {
           <!-- 分隔线 -->
           <div class="border-t" :class="darkMode ? 'border-gray-700' : 'border-gray-200'"></div>
 
-          <!-- 站点时区（修改点：站点时区一期）
+          <!-- 站点时区（修改点：站点时区一期 → 前台时区一期收窄为「后台时区」）
                选项由 Intl.supportedValuesOf 动态生成并按大洲分组，
                下方给出实时预览与浏览器时区参考，便于管理员保存前确认 -->
           <div>
@@ -408,6 +432,36 @@ const handleClearAnnouncementContent = () => {
             </p>
             <p class="text-xs mt-0.5" :class="darkMode ? 'text-gray-500' : 'text-gray-400'">
               {{ t("admin.site.timezone.browserHint", { zone: browserTimezone }) }}
+            </p>
+          </div>
+
+          <!-- 分隔线（修改点：前台时区一期） -->
+          <div class="border-t" :class="darkMode ? 'border-gray-700' : 'border-gray-200'"></div>
+
+          <!-- 前台时区（修改点：前台时区一期）
+               与上面的后台时区相互独立；首项「跟随后台时区」对应空值，
+               预览在留空时显示的是实际生效的后台时区，避免被误读成 UTC -->
+          <div>
+            <div class="flex items-center justify-between gap-4 mb-2 flex-wrap">
+              <label class="block text-sm font-medium" :class="darkMode ? 'text-gray-200' : 'text-gray-700'">
+                {{ t("admin.site.frontendTimezone.label") }}
+              </label>
+              <span v-if="frontendTimezonePreview" class="text-xs font-mono" :class="darkMode ? 'text-gray-300' : 'text-gray-600'">
+                {{ t("admin.site.timezone.preview", { time: frontendTimezonePreview }) }}
+              </span>
+            </div>
+            <select
+              v-model="siteSettings.site_frontend_timezone"
+              class="w-full px-3 py-2 border rounded-lg text-sm transition-colors focus:outline-none focus:ring-2 focus:ring-blue-500/40"
+              :class="darkMode ? 'bg-gray-700 border-gray-600 text-white' : 'bg-white border-gray-300 text-gray-900'"
+            >
+              <option value="">{{ t("admin.site.frontendTimezone.follow") }}</option>
+              <optgroup v-for="[region, zones] in groupedTimezones" :key="region" :label="region">
+                <option v-for="zone in zones" :key="zone" :value="zone">{{ zone }}</option>
+              </optgroup>
+            </select>
+            <p class="text-xs mt-1" :class="darkMode ? 'text-gray-400' : 'text-gray-500'">
+              {{ t("admin.site.frontendTimezone.hint") }}
             </p>
           </div>
         </div>

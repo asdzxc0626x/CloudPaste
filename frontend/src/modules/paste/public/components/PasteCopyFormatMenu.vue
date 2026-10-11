@@ -34,7 +34,8 @@ import { useEventListener } from "@vueuse/core";
 import { IconCode, IconDocumentText, IconDownload } from "@/components/icons";
 import { copyToClipboard as clipboardCopy } from "@/utils/clipboard";
 import markdownToWord from "@/utils/markdownToWord";
-import { formatNowForFilename } from "@/utils/timeUtils.js";
+// 修改点（前台时区一期）：前台分享页复制出来的内容，时间戳按前台时区生成
+import { formatFrontendNowForFilename } from "@/utils/timeUtils.js";
 import { saveAs } from "file-saver";
 import { editorContentToPng as snapdomEditorContentToPng } from "@/utils/snapdomCapture";
 import { createLogger } from "@/utils/logger.js";
@@ -170,7 +171,7 @@ const exportWordDocument = async () => {
       title: props.documentTitle || t("markdown.exportDocumentTitle"),
     });
 
-    const timestamp = formatNowForFilename();
+    const timestamp = formatFrontendNowForFilename();
     const baseName = props.documentTitle || "markdown";
     const fileName = `${baseName}-${timestamp}.docx`;
 
@@ -200,7 +201,7 @@ const exportAsPng = async () => {
   emit("status-message", t("markdown.messages.exportingPng"));
 
   try {
-    const timestamp = formatNowForFilename();
+    const timestamp = formatFrontendNowForFilename();
     const baseName = props.documentTitle || "markdown";
     const fileName = `${baseName}-${timestamp}.png`;
 

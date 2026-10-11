@@ -136,7 +136,8 @@
 <script setup>
 import { ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import { formatDateTimeWithSeconds } from "@/utils/timeUtils.js";
+// 修改点（前台时区一期）：本弹窗目前只被挂载浏览的上传流程使用，走前台时区口径
+import { formatFrontendDateTimeWithSeconds } from "@/utils/timeUtils.js";
 import { IconCheckbox, IconClock, IconCopy, IconDocument } from "@/components/icons";
 import { useEventListener } from "@vueuse/core";
 import { copyToClipboard } from "@/utils/clipboard";
@@ -191,9 +192,9 @@ watch(
   }
 );
 
-// 格式化日期
+// 格式化日期（修改点（前台时区一期）：走前台时区口径）
 const formatDate = (dateString) => {
-  return formatDateTimeWithSeconds(dateString);
+  return formatFrontendDateTimeWithSeconds(dateString);
 };
 // 获取匹配分数显示
 const getMatchScoreDisplay = (upload, index) => {

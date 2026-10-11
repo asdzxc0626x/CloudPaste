@@ -33,7 +33,8 @@ import { ref } from "vue";
 import { useI18n } from "vue-i18n";
 import { useEventListener } from "@vueuse/core";
 import { copyToClipboard as clipboardCopy } from "@/utils/clipboard";
-import { formatNowForFilename } from "@/utils/timeUtils.js";
+// 修改点（前台时区一期）：首页文本编辑器属于前台，复制出来的内容时间戳按前台时区生成
+import { formatFrontendNowForFilename } from "@/utils/timeUtils.js";
 import { saveAs } from "file-saver";
 import { IconCode, IconDocumentText, IconDownload } from "@/components/icons";
 import { createLogger } from "@/utils/logger.js";
@@ -124,7 +125,7 @@ const exportWordDocument = async () => {
       title: t("markdown.exportDocumentTitle"),
     });
 
-    const timestamp = formatNowForFilename();
+    const timestamp = formatFrontendNowForFilename();
     const fileName = `markdown-${timestamp}.docx`;
 
     saveAs(blob, fileName);
@@ -148,7 +149,7 @@ const exportAsPng = async () => {
   emit("status-message", t("markdown.messages.exportingPng"));
 
   try {
-    const timestamp = formatNowForFilename();
+    const timestamp = formatFrontendNowForFilename();
     const fileName = `markdown-${timestamp}.png`;
 
     // 性能优化：只有真的点击“导出 PNG”时，才加载 snapdom

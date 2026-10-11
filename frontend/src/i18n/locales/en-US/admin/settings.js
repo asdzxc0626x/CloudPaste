@@ -230,12 +230,18 @@ export default {
       hint: "Supports Markdown format, you can use links, bold text, etc. Leave empty to hide footer",
       placeholder: "© 2025 CloudPaste. All rights reserved.",
     },
-    // 修改点（站点时区一期）
+    // 修改点（站点时区一期）：修改点（前台时区一期）语义收窄为「管理后台页面」
     timezone: {
-      label: "Site Time Zone",
-      hint: "All times across the site are displayed in this time zone. Display only — it does not change how times are stored, nor when scheduled jobs actually run.",
+      label: "Admin Time Zone",
+      hint: "Times on admin pages (tasks, schedules, storage, mounts, …) are displayed in this time zone. Display only — it does not change how times are stored, nor when scheduled jobs actually run.",
       browserHint: "Your browser's time zone: {zone}",
       preview: "Current time: {time}",
+    },
+    // 修改点（前台时区一期）：前台公开页面显示时区，与后台时区相互独立
+    frontendTimezone: {
+      label: "Frontend Time Zone",
+      hint: "Times on public pages (mount explorer, text/file share pages, upload page) are displayed in this time zone. Choose \"Follow admin time zone\" to keep it in sync with the setting above. Display only.",
+      follow: "Follow admin time zone",
     },
     frontendEntries: {
       title: "Frontend Entry Toggles",

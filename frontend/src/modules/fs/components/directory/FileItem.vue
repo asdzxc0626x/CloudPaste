@@ -131,7 +131,8 @@ import { useI18n } from "vue-i18n";
 import { IconDelete, IconDownload, IconLink, IconRename } from "@/components/icons";
 import { formatFileSize } from "@/utils/fileUtils.js";
 import { getFileIcon as getFileIconSvg } from "@/utils/fileTypeIcons.js";
-import { formatDateTime } from "@/utils/timeUtils.js";
+// 修改点（前台时区一期）：挂载浏览是前台页面，时间按前台时区显示
+import { formatFrontendDateTime } from "@/utils/timeUtils.js";
 
 const { t } = useI18n();
 
@@ -188,10 +189,10 @@ const handleContextMenu = (event) => {
 
 const isValidSize = (value) => typeof value === "number" && Number.isFinite(value) && value >= 0;
 
-// 格式化日期
+// 格式化日期（修改点（前台时区一期）：走前台时区口径）
 const formatDate = (dateString) => {
   if (!dateString) return "-";
-  return formatDateTime(dateString);
+  return formatFrontendDateTime(dateString);
 };
 
 // 格式化大小：未知则显示 "-"

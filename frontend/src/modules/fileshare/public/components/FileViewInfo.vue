@@ -270,7 +270,8 @@ const fileshareService = useFileshareService();
 const route = useRoute();
 import { formatFileSize, getIconType } from "@/utils/fileTypes.js";
 import { resolvePreviewSelection, PREVIEW_KEYS } from "@/composables/index.js";
-import { formatDateTime } from "@/utils/timeUtils.js";
+// 修改点（前台时区一期）：文件分享公开页属于前台，时间按前台时区显示
+import { formatFrontendDateTime } from "@/utils/timeUtils.js";
 import { copyToClipboard as clipboardCopy } from "@/utils/clipboard";
 
 //导入预览组件
@@ -341,14 +342,14 @@ const formattedMimeType = computed(() => {
   return props.fileInfo.mimetype || "";
 });
 
-// 格式化的创建时间
+// 格式化的创建时间（修改点（前台时区一期）：走前台时区口径）
 const formattedCreatedAt = computed(() => {
-  return formatDateTime(props.fileInfo.created_at);
+  return formatFrontendDateTime(props.fileInfo.created_at);
 });
 
-// 格式化的过期时间
+// 格式化的过期时间（修改点（前台时区一期）：走前台时区口径）
 const formattedExpiresAt = computed(() => {
-  return formatDateTime(props.fileInfo.expires_at);
+  return formatFrontendDateTime(props.fileInfo.expires_at);
 });
 
 // 文件信息（直接使用后端type字段）

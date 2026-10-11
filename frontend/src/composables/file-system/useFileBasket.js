@@ -10,7 +10,8 @@ import { useFileBasketStore } from "@/stores/fileBasketStore.js";
 import { useAuthStore } from "@/stores/authStore.js";
 import { useTaskManager } from "@/utils/taskManager.js";
 import { api } from "@/api";
-import { formatNowForFilename } from "@/utils/timeUtils.js";
+// 修改点（前台时区一期）：文件篮只服务挂载浏览（前台），导出文件名/清单按前台时区
+import { formatFrontendNowForFilename } from "@/utils/timeUtils.js";
 import { usePathPassword } from "@/composables/usePathPassword.js";
 import { getZipJsDefaultConfig } from "@/utils/zipjsRuntimeUris.js";
 import { createLogger } from "@/utils/logger.js";
@@ -326,7 +327,7 @@ export function useFileBasket() {
       // 先生成文件名（保持与旧逻辑一致），用于：
       // - File System Access API 的 suggestedName
       // - Blob 模式下 saveAs 的下载文件名
-      const timestamp = formatNowForFilename();
+      const timestamp = formatFrontendNowForFilename();
       const suggestedZipFileName = `CloudPaste_${timestamp}.zip`;
 
       // 优先尝试 File System Access API
@@ -393,7 +394,7 @@ export function useFileBasket() {
     };
 
     const outputTarget = options?.outputTarget || null;
-    const zipFileName = options?.zipFileName || `CloudPaste_${formatNowForFilename()}.zip`;
+    const zipFileName = options?.zipFileName || `CloudPaste_${formatFrontendNowForFilename()}.zip`;
     const isFsAccessMode = outputTarget?.mode === "fs_access" && outputTarget?.writable;
 
     try {
