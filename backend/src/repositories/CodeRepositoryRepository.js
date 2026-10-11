@@ -17,16 +17,80 @@ export class CodeRepositoryRepository extends BaseRepository {
 
   /**
    * 获取仓库列表
-   * @param {{ enabledOnly?: boolean }} [options]
+   *
+   * 修改点（仓库管理分页与搜索）：新增 search / limit / offset。
+   * 不传 limit 时仍返回全部记录（与改动前完全一致），需要全量遍历的调用方不受影响；
+   * 传了 limit 才拼 LIMIT/OFFSET，筛选条件与 countRepositories 共用同一套口径。
+   *
+   * @param {{ enabledOnly?: boolean, search?: string, limit?: number, offset?: number }} [options]
    * @returns {Promise<Object[]>}
    */
   async findAllRepositories(options = {}) {
-    const { enabledOnly = false } = options || {};
-    const sql = enabledOnly
-      ? `SELECT * FROM ${DbTables.CODE_REPOSITORIES} WHERE enabled = 1 ORDER BY created_at DESC`
-      : `SELECT * FROM ${DbTables.CODE_REPOSITORIES} ORDER BY created_at DESC`;
-    const result = await this.query(sql);
+    const { whereSql, params } = this._buildRepositoryFilter(options);
+
+    /**
+     * 排序补上 id 作为次序键（修改点：仓库管理分页与搜索）
+     *
+     * 只按 created_at 排序时，同一秒内创建的几条记录之间的相对顺序是未定义的，
+     * 翻页就会出现「同一条记录两页都在、另一条两页都没有」——
+     * 分页之前这个问题不可见（一次返回全部），加了 LIMIT/OFFSET 才会暴露。
+     */
+    let sql = `SELECT * FROM ${DbTables.CODE_REPOSITORIES}${whereSql} ORDER BY created_at DESC, id DESC`;
+    const bindings = [...params];
+
+    const rawLimit = Number(options?.limit);
+    if (Number.isFinite(rawLimit) && rawLimit > 0) {
+      const limit = Math.max(1, Math.min(200, Math.trunc(rawLimit)));
+      const rawOffset = Number(options?.offset);
+      const offset = Number.isFinite(rawOffset) ? Math.max(0, Math.trunc(rawOffset)) : 0;
+      sql += " LIMIT ? OFFSET ?";
+      bindings.push(limit, offset);
+    }
+
+    const result = await this.query(sql, bindings);
     return result.results || [];
+  }
+
+  /**
+   * 统计仓库条数（修改点：仓库管理分页与搜索）
+   * - 必须与 findAllRepositories 共用筛选条件，否则「共 N 个」与列表内容会各说各话
+   * @param {{ enabledOnly?: boolean, search?: string }} [options]
+   * @returns {Promise<number>}
+   */
+  async countRepositories(options = {}) {
+    const { whereSql, params } = this._buildRepositoryFilter(options);
+    const row = await this.queryFirst(
+      `SELECT COUNT(*) AS count FROM ${DbTables.CODE_REPOSITORIES}${whereSql}`,
+      params,
+    );
+    return Number(row?.count) || 0;
+  }
+
+  /**
+   * 构建仓库列表的筛选条件（修改点：仓库管理分页与搜索）
+   *
+   * 搜索范围限定在 name 与 repo_identifier：它们是列表里唯一可见的文本，
+   * 搜不到的字段（config_json 里的 token 等）绝不能进来。
+   *
+   * @private
+   * @param {{ enabledOnly?: boolean, search?: string }} [options]
+   * @returns {{ whereSql: string, params: Array }}
+   */
+  _buildRepositoryFilter(options = {}) {
+    const { enabledOnly = false, search = "" } = options || {};
+    const where = [];
+    const params = [];
+
+    if (enabledOnly) where.push("enabled = 1");
+
+    const keyword = String(search ?? "").trim();
+    if (keyword) {
+      const pattern = `%${keyword}%`;
+      where.push("(name LIKE ? OR repo_identifier LIKE ?)");
+      params.push(pattern, pattern);
+    }
+
+    return { whereSql: where.length > 0 ? ` WHERE ${where.join(" AND ")}` : "", params };
   }
 
   /**
@@ -548,8 +612,56 @@ export class CodeRepositoryRepository extends BaseRepository {
     return map;
   }
 
-  // ==================== repo_detect_states（修改点：第 4 期 检测状态持久化）====================
+  /**
+   * 取某仓库在某挂载点上「仍被数据库引用」的落盘路径
+   * （修改点：同分支同 sha 只保留一个目录）
+   *
+   * 用途：目录去重要删掉「同分支同 sha 的多余目录」，但绝不能删掉任何
+   * 还挂在备份记录上的目录 —— 那会让备份历史里的下载链接指向不存在的文件。
+   * 所以删之前先问一句「这个目录还有记录引用吗」。
+   *
+   * 口径说明：
+   * - 不限 status。deferred / failed 的目标行也可能带着 storage_path（上一轮写成功、
+   *   这一轮才失败的补写场景），它们指向的文件仍然是有效快照，不能删；
+   * - 同时取 targets 表与 backups 表（v35 及更早的记录把路径直接存在备份记录上），
+   *   与 retention.groupPathsByMount 的兼容口径保持一致。
+   *
+   * @param {string} repositoryId
+   * @param {string|number} mountId
+   * @returns {Promise<string[]>} 该挂载点上仍被引用的文件路径（未去重）
+   */
+  async findReferencedPathsByMount(repositoryId, mountId) {
+    if (!repositoryId || mountId === undefined || mountId === null) return [];
 
+    const paths = [];
+
+    const targetRows = await this.query(
+      `SELECT t.storage_path AS storage_path, t.manifest_path AS manifest_path
+       FROM ${DbTables.CODE_REPOSITORY_BACKUP_TARGETS} t
+       JOIN ${DbTables.CODE_REPOSITORY_BACKUPS} b ON b.id = t.backup_id
+       WHERE b.repository_id = ? AND t.mount_id = ?`,
+      [repositoryId, mountId],
+    );
+    for (const row of targetRows.results || []) {
+      if (row?.storage_path) paths.push(String(row.storage_path));
+      if (row?.manifest_path) paths.push(String(row.manifest_path));
+    }
+
+    // 兼容 v35 数据：路径直接存在备份记录上，挂载点由 target_mount_id 标识
+    const legacyRows = await this.query(
+      `SELECT storage_path, manifest_path FROM ${DbTables.CODE_REPOSITORY_BACKUPS}
+       WHERE repository_id = ? AND target_mount_id = ?`,
+      [repositoryId, mountId],
+    );
+    for (const row of legacyRows.results || []) {
+      if (row?.storage_path) paths.push(String(row.storage_path));
+      if (row?.manifest_path) paths.push(String(row.manifest_path));
+    }
+
+    return paths;
+  }
+
+  // ==================== repo_detect_states（修改点：第 4 期 检测状态持久化）====================
   /**
    * 取某仓库的全部检测状态
    * @param {string} repositoryId

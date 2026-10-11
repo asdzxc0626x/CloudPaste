@@ -9,6 +9,9 @@
  * - 最近备份列附带该仓库的备份计划（间隔 + 下次执行时间）
  * - 桌面端（md 以上）用表格；移动端改用卡片列表，
  *   避免 5 列表格在窄屏上被迫横向滚动
+ *
+ * 修改点（仓库管理批量删除）：新增选择列（桌面端表头全选 + 移动端卡片勾选），
+ * 选中集合由父级（useAdminBase）持有，这里只负责显示与派发事件。
  */
 import { computed } from "vue";
 import { useI18n } from "vue-i18n";
@@ -24,9 +27,14 @@ const props = defineProps({
   loading: { type: Boolean, default: false },
   darkMode: { type: Boolean, default: false },
   isRepoBusy: { type: Function, required: true },
+  // 修改点（仓库管理批量删除）：当前选中的仓库 ID 与「本页是否全选」
+  selectedIds: { type: Array, default: () => [] },
+  allSelected: { type: Boolean, default: false },
+  // 修改点（仓库管理搜索）：搜索无结果与「一条都还没登记」是两种空状态，文案不同
+  searchMode: { type: Boolean, default: false },
 });
 
-const emit = defineEmits(["check", "backup", "history", "edit", "toggle", "delete"]);
+const emit = defineEmits(["check", "backup", "history", "edit", "toggle", "delete", "toggle-select", "toggle-select-all"]);
 
 const { t } = useI18n();
 
@@ -34,6 +42,10 @@ const hasData = computed(() => props.repositories.length > 0);
 
 const showEmpty = computed(() => !hasData.value && !props.loading);
 const showLoading = computed(() => props.loading && !hasData.value);
+
+/** 该行是否被选中（修改点：仓库管理批量删除） */
+const isSelected = (id) => props.selectedIds.includes(id);
+
 
 /** 备份状态对应的徽章样式 */
 const statusClass = (status) => {
@@ -362,7 +374,7 @@ const dimensionRows = (repo) => [
     class="rounded-lg border px-4 py-10 text-center text-sm"
     :class="[darkMode ? 'border-gray-700 text-gray-400' : 'border-gray-200 text-gray-500']"
   >
-    {{ showLoading ? $t("admin.repoBackup.table.loading") : $t("admin.repoBackup.table.empty") }}
+    {{ showLoading ? $t("admin.repoBackup.table.loading") : (searchMode ? $t("admin.repoBackup.table.emptyFiltered") : $t("admin.repoBackup.table.empty")) }}
   </div>
 
   <template v-else>
@@ -371,6 +383,17 @@ const dimensionRows = (repo) => [
       <table class="min-w-full divide-y" :class="darkMode ? 'divide-gray-700' : 'divide-gray-200'">
         <thead :class="darkMode ? 'bg-gray-800' : 'bg-gray-50'">
           <tr>
+            <!-- 选择列（修改点：仓库管理批量删除）：全选只覆盖当前页，
+                 翻页/搜索时父级会清空选中集合，避免误删看不见的行 -->
+            <th scope="col" class="w-10 px-3 py-3 text-center">
+              <input
+                type="checkbox"
+                :checked="allSelected"
+                class="h-4 w-4 text-primary-600 focus:ring-primary-500 border-gray-300 rounded cursor-pointer"
+                :title="$t('admin.repoBackup.table.selectAll')"
+                @change="emit('toggle-select-all')"
+              />
+            </th>
             <th scope="col" class="px-4 py-3 text-left text-xs font-medium uppercase tracking-wider" :class="darkMode ? 'text-gray-300' : 'text-gray-500'">
               {{ $t("admin.repoBackup.table.repository") }}
             </th>
@@ -391,6 +414,15 @@ const dimensionRows = (repo) => [
 
         <tbody :class="darkMode ? 'bg-gray-900 divide-gray-700' : 'bg-white divide-gray-200'" class="divide-y">
           <tr v-for="repo in repositories" :key="repo.id" :class="darkMode ? 'hover:bg-gray-800/60' : 'hover:bg-gray-50'">
+            <!-- 选择（修改点：仓库管理批量删除） -->
+            <td class="w-10 px-3 py-3 text-center align-top">
+              <input
+                type="checkbox"
+                :checked="isSelected(repo.id)"
+                class="h-4 w-4 text-primary-600 focus:ring-primary-500 border-gray-300 rounded cursor-pointer"
+                @change="emit('toggle-select', repo.id)"
+              />
+            </td>
             <!-- 仓库 -->
             <td class="px-4 py-3 align-top">
               <div class="flex items-center gap-2 flex-wrap">
@@ -618,28 +650,37 @@ const dimensionRows = (repo) => [
       >
         <!-- 标题行 -->
         <div class="flex items-start justify-between gap-2">
-          <div class="min-w-0">
-            <div class="flex items-center gap-1.5 flex-wrap">
-              <span class="text-sm font-medium truncate" :class="darkMode ? 'text-white' : 'text-gray-900'">{{ repo.name }}</span>
-              <span class="px-1.5 py-0.5 text-[10px] rounded font-medium" :class="chipClass">{{ repo.providerDisplayName }}</span>
-              <span
-                v-if="!repo.enabled"
-                class="px-1.5 py-0.5 text-[10px] rounded font-medium bg-yellow-100 text-yellow-800 dark:bg-yellow-900/40 dark:text-yellow-300"
-              >
-                {{ $t("admin.repoBackup.status.disabled") }}
-              </span>
-            </div>
-            <div class="text-[11px] mt-0.5 font-mono break-all" :class="darkMode ? 'text-gray-400' : 'text-gray-500'">
-              <!-- 修改点（点击 owner/repo 跳转仓库）：与桌面端一致 -->
-              <a
-                v-if="repo.repoWebUrl"
-                :href="repo.repoWebUrl"
-                target="_blank"
-                rel="noopener noreferrer"
-                class="hover:underline hover:text-blue-600 dark:hover:text-blue-400"
-                :title="$t('admin.repoBackup.openRepository')"
-              >{{ repo.repoIdentifier }}</a>
-              <template v-else>{{ repo.repoIdentifier }}</template>
+          <div class="flex min-w-0 items-start gap-2">
+            <!-- 选择（修改点：仓库管理批量删除）：移动端没有表头，全选放在上方工具栏里 -->
+            <input
+              type="checkbox"
+              :checked="isSelected(repo.id)"
+              class="mt-0.5 h-4 w-4 shrink-0 text-primary-600 focus:ring-primary-500 border-gray-300 rounded cursor-pointer"
+              @change="emit('toggle-select', repo.id)"
+            />
+            <div class="min-w-0">
+              <div class="flex items-center gap-1.5 flex-wrap">
+                <span class="text-sm font-medium truncate" :class="darkMode ? 'text-white' : 'text-gray-900'">{{ repo.name }}</span>
+                <span class="px-1.5 py-0.5 text-[10px] rounded font-medium" :class="chipClass">{{ repo.providerDisplayName }}</span>
+                <span
+                  v-if="!repo.enabled"
+                  class="px-1.5 py-0.5 text-[10px] rounded font-medium bg-yellow-100 text-yellow-800 dark:bg-yellow-900/40 dark:text-yellow-300"
+                >
+                  {{ $t("admin.repoBackup.status.disabled") }}
+                </span>
+              </div>
+              <div class="text-[11px] mt-0.5 font-mono break-all" :class="darkMode ? 'text-gray-400' : 'text-gray-500'">
+                <!-- 修改点（点击 owner/repo 跳转仓库）：与桌面端一致 -->
+                <a
+                  v-if="repo.repoWebUrl"
+                  :href="repo.repoWebUrl"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  class="hover:underline hover:text-blue-600 dark:hover:text-blue-400"
+                  :title="$t('admin.repoBackup.openRepository')"
+                >{{ repo.repoIdentifier }}</a>
+                <template v-else>{{ repo.repoIdentifier }}</template>
+              </div>
             </div>
           </div>
           <!-- 主徽章（修改点：第 5 期 前端状态展示）：与桌面端保持一致，

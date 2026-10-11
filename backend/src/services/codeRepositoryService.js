@@ -431,19 +431,37 @@ export function getProviderMetadata() {
 // ==================== 仓库 CRUD ====================
 
 /**
- * 获取仓库列表
+ * 获取仓库列表（分页 + 搜索）
+ *
+ * 修改点（仓库管理分页与搜索）：返回值由「数组」改为「{ items, total, limit, offset, search }」，
+ * 与同域的 listBackups 口径一致，前端可以直接喂给 useAdminBase 的 offset 模式分页。
+ *
+ * 顺带的收益：下面那一圈逐仓库查询（最近备份 / 目标结果）原先要对**全部**仓库各跑一遍，
+ * 现在只对当前这一页跑，仓库多了以后这个接口的数据库往返次数不再线性增长。
+ *
  * @param {D1Database} db
  * @param {object} repositoryFactory
  * @param {string} encryptionSecret
  * @param {object} [env]
+ * @param {{ limit?: number, offset?: number, search?: string }} [options]
+ *        不传 limit 时返回全部仓库（total 仍是真实总数），保留给内部全量调用
  */
-export async function listRepositories(db, repositoryFactory, encryptionSecret, env = {}) {
+export async function listRepositories(db, repositoryFactory, encryptionSecret, env = {}, options = {}) {
   const factory = ensureRepositoryFactory(db, repositoryFactory, env);
   const codeRepo = factory.getCodeRepositoryRepository();
   const mountRepository = factory.getMountRepository();
 
-  const rows = await codeRepo.findAllRepositories();
-  if (rows.length === 0) return [];
+  const search = String(options?.search ?? "").trim();
+  const rawLimit = Number(options?.limit);
+  const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.trunc(rawLimit) : 0;
+  const rawOffset = Number(options?.offset);
+  const offset = Number.isFinite(rawOffset) && rawOffset > 0 ? Math.trunc(rawOffset) : 0;
+
+  // 先取总数：当前页为空（例如删到最后一页空了）时前端要靠它把页码退回去
+  const total = await codeRepo.countRepositories({ search });
+  const rows = await codeRepo.findAllRepositories({ search, limit, offset });
+  const paging = { total, limit, offset, search };
+  if (rows.length === 0) return { items: [], ...paging };
 
   // 一次性取出挂载点，避免 N+1 查询
   const mounts = await mountRepository.findAll(true);
@@ -505,7 +523,7 @@ export async function listRepositories(db, repositoryFactory, encryptionSecret, 
     );
   }
 
-  return result;
+  return { items: result, ...paging };
 }
 
 /**
@@ -947,6 +965,45 @@ export async function deleteRepository(db, repositoryFactory, id, env = {}) {
   return { id };
 }
 
+/**
+ * 批量删除仓库（修改点：仓库管理批量删除）
+ *
+ * 逐条调用 deleteRepository，让「连带清理备份记录与备份计划」这件事只有一处实现 ——
+ * 批量路径自己写一遍 SQL 就必然漏掉调度作业的清理。
+ *
+ * 失败不中断：某个 ID 已被别人删掉（NotFound）在列表页是常事，
+ * 整批回滚只会让用户反复点、每次都失败。因此与文件管理的批量删除一致，
+ * 返回成功条数与逐条失败原因，由前端决定怎么提示。
+ *
+ * @param {D1Database} db
+ * @param {object} repositoryFactory
+ * @param {string[]} ids
+ * @param {object} [env]
+ * @returns {Promise<{ total: number, success: number, failed: Array<{id: string, error: string}> }>}
+ */
+export async function batchDeleteRepositories(db, repositoryFactory, ids, env = {}) {
+  const factory = ensureRepositoryFactory(db, repositoryFactory, env);
+
+  // 去重：前端全选 + 手动勾选可能出现重复 ID，重复删除会多出一条「不存在」的失败
+  const unique = [...new Set((Array.isArray(ids) ? ids : []).map((item) => String(item ?? "").trim()).filter(Boolean))];
+  if (unique.length === 0) {
+    throw new ValidationError("请提供要删除的代码仓库 ID 列表");
+  }
+
+  let success = 0;
+  const failed = [];
+  for (const id of unique) {
+    try {
+      await deleteRepository(db, factory, id, env);
+      success += 1;
+    } catch (e) {
+      failed.push({ id, error: e?.message || "删除失败" });
+    }
+  }
+
+  return { total: unique.length, success, failed };
+}
+
 // ==================== 检查更新 ====================
 
 /**
@@ -1190,6 +1247,8 @@ export default {
   updateRepository,
   setRepositoryEnabled,
   deleteRepository,
+  // 修改点（仓库管理批量删除）
+  batchDeleteRepositories,
   checkRepository,
   listBackups,
   getBackupDownloadLink,

@@ -11,6 +11,17 @@ export default {
       refreshing: "Refreshing...",
       // 修改点（第 3 期 3-B）：全局 Token / 代理池入口
       globalCredentials: "Global credentials",
+      // 修改点（仓库管理搜索 / 批量删除 / 手动刷新）
+      searchPlaceholder: "Search repositories (name, owner/repo)",
+      searchHint: "Server-side search with fuzzy matching",
+      batchDelete: "Delete selected",
+      lastRefresh: "Last refreshed: {time}",
+    },
+
+    // 修改点（仓库管理分页）：列表统计，总数是筛选后的真实条数
+    stats: {
+      total: "{count} repositories",
+      selected: "{count} selected",
     },
 
     table: {
@@ -20,6 +31,9 @@ export default {
       lastBackup: "Last Backup",
       actions: "Actions",
       empty: "No repositories registered yet. Click \"Add Repository\" to start.",
+      // 修改点（仓库管理搜索）：搜索无结果与「一条都还没登记」是两种情况
+      emptyFiltered: "No repositories match your search. Try another keyword.",
+      selectAll: "Select page",
       loading: "Loading...",
       checkedAt: "Checked at",
       neverBackedUp: "Never backed up",
@@ -347,6 +361,14 @@ export default {
       hint: "Only the registration and backup records are removed. Snapshot files already uploaded to storage are kept.",
     },
 
+    // 修改点（仓库管理批量删除）
+    batchDelete: {
+      title: "Delete repositories",
+      confirm: "Delete the {count} selected repositories?",
+      hint: "Only the registrations and backup records are removed. Snapshot files already uploaded to storage are kept. This cannot be undone.",
+      deleting: "Deleting...",
+    },
+
     validation: {
       repoRequired: "Please enter the repository (owner/repo)",
       branchRequired: "Add at least one branch in branch mode",
@@ -364,6 +386,11 @@ export default {
       saveFailed: "Save failed",
       deleteSuccess: "Deleted",
       deleteFailed: "Delete failed",
+      // 修改点（仓库管理批量删除）：部分失败要同时给出成功数与失败数
+      noSelection: "Select the repositories to delete first",
+      batchDeleteSuccess: "Deleted {count} repositories",
+      batchDeletePartial: "Batch delete finished: {success} succeeded, {failed} failed",
+      batchDeleteFailed: "Batch delete failed",
       toggleFailed: "Failed to toggle state",
       checkFailed: "Failed to check for updates",
       backupCreated: "Backup job created. Check progress in the task list.",

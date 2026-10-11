@@ -242,11 +242,23 @@ export function getProviders() {
  ******************************************************************************/
 
 /**
- * 获取仓库列表
- * @returns {Promise<{success: boolean, data: CodeRepository[], message: string}>}
+ * 获取仓库列表（分页 + 搜索）
+ *
+ * 修改点（仓库管理分页与搜索）：返回结构从裸数组改成 { items, total, limit, offset, search }，
+ * 与备份历史（listBackups）一致，可直接喂给 useAdminBase 的 offset 模式分页。
+ * 不传 paging 时后端返回全部仓库（total 仍为真实总数）。
+ *
+ * @param {{limit?: number, offset?: number, search?: string}} [paging]
+ * @returns {Promise<{success: boolean, data: {items: CodeRepository[], total: number, limit: number, offset: number, search: string}, message: string}>}
  */
-export function listRepositories() {
-  return get(`${BASE}/repositories`);
+export function listRepositories(paging = {}) {
+  const params = new URLSearchParams();
+  if (paging.limit != null) params.set("limit", String(paging.limit));
+  if (paging.offset != null) params.set("offset", String(paging.offset));
+  const search = String(paging.search ?? "").trim();
+  if (search) params.set("search", search);
+  const query = params.toString();
+  return get(`${BASE}/repositories${query ? `?${query}` : ""}`);
 }
 
 /**
@@ -303,6 +315,19 @@ export function updateRepository(id, payload) {
  */
 export function deleteRepository(id) {
   return del(`${BASE}/repositories/${encodeURIComponent(id)}`);
+}
+
+/**
+ * 批量删除仓库（修改点：仓库管理批量删除）
+ *
+ * 部分失败也会返回 success:true，失败明细在 data.failed 里 ——
+ * 列表里某条已被别人删掉是常态，不该让整批都算失败。
+ *
+ * @param {string[]} ids
+ * @returns {Promise<{success: boolean, data: {total: number, success: number, failed: Array<{id: string, error: string}>}, message: string}>}
+ */
+export function batchDeleteRepositories(ids) {
+  return del(`${BASE}/repositories/batch-delete`, { ids });
 }
 
 /**
@@ -413,6 +438,8 @@ export default {
   createRepository,
   updateRepository,
   deleteRepository,
+  // 修改点（仓库管理批量删除）
+  batchDeleteRepositories,
   setRepositoryEnabled,
   checkRepository,
   triggerBackup,

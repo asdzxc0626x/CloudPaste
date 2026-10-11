@@ -6,7 +6,7 @@
 
 import { Hono } from "hono";
 import { UserType } from "../constants/index.js";
-import { jsonOk, jsonCreated } from "../utils/common.js";
+import { jsonOk, jsonCreated, getPagination } from "../utils/common.js";
 import { usePolicy } from "../security/policies/policies.js";
 import { resolvePrincipal } from "../security/helpers/principal.js";
 import { ValidationError, ConflictError } from "../http/errors.js";
@@ -21,6 +21,8 @@ import {
   updateRepository,
   setRepositoryEnabled,
   deleteRepository,
+  // 修改点（仓库管理批量删除）
+  batchDeleteRepositories,
   checkRepository,
   listBackups,
   getBackupDownloadLink,
@@ -42,18 +44,6 @@ const resolveContext = (c) => ({
   env: c.env,
 });
 
-/** 解析分页参数 */
-const parsePaging = (c) => {
-  const limitRaw = c.req.query("limit");
-  const offsetRaw = c.req.query("offset");
-  const limit = limitRaw ? Number(limitRaw) : 50;
-  const offset = offsetRaw ? Number(offsetRaw) : 0;
-  return {
-    limit: Number.isFinite(limit) ? limit : 50,
-    offset: Number.isFinite(offset) ? offset : 0,
-  };
-};
-
 // ==================== Provider 元数据 ====================
 
 /**
@@ -68,8 +58,19 @@ codeRepositoryRoutes.get("/api/admin/repo-backup/providers", requireAdmin, async
 
 codeRepositoryRoutes.get("/api/admin/repo-backup/repositories", requireAdmin, async (c) => {
   const { db, repositoryFactory, encryptionSecret, env } = resolveContext(c);
-  const items = await listRepositories(db, repositoryFactory, encryptionSecret, env);
-  return jsonOk(c, items, "获取代码仓库列表成功");
+
+  /**
+   * 修改点（仓库管理分页与搜索）
+   *
+   * 分页参数复用 getPagination（文件管理 / 文本管理用的是同一个），因此同时支持
+   * ?limit&offset 与 ?page&limit 两种写法；搜索命中 name 与 owner/repo。
+   * 返回结构随之从数组变成 { items, total, limit, offset, search }。
+   */
+  const { limit, offset } = getPagination(c, { limit: 20 });
+  const search = c.req.query("search") || "";
+
+  const result = await listRepositories(db, repositoryFactory, encryptionSecret, env, { limit, offset, search });
+  return jsonOk(c, result, "获取代码仓库列表成功");
 });
 
 // ==================== 全局 GitHub 凭据池（修改点：第 3 期 3-B）====================
@@ -161,6 +162,33 @@ codeRepositoryRoutes.put("/api/admin/repo-backup/repositories/:id", requireAdmin
   const body = await c.req.json().catch(() => ({}));
   const repo = await updateRepository(db, repositoryFactory, encryptionSecret, id, body, env);
   return jsonOk(c, repo, "代码仓库已更新");
+});
+
+/**
+ * 批量删除（修改点：仓库管理批量删除）
+ *
+ * 必须注册在 `/repositories/:id` 之前：Hono 按注册顺序匹配，
+ * 放到后面的话 "batch-delete" 会被当成某个仓库的 id 吃掉。
+ * 与文件 / 文本管理的批量删除一致，用 DELETE + body.ids。
+ */
+codeRepositoryRoutes.delete("/api/admin/repo-backup/repositories/batch-delete", requireAdmin, async (c) => {
+  const { db, repositoryFactory, env } = resolveContext(c);
+  resolvePrincipal(c, { allowedTypes: [UserType.ADMIN] });
+
+  const body = await c.req.json().catch(() => ({}));
+  const ids = Array.isArray(body?.ids) ? body.ids : null;
+  if (!ids || ids.length === 0) {
+    throw new ValidationError("请提供有效的代码仓库 ID 数组");
+  }
+
+  const result = await batchDeleteRepositories(db, repositoryFactory, ids, env);
+
+  // 部分失败也返回 200：成功的那些已经删掉了，前端要同时显示成功数与失败明细
+  const message =
+    result.failed.length > 0
+      ? `批量删除完成：成功 ${result.success} 个，失败 ${result.failed.length} 个`
+      : `已删除 ${result.success} 个代码仓库（已上传的备份文件保留）`;
+  return jsonOk(c, result, message);
 });
 
 codeRepositoryRoutes.delete("/api/admin/repo-backup/repositories/:id", requireAdmin, async (c) => {
@@ -346,7 +374,9 @@ codeRepositoryRoutes.get("/api/admin/repo-backup/repositories/:id/backups", requ
     .map((item) => item.trim())
     .filter(Boolean);
 
-  const result = await listBackups(db, repositoryFactory, id, { ...parsePaging(c), statuses }, env);
+  // 修改点（仓库管理分页与搜索）：这里原先用的是本文件内的 parsePaging，
+  // 与仓库列表改用 getPagination 后会出现两套分页解析，统一到公共实现（默认值保持 50 不变）
+  const result = await listBackups(db, repositoryFactory, id, { ...getPagination(c, { limit: 50 }), statuses }, env);
   return jsonOk(c, result, "获取备份记录成功");
 });
 

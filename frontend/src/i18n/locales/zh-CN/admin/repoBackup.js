@@ -10,6 +10,17 @@ export default {
       refreshing: "刷新中...",
       // 修改点（第 3 期 3-B）：全局 Token / 代理池入口
       globalCredentials: "全局凭据",
+      // 修改点（仓库管理搜索 / 批量删除 / 手动刷新）
+      searchPlaceholder: "搜索仓库（支持名称、owner/repo）",
+      searchHint: "服务端搜索，支持模糊匹配",
+      batchDelete: "批量删除",
+      lastRefresh: "上次刷新: {time}",
+    },
+
+    // 修改点（仓库管理分页）：列表统计，总数是筛选后的真实条数
+    stats: {
+      total: "共 {count} 个仓库",
+      selected: "已选择 {count} 个",
     },
 
     table: {
@@ -19,6 +30,9 @@ export default {
       lastBackup: "最近备份",
       actions: "操作",
       empty: "还没有登记任何代码仓库，点击「添加仓库」开始",
+      // 修改点（仓库管理搜索）：搜索无结果与「一条都还没登记」是两种情况
+      emptyFiltered: "没有匹配的仓库，换个关键词试试",
+      selectAll: "全选本页",
       loading: "加载中...",
       checkedAt: "检查于",
       neverBackedUp: "尚未备份",
@@ -346,6 +360,14 @@ export default {
       hint: "仅删除登记信息与备份记录，已上传到存储的快照文件会保留。",
     },
 
+    // 修改点（仓库管理批量删除）
+    batchDelete: {
+      title: "批量删除代码仓库",
+      confirm: "确定要删除选中的 {count} 个代码仓库吗？",
+      hint: "仅删除登记信息与备份记录，已上传到存储的快照文件会保留。该操作不可撤销。",
+      deleting: "删除中...",
+    },
+
     validation: {
       repoRequired: "请填写仓库标识（owner/repo）",
       branchRequired: "分支模式下至少需要添加一个分支",
@@ -364,6 +386,12 @@ export default {
       saveFailed: "保存失败",
       deleteSuccess: "删除成功",
       deleteFailed: "删除失败",
+      // 修改点（仓库管理批量删除）：部分失败要同时给出成功数与失败数，
+      // 否则用户会对着「删除失败」反复点，而每次都少删几条
+      noSelection: "请先选择要删除的仓库",
+      batchDeleteSuccess: "已删除 {count} 个代码仓库",
+      batchDeletePartial: "批量删除完成：成功 {success} 个，失败 {failed} 个",
+      batchDeleteFailed: "批量删除失败",
       toggleFailed: "切换状态失败",
       checkFailed: "检查更新失败",
       backupCreated: "备份作业已创建，可在「任务列表」查看进度",

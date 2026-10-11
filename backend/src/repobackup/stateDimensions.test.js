@@ -352,7 +352,8 @@ test("端到端：列表接口同时下发三个维度，且调度维度来自 s
     .bind(nextRunAfter)
     .run();
 
-  const list = await listRepositories(db, null, ENV.ENCRYPTION_SECRET, ENV);
+  // 修改点（仓库管理分页与搜索）：列表接口返回 { items, total, ... }，不再是裸数组
+  const { items: list } = await listRepositories(db, null, ENV.ENCRYPTION_SECRET, ENV);
   assert.equal(list.length, 1);
   const dto = list[0];
 
@@ -387,7 +388,7 @@ test("端到端：批量统计作业数不会把别的仓库算进来", async ()
   await seedActiveTask(db, { taskId: "t-b1", taskType: "repo_backup", repositoryId: "repo-b" });
   await seedActiveTask(db, { taskId: "t-b2", taskType: "repo_backup_check", repositoryId: "repo-b" });
 
-  const list = await listRepositories(db, null, ENV.ENCRYPTION_SECRET, ENV);
+  const { items: list } = await listRepositories(db, null, ENV.ENCRYPTION_SECRET, ENV);
   const byId = new Map(list.map((item) => [item.id, item]));
 
   assert.equal(byId.get("repo-a").activeCheckCount, 1);
