@@ -926,6 +926,73 @@ export class CodeRepositoryRepository extends BaseRepository {
   }
 
   /**
+   * 把某仓库「卡在 running 的编排任务行」收尾成 failed（修改点：阶段 1 任务卡在 running）
+   *
+   * 为什么 code_repository_backups 的收尾不够
+   * ----------------------------------------
+   * findRunningBackupsBefore + zombies.js 收尾的是**备份历史表**，
+   * 管理员在「备份历史」里能看到失败原因了。但 tasks 表（编排任务）
+   * 是另一张表，它在 Workers 下**没有任何收敛路径**：
+   * - Node/Docker 侧有 SQLiteTaskOrchestrator.recoverJobs()，进程启动时把
+   *   pending/running 全部重置为 pending，所以容器重启能自愈；
+   * - Workers 侧没有「启动」这个时机，JobWorkflow 的 finalize-task-record
+   *   只在 run() 还能继续执行时才跑得到。CPU 超限是运行时直接杀 isolate，
+   *   连 execute-task 外面那层 catch 都不执行，于是 tasks 行永久停在 running，
+   *   且 finished_at / error_message 全是空 —— 前端「任务管理」页的表现就是
+   *   「一直在跑、看不到原因」，正是本次要解决的现场。
+   *
+   * 安全性（三道守卫，缺一不可）
+   * --------------------------
+   * 1. `status = 'running'`：**只动 running**。已经是终态
+   *    （completed/failed/partial/cancelled）的行一律不碰，
+   *    所以这个收尾永远不可能把新状态覆盖成旧状态。
+   * 2. 刻意**不处理 pending**：pending 可能只是实例还在排队
+   *    （免费计划有并发实例上限，排队是正常状态），误判会把没开始的作业打成失败。
+   *    running 则意味着 mark-running 已经执行过、执行体确实启动了，
+   *    此时长时间不再回报才能断定它已经死了。
+   * 3. `updated_at < ?`：用 updated_at 当心跳。进度上报每次都会刷新它
+   *    （JobWorkflow.updateProgress / SQLiteTaskOrchestrator 都写这一列），
+   *    所以真正还在跑的作业不会被判成僵尸；判早了也只是多一条 failed，
+   *    执行体若仍活着，finalize-task-record 会按它自己的判定覆盖回来。
+   *
+   * @param {string} repositoryId
+   * @param {string[]} taskTypes 例如 ["repo_backup", "repo_backup_check"]
+   * @param {number} staleBeforeMs updated_at 早于这个时间戳才收尾
+   * @param {string} reason 写入 error_message 的原因说明
+   * @returns {Promise<number>} 实际收尾的行数
+   */
+  async finalizeStaleRepoJobs(repositoryId, taskTypes, staleBeforeMs, reason) {
+    if (!repositoryId || !reason) return 0;
+    const types = (taskTypes || []).filter(Boolean);
+    if (types.length === 0) return 0;
+
+    const typePlaceholders = types.map(() => "?").join(", ");
+    const now = Date.now();
+    const sql = `
+      UPDATE ${DbTables.TASKS}
+      SET status = 'failed',
+          error_message = ?,
+          finished_at = ?,
+          updated_at = ?
+      WHERE task_type IN (${typePlaceholders})
+        AND status = 'running'
+        AND updated_at < ?
+        AND json_valid(payload)
+        AND json_extract(payload, '$.repositoryId') = ?
+    `;
+    const binds = [
+      String(reason),
+      now,
+      now,
+      ...types,
+      Number(staleBeforeMs) || 0,
+      String(repositoryId),
+    ];
+    const result = await this.execute(sql, binds);
+    return Number(result?.meta?.changes ?? result?.changes ?? 0) || 0;
+  }
+
+  /**
    * 删除某仓库的全部检测状态（删除仓库时调用）
    * @param {string} repositoryId
    * @returns {Promise<void>}

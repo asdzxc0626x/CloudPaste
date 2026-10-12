@@ -118,13 +118,53 @@ export class S3UploadOperations {
           },
           queueSize: uploadConfig.queueSize,
           partSize: uploadConfig.partSize,
+          /**
+           * leavePartsOnError: false —— 失败时让 lib-storage 自己中止分片上传
+           *
+           * 修改点（阶段 1 S3 分片残留）：这里要讲清楚它**覆盖不到**的情况，
+           * 否则排查时会误以为分片一定被清理了。
+           *
+           * 已核实的实现（node_modules/@aws-sdk/lib-storage/dist-cjs/index.js）：
+           * `markUploadAsAborted()` 在 `__doMultipartUpload()` 的错误处理路径里被调用，
+           * 内部 `this.client.send(AbortMultipartUploadCommand)`。
+           * 也就是说它是**纯 JS 层的补偿动作**，成立的前提是「JS 还在跑」：
+           * - upload.done() 抛错 / 流出错 / 调用方 abort()：能清理 ✔
+           * - Cloudflare Workers CPU 超限、OOM：运行时直接杀 isolate，
+           *   catch 不执行，这个 abort **永远不会发出** ✘
+           *   → 已上传的分片留在桶里，按存储量持续计费。
+           *
+           * 还有一点容易被忽略：abort 本身也是一次**外部 subrequest**。
+           * 免费计划每次调用只有 50 个外部 subrequest（见 transferBudget.js 文件头），
+           * 如果失败正是因为 subrequest 耗尽，这次 abort 也发不出去。
+           *
+           * 兜底手段只能在 S3 侧，且**不能假设所有 S3 兼容服务都支持**：
+           * R2 / AWS S3 支持「中止未完成分片上传」的生命周期规则，
+           * 但 MinIO、B2、各家自建网关的支持程度不一，部分只能靠
+           * ListMultipartUploads + AbortMultipartUpload 手工清理。
+           * 因此这里不做自动清理（会引入新的调度作业与新的服务商能力假设），
+           * 只保证下面的日志能把残留定位到具体 Key 与分片数。
+           */
           leavePartsOnError: false,
         });
 
         // 3. 只从 Upload 的 httpUploadProgress 里拿整体进度
         let lastProgressLog = 0;
+        /**
+         * 修改点（阶段 1 补充必要诊断）：记录分片进度，用于定位残留分片
+         *
+         * 之所以在这里统计而不是另外加探针：httpUploadProgress 是 lib-storage
+         * **已经在发**的事件，读它不产生任何额外开销（既不多读流，也不多发请求）。
+         * maxPart 就是「至少已经传上去多少个分片」——
+         * isolate 被杀时它是判断桶里残留规模的唯一线索。
+         */
+        let maxPartSeen = 0;
+        let lastLoaded = 0;
         upload.on("httpUploadProgress", (progress) => {
           const { loaded = 0, total = contentLength } = progress;
+          // 修改点（阶段 1 补充必要诊断）：分片号与已传字节
+          const partNumber = Number(progress?.part) || 0;
+          if (partNumber > maxPartSeen) maxPartSeen = partNumber;
+          if (loaded > lastLoaded) lastLoaded = loaded;
           const REDUCED_LOG_INTERVAL = 50 * 1024 * 1024;
           const shouldLog = total > 0 ? loaded === total || loaded - lastProgressLog >= REDUCED_LOG_INTERVAL : loaded - lastProgressLog >= REDUCED_LOG_INTERVAL;
 
@@ -133,7 +173,7 @@ export class S3UploadOperations {
             const totalMB = total > 0 ? (total / (1024 * 1024)).toFixed(2) : "未知";
             const percentage = total > 0 ? ((loaded / total) * 100).toFixed(1) : "未知";
             console.log(
-              `[StorageUpload] type=S3 mode=流式分片 status=进度 已传=${progressMB}MB 总=${totalMB}MB 进度=${percentage}% 路径=${finalS3Path}`
+              `[StorageUpload] type=S3 mode=流式分片 status=进度 已传=${progressMB}MB 总=${totalMB}MB 进度=${percentage}% 已完成分片=${maxPartSeen} 路径=${finalS3Path}`
             );
             lastProgressLog = loaded;
           }
@@ -150,12 +190,31 @@ export class S3UploadOperations {
 
         // 4. 等 Upload 完成，然后统一做目录更新时间等收尾
         const startTime = Date.now();
-        result = await upload.done();
+        try {
+          result = await upload.done();
+        } catch (uploadError) {
+          /**
+           * 修改点（阶段 1 S3 分片残留）：失败时留下可定位残留的痕迹
+           *
+           * 只记录、不改变错误语义（原样 rethrow，交给外层 handleFsError）。
+           * 走到这里 lib-storage 已经按 leavePartsOnError=false 尝试过 abort，
+           * 但 abort 自身也可能失败（例如 subrequest 耗尽），所以仍然要留痕。
+           * 真正**拿不到**这条日志的情况才是最麻烦的：isolate 被直接杀掉时
+           * 这个 catch 也不执行，那时只能靠上面的「进度」日志里最后一条
+           * 已完成分片数来估算残留规模。
+           */
+          console.error(
+            `[StorageUpload] type=S3 mode=流式分片 status=失败 用时=${Date.now() - startTime}ms ` +
+              `已传=${(lastLoaded / (1024 * 1024)).toFixed(2)}MB 已完成分片=${maxPartSeen} ` +
+              `路径=${finalS3Path} 原因=${uploadError?.message || uploadError}`
+          );
+          throw uploadError;
+        }
         const duration = Date.now() - startTime;
         const speedMBps = contentLength > 0 ? (contentLength / 1024 / 1024 / (duration / 1000)).toFixed(2) : "未知";
 
         console.log(
-          `[StorageUpload] type=S3 mode=流式分片 status=完成 用时=${duration}ms 速度=${speedMBps}MB/s 路径=${finalS3Path}`
+          `[StorageUpload] type=S3 mode=流式分片 status=完成 用时=${duration}ms 速度=${speedMBps}MB/s 已传=${(lastLoaded / (1024 * 1024)).toFixed(2)}MB 分片数=${maxPartSeen} 路径=${finalS3Path}`
         );
         etag = result.ETag ? result.ETag.replace(/"/g, "") : undefined;
 

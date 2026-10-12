@@ -7,16 +7,45 @@
  * （归档流只能消费一次，所以多目标必须重新下载，见 RepoBackupTaskHandler 顶部说明）。
  * 工作量上界由「用户跟踪了几个分支」和「仓库有多大」决定，代码侧没有任何约束。
  *
- * 而在 Cloudflare Workers 下，这一整串动作跑在**同一个** Workflow 步骤里，于是同时受两道限制：
- * - 该次调用的 CPU 累计上限（wrangler 配置的 [limits] cpu_ms；该段默认注释掉了，
- *   不配就是平台默认的 30 秒 —— 免费计划只能这样，见下方 WORKER_DEFAULTS 的说明）
- * - Workflow 步骤的 wall-clock 上限（JobWorkflow 里 execute-task 配的 600 秒）
+ * 而在 Cloudflare Workers 下，这一整串动作跑在**同一个** Workflow 步骤里，
+ * 也就是**一次 Worker 调用**，于是同时受三道限制。
+ *
+ * 修改点（阶段 1 核实执行环境）：以下数字已从官方文档核实（2026-10-12 抓取存档于
+ * backend/.audit/docs/），**不要再按本文件此前写的「免费计划 30 秒」调参** ——
+ * 那个数字是**付费**计划的默认值，免费计划差了 3000 倍：
+ *
+ * - CPU 累计上限（workers/platform/limits/ 的 Account plan limits 表、
+ *   workflows/reference/limits/ 的 "Compute time per step" 行）：
+ *     · 免费计划 **10 ms**；
+ *     · 付费计划默认 30 秒，可用 [limits] cpu_ms 配到 5 分钟。
+ *   wrangler 配置里那段默认是注释状态，因为免费计划填了会被 100328 拒绝部署，
+ *   也就是说免费计划下这一项**根本无法调整**。
+ *   注意 CPU 时间只算「真正在执行 JS」的时间，等网络 / D1 的时间不计入。
+ *   文档也说明 isolate 对偶发超限有一点弹性，但那是「偶发」级别的余量，
+ *   不足以覆盖下面这种数量级的差距。
+ *
+ * - 外部 subrequest 上限（同两份文档；原文："Workers on the free plan remain
+ *   limited to 50 external subrequests and 1,000 subrequests to Cloudflare
+ *   services per invocation."）：
+ *     · 免费计划 **50 个外部请求 / 次调用**（D1 属于后者的 1,000）。
+ *   **本模块完全没有建模这一条**，而它是一道独立的硬墙：
+ *   355MB 归档按 6MB 分片 ≈ 60 次 UploadPart，再加归档下载、
+ *   CreateMultipartUpload、CompleteMultipartUpload，单目标一趟就已经越界。
+ *
+ * - 步骤超时：平台对单步 wall-clock 是 Unlimited，真正生效的是
+ *   JobWorkflow 给 execute-task 配的 600 秒，且它是**每次尝试**的超时，不是总超时。
  *
  * 实测数据（真 workerd，与线上同 compatibility_date / nodejs_compat）：
  * - 354MB 归档走 lib-storage（6MB 分片、并发 1）单趟约 3.5 秒 CPU；
  *   加上传输看门狗与进度统计的逐块开销，上游分片越小越贵，
  *   1KB 分片的极端情况下单趟能爬到 20 秒以上。
- * 也就是说：单趟勉强够，**多引用 / 多目标累计必然超**。
+ *
+ * 把实测值和核实后的上限对起来看，结论比原先的注释严重得多：
+ * 免费计划下单趟 354MB 需要的 CPU 是配额的**数百倍**，并且就算 CPU 无限，
+ * 也会先撞上 50 个外部 subrequest ——
+ * 即「单趟勉强够」这个前提在免费计划上不成立，**一趟都不够**。
+ * 本模块只能让失败变得可预期、可留痕，不能让它跑通；
+ * 真正跑通大仓库要么拆步骤（每步一份独立配额），要么用 Node/Docker 部署。
  *
  * 超了会怎样（这是本模块存在的真正理由）
  * -------------------------------------
@@ -66,11 +95,18 @@ export const REPO_BACKUP_BUDGET_ENV_KEYS = {
  * - 2GiB 单趟在实测里远在 CPU 上限之内（按付费计划配了 cpu_ms = 300000 计），留足余量；
  * - 比它更大的仓库靠调大 cpu_ms 也救不回来，真正该做的是分轮或者换 Node 部署。
  *
- * 修改点（免费计划部署被 100328 拒绝）：cpu_ms 在 wrangler 配置里默认是注释状态，
- * 因为免费计划填这一项会直接部署失败。也就是说免费计划下 CPU 上限是平台默认的
- * 30 秒，上面这套默认值（7 分钟软截止 / 2GiB 单次预算）是按 5 分钟上限定的，
- * 在免费计划上**挡不住** CPU 超限 —— 那时要用 [vars] 里的
- * REPO_BACKUP_SOFT_DEADLINE_MS / REPO_BACKUP_JOB_BYTE_BUDGET_MB 主动压小。
+ * 修改点（阶段 1 核实执行环境）：原注释写「免费计划下 CPU 上限是平台默认的 30 秒」，
+ * 这是错的 —— 30 秒是**付费**计划的默认值，免费计划是 **10 ms**（出处见文件头）。
+ * 更正后，这套默认值在免费计划上的处境要说清楚：
+ * - 它们是按付费 5 分钟 CPU 上限定的，约束的只有 **wall-clock 和字节数**，
+ *   **从来不约束 CPU**，也不约束外部 subrequest 数；
+ * - 因此在免费计划上，一个 355MB 的归档会原样通过这三道口子
+ *   （2GiB 远大于 355MB），然后在传输途中被运行时杀掉；
+ * - 把 REPO_BACKUP_MAX_ARCHIVE_MB 压到 355MB 以下确实能把它挡在开传之前，
+ *   但那是「拒绝备份这个仓库」，不是把它备份成功 ——
+ *   免费计划下单趟 355MB 既超 CPU 也超 subrequest，不存在能跑通的参数组合。
+ *   所以这里**刻意不动默认值**：阶段 1 只负责让失败可收敛、可观测、不放大，
+ *   要真正备上大仓库得拆步骤或换 Node/Docker 部署。
  */
 const WORKER_DEFAULTS = {
   softDeadlineMs: 7 * 60 * 1000,

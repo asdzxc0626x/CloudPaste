@@ -34,12 +34,130 @@ interface Env {
   ENCRYPTION_SECRET: string;
 }
 
+/**
+ * execute-task 的默认步骤配置（修改点：阶段 1 重试放大）
+ *
+ * 保持与改动前**完全一致**的取值，所有任务类型默认继续走这一套，
+ * 这样这次调整不会碰到任何其他任务类型的重试行为。
+ *
+ * 语义按官方文档核实（workflows/build/sleeping-and-retrying/，
+ * 2026-10-12 抓取存档于 backend/.audit/docs/）：
+ * - `retries.limit` 是**重试次数**，不是总次数：文档示例 `limit: 10` 注明
+ *   "11 attempts total"。所以 limit = 3 意味着**最多 4 次完整尝试**。
+ * - `timeout` 是**每次尝试**的超时（原文 "the timeout is set per attempt"），
+ *   不是整个步骤的总预算。于是 limit=3 + timeout=600000 的真实 wall-clock
+ *   上界是 4 × 10 分钟 + 退避 (10s+20s+40s) ≈ 41 分钟。
+ * - 不传配置时平台默认是 `{limit: 5, delay: 10000, backoff: "exponential"},
+ *   timeout: "10 minutes"`，所以这里显式写出来是在收紧而非放宽。
+ */
+const DEFAULT_EXECUTE_STEP_CONFIG = {
+  retries: {
+    limit: 3,
+    delay: 10000,
+    backoff: "exponential" as const,
+  },
+  timeout: 600000,
+};
+
+/**
+ * 按任务类型覆盖 execute-task 的步骤配置（修改点：阶段 1 重试放大）
+ *
+ * 为什么只对 repo_backup 收紧，而不是改默认值：
+ * 步骤重试是**基础设施级**重试——它把整个 handler.execute() 从头再跑一遍。
+ * 对大多数任务（copy / 索引重建等）这是对的：工作量小、失败多半是偶发网络问题。
+ *
+ * 但 repo_backup 的一次尝试是「N 个引用 × M 个目标，每个组合完整下载 + 完整上传
+ * 一遍归档」。一个 355MB 的仓库在 limit=3 下最坏要被完整拉 **4 遍**，代价是：
+ * - GitHub 出口流量 ×4（355MB → 1.4GB），而归档下载不走 API 配额调度器，
+ *   没有任何东西会拦住它；
+ * - 每次被运行时杀掉都会漏掉 lib-storage 的 AbortMultipartUpload
+ *   （见 S3UploadOperations 的说明），于是桶里留下 4 套未完成分片持续计费；
+ * - 而重试本身救不了它：同样的工作量再跑一遍，撞的还是同一道 CPU /
+ *   subrequest 上限（免费计划 10ms / 50 个外部请求，见 transferBudget.js 文件头）。
+ *
+ * 真正需要的「业务重试」已经由另一套机制承担，且比盲目重跑精确得多：
+ * handler 内部捕获业务异常后用 planRetryForError 算出重试时刻，
+ * 再由 deferRepositoryBackupSchedule 写进 scheduled_jobs.next_run_after，
+ * 下一轮从**没做完的那个目标**接着做，而不是从头重来。
+ *
+ * 所以这里把重试次数降到 1（= 最多 2 次尝试）：
+ * 保留一次重试是为了覆盖「连接卡死导致步骤超时」这类真正偶发的基础设施故障，
+ * 不降到 0 是为了让这次改动尽量小、可回退。
+ */
+const EXECUTE_STEP_CONFIG_BY_TASK_TYPE: Record<string, typeof DEFAULT_EXECUTE_STEP_CONFIG> = {
+  repo_backup: {
+    retries: {
+      limit: 1,
+      delay: 10000,
+      backoff: "exponential" as const,
+    },
+    timeout: 600000,
+  },
+};
+
+/**
+ * 取某任务类型的 execute-task 步骤配置（修改点：阶段 1 重试放大）
+ * @param taskType 任务类型
+ * @returns 未配置覆盖的类型返回默认配置（与改动前一致）
+ */
+function resolveExecuteStepConfig(taskType: string) {
+  return EXECUTE_STEP_CONFIG_BY_TASK_TYPE[taskType] ?? DEFAULT_EXECUTE_STEP_CONFIG;
+}
+
+/**
+ * 单行结构化诊断日志（修改点：阶段 1 补充必要诊断）
+ *
+ * 口径与约束：
+ * - **只写日志，不写 D1**。免费计划下 D1 调用计入「1,000 次 Cloudflare 服务
+ *   subrequest / 次调用」的额度，而进度上报已经在用掉其中相当一部分，
+ *   诊断绝不能再往里加。日志在 Workers Logs / `wrangler tail` 里就能看。
+ * - 单行 `key=value`，方便在 tail 里直接 grep（避免多行 JSON 被日志面板截断）。
+ * - 不打印 payload：里面可能有仓库凭据相关字段。只打印标识类信息。
+ *
+ * 注意：**CPU 时间拿不到**。Workers 没有向 JS 暴露本次调用已用 CPU 的 API，
+ * 所以这里记录的 `wallMs` 是 wall-clock，不是 CPU 时间（两者在本任务里差得很远：
+ * 绝大部分 wall-clock 花在等网络，不计入 CPU）。真实 CPU 时间只能从
+ * Workers Logs 的 invocation log 或 Logpush 的 Trace Events 顶层字段读。
+ */
+function logJob(event: string, fields: Record<string, unknown>) {
+  const parts = [`[JobWorkflow] ${event}`];
+  for (const [key, value] of Object.entries(fields)) {
+    if (value === undefined || value === null || value === "") continue;
+    parts.push(`${key}=${value}`);
+  }
+  console.log(parts.join(" "));
+}
+
 /** 通用作业 Workflow - 持久化执行 + 自动重试 */
 export class JobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams> {
   async run(event: WorkflowEvent<JobWorkflowParams>, step: WorkflowStep) {
     const { jobId, taskType, payload, userId, userType } = event.payload;
 
-    console.log(`[JobWorkflow] 启动作业 ${jobId}, 任务类型: ${taskType}`);
+    /**
+     * 修改点（阶段 1 补充必要诊断）：本次 run() 调用的标识
+     *
+     * Workflows 没有向 JS 暴露「这是第几次尝试」的 API，所以用一个
+     * 每次调用都重新生成的随机 token 来替代：**同一个 jobId 出现多个
+     * 不同的 invocation，就说明发生了步骤重试或实例重放**。
+     * 这是在不写任何 D1 的前提下能拿到的最接近「重试次数」的信号。
+     *
+     * instanceId 与 jobId 在本项目里是同一个值（WorkflowsTaskOrchestrator
+     * 用 `JOB_WORKFLOW.create({ id: jobId })` 创建实例），这里仍然分开打，
+     * 以便将来改了 ID 策略时日志不会误导。
+     */
+    const invocation = Math.random().toString(36).slice(2, 10);
+    const instanceId = (event as any)?.instanceId ?? jobId;
+    const runStartedAtMs = Date.now();
+
+    logJob("run 开始", {
+      jobId,
+      taskType,
+      instanceId,
+      invocation,
+      eventAt: (event as any)?.timestamp
+        ? new Date((event as any).timestamp).toISOString()
+        : undefined,
+    });
 
     // 获取任务处理器
     let handler;
@@ -94,20 +212,29 @@ export class JobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams> {
      * finalize-task-record 永远不执行 —— D1 里的 tasks 行就永久停在 running，
      * 既没有 finished_at 也没有 error_message，前端表现就是「卡住且看不到原因」。
      */
+    const executeStepConfig = resolveExecuteStepConfig(taskType);
+
     try {
       await step.do(
         'execute-task',
-        {
-          retries: {
-            limit: 3,
-            delay: 10000,
-            backoff: "exponential" as const,
-          },
-          timeout: 600000,
-        },
+        executeStepConfig,
         async () => {
+        /**
+         * 修改点（阶段 1 补充必要诊断）：每次尝试各自计时
+         *
+         * 这个闭包会被**完整重跑**一遍（每次重试都是一次新的尝试），
+         * 所以计时必须放在闭包内部，放外面量到的是「首次尝试到现在」。
+         */
+        const attemptStartedAtMs = Date.now();
+        logJob("execute-task 尝试开始", {
+          jobId,
+          taskType,
+          invocation,
+          retryLimit: executeStepConfig.retries.limit,
+          attemptTimeoutMs: executeStepConfig.timeout,
+        });
+
         try {
-          console.log(`[JobWorkflow] 执行任务 ${jobId} (类型: ${taskType})`);
 
           // 创建执行上下文
           // 进度更新节流：避免高频写 D1 导致放大
@@ -203,11 +330,26 @@ export class JobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams> {
 
           await handler.execute(job, context);
 
-          console.log(`[JobWorkflow] ✓ 任务 ${jobId} 执行成功`);
+          // 修改点（阶段 1 补充必要诊断）：wallMs 是 wall-clock，不是 CPU 时间
+          logJob("execute-task 尝试成功", {
+            jobId,
+            taskType,
+            invocation,
+            wallMs: Date.now() - attemptStartedAtMs,
+          });
           return { success: true };
         } catch (error: any) {
           taskSuccess = false;
           taskError = error;
+          logJob("execute-task 尝试失败", {
+            jobId,
+            taskType,
+            invocation,
+            wallMs: Date.now() - attemptStartedAtMs,
+            // handler 自己捕获业务异常并返回，所以走到这里多半是未预期的运行时错误
+            errorName: error?.name,
+            errorMessage: error?.message || String(error),
+          });
           console.error(`[JobWorkflow] ✗ 任务 ${jobId} 执行失败:`, error);
 
           return {
@@ -221,6 +363,14 @@ export class JobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams> {
       // 步骤超时 / 重试耗尽 / 运行时异常：记下原因，继续走最终化，绝不让任务停在 running
       taskSuccess = false;
       taskError = stepError instanceof Error ? stepError : new Error(String(stepError));
+      logJob("execute-task 步骤退出", {
+        jobId,
+        taskType,
+        invocation,
+        wallMs: Date.now() - runStartedAtMs,
+        errorName: stepError?.name,
+        errorMessage: stepError?.message || String(stepError),
+      });
       console.error(
         `[JobWorkflow] ✗ 任务 ${jobId} 的 execute-task 步骤异常退出（超时或重试耗尽）:`,
         stepError
@@ -272,6 +422,27 @@ export class JobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams> {
       ).run();
 
       console.log(`[JobWorkflow] ✓ 作业记录已最终化,状态: ${finalStatus}`);
+      /**
+       * 修改点（阶段 1 补充必要诊断）：最终状态与可诊断的错误信息
+       *
+       * prevStatus 一并打出来是为了识别「僵尸收尾先到、Workflow 后到」的情况：
+       * 收尾会把长期停在 running 的行改成 failed（见 repobackup/zombies.js），
+       * 之后实例若仍活着走到这里，这里的判定更准确，会覆盖它 —— 这是预期行为，
+       * 日志里能看到 prevStatus=failed → status=... 的交接过程。
+       */
+      logJob("finalize 完成", {
+        jobId,
+        taskType,
+        invocation,
+        prevStatus: finalRow?.status,
+        status: finalStatus,
+        totalWallMs: Date.now() - runStartedAtMs,
+        successCount: finalStats.successCount,
+        failedCount: finalStats.failedCount,
+        skippedCount: finalStats.skippedCount,
+        bytesTransferred: (finalStats as any)?.bytesTransferred,
+        errorMessage: errorMessage ?? undefined,
+      });
       return { status: finalStatus };
     });
 
