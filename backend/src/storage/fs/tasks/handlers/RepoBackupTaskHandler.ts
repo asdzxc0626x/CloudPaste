@@ -184,6 +184,146 @@ type RefOutcome = {
 type BackupStage = "preparing" | "resolving" | "transferring" | "manifest" | "pruning" | "finished";
 
 /**
+ * 以下三组类型是**步骤返回值**（修改点：阶段 2 拆分 Workflow 步骤）
+ * ================================================================
+ * 它们受两条硬约束，改这里之前务必先读 TaskHandler.ts 里 runStep 的注释：
+ *
+ * 1. **必须可序列化**：Workflows 会把步骤输出持久化下来，重放时直接回灌。
+ *    所以只能放原始值与纯对象 —— 不能放 Error、Date、Stream、ReadableStream，
+ *    也不能放 mount 行或 repoRow 这种带嵌套的数据库行。
+ * 2. **不得含凭据**：持久化意味着它离开了 D1 的加密字段。provider 配置、
+ *    token、S3 密钥一律不许出现在这里；需要凭据的代码在步骤**内部**自己解密。
+ *
+ * 另一条设计约束是「确定性」：步骤之外的累计逻辑（预算、吞吐、延迟重试时间）
+ * 全部只依赖这些返回值，不读 Date.now()。于是重放时拿到的是同一批缓存输出，
+ * 推导出的控制流完全一致 —— 这正是文档要求的
+ * 「conditions must be based on deterministic values — either values from
+ *  event.payload or return values from previous steps」。
+ */
+
+/**
+ * 可延迟重试计划的可序列化形态
+ *
+ * planRetryForError 的返回值里 retryAtMs 是 `Date.now() + delay` 算出来的，
+ * 这是个不确定值。所以它必须**在步骤内部**算好并随返回值缓存下来，
+ * 否则每次重放都会算出一个新的重试时刻，日志与前端显示会漂移。
+ */
+type SerializableDeferral = {
+  kind: string;
+  retryAtMs: number;
+  message: string;
+};
+
+/** prepare-ref 步骤的结论 */
+type PrepareRefResult = {
+  /**
+   * transfer    —— 需要搬运，missingMountIds 是本次要补写的目标
+   * up_to_date  —— 全部目标都已有该 commit 的成功副本（水位已在步骤内补齐）
+   * deferred    —— 解析阶段撞上限流/暂时性故障，已安排重试
+   * failed      —— 永久性失败
+   * cancelled   —— 作业已被取消
+   */
+  decision: "transfer" | "up_to_date" | "deferred" | "failed" | "cancelled";
+  backupId: string | null;
+  /** 本次要补写的目标挂载点 ID；顺序与 mounts 一致（遍历顺序必须确定） */
+  missingMountIds: string[];
+  /** 已有成功副本、本次跳过的目标挂载点 ID */
+  doneMountIds: string[];
+  /**
+   * 本次备份目录的时间基准（毫秒）
+   *
+   * planBackupPaths 默认用 `new Date()`，而目录名里带时间戳
+   * （`时间__分支__sha`）—— 也就是说**同一个组合重跑一次就会多出一个目录**。
+   * 把时间基准收进步骤返回值后，步骤重试与实例重放都会复用同一个时间戳，
+   * 落到同一个路径上（覆盖写），不再产生孤儿目录。
+   * 路径格式本身一个字都没改，dedupeBackupDirs 仍作为兜底保留。
+   */
+  pathAtMs: number;
+  /** 解析出的版本；decision 为 cancelled/failed 的早期分支下可能为 null */
+  version: {
+    refType: string;
+    ref: string | null;
+    commitSha: string;
+    version: string | null;
+    publishedAt: string | null;
+  } | null;
+  deferral: SerializableDeferral | null;
+  error: string | null;
+  /** 预算用尽导致这个引用根本没开工；文案给管理员看，不进 last_error */
+  budgetReason: string | null;
+};
+
+/** 单个 ref × 目标 的传输结果 */
+type TransferResult = {
+  status: "success" | "failed" | "deferred";
+  mountId: string;
+  /** 目标显示名（日志与任务详情用） */
+  label: string;
+  storagePath: string | null;
+  manifestPath: string | null;
+  manifestWarning: string | null;
+  sizeBytes: number | null;
+  /** 本趟实际搬了多少字节（失败/中止那趟也算），用于累计流量预算 */
+  bytes: number;
+  /** 传输成功时的净耗时，用于吞吐估算；失败趟返回 0（不污染速度样本） */
+  transferMs: number;
+  error: string | null;
+  deferral: SerializableDeferral | null;
+  /** 预算用尽导致这一趟根本没开始；文案给管理员看，不进 last_error */
+  budgetReason: string | null;
+};
+
+/** finalize-ref 步骤的结论 */
+type FinalizeRefResult = {
+  /**
+   * success  —— 全部目标都有副本
+   * partial  —— 部分目标有副本
+   * failed   —— 一个副本都没有，且确实有目标写挂了
+   * deferred —— 一个副本都没有，但原因是限流 / 预算用尽，已安排重试
+   */
+  status: "success" | "partial" | "failed" | "deferred";
+  doneCount: number;
+  totalTargets: number;
+  primaryStoragePath: string | null;
+  primarySizeBytes: number | null;
+  /** 进备份记录 error_message 的完整说明（含「没轮到」与清理结果） */
+  note: string | null;
+  /** 进 code_repositories.last_error 的**真实失败**原因；没有真失败时为 null */
+  warning: string | null;
+  /** 一个副本都没有时给任务条目的说明 */
+  message: string | null;
+};
+
+/**
+ * 元数据类步骤的配置（修改点：阶段 2 拆分 Workflow 步骤）
+ *
+ * plan-run / prepare-ref / finalize-ref / defer-schedule 都是「几次 D1 读写
+ * 加最多一次 GitHub 版本查询」，重试代价极低而收益明确（偶发的 D1/网络抖动），
+ * 所以保留 3 次重试。超时给到 120s 是为了容纳 resolveLatestVersion 在
+ * 请求调度器里排队（全局并发 <=2、间隔 >=800ms）的等待。
+ */
+const META_STEP_CONFIG = {
+  retries: { limit: 3, delay: 5000, backoff: "exponential" as const },
+  timeout: 120000,
+};
+
+/**
+ * 传输步骤的配置（修改点：阶段 2 拆分 Workflow 步骤）
+ *
+ * 取值沿用阶段 1 给 repo_backup 定下的 `limit: 1`，理由不变（见 JobWorkflow.ts
+ * 的 EXECUTE_STEP_CONFIG_BY_TASK_TYPE 注释）：一次尝试就是「完整下载 + 完整上传
+ * 一遍归档」，盲目重跑只会再撞同一道上限，还会在桶里多留一套未完成分片。
+ *
+ * 拆分带来的改善是**重试的作用域**：阶段 1 的 limit=1 是「整个作业最多跑 2 遍」
+ * （N 个引用 × M 个目标全部重来），现在变成「**这一个组合**最多跑 2 遍」，
+ * 已经成功的组合不会被牵连 —— 它们的步骤结果已经落盘缓存。
+ */
+const TRANSFER_STEP_CONFIG = {
+  retries: { limit: 1, delay: 10000, backoff: "exponential" as const },
+  timeout: 600000,
+};
+
+/**
  * 传输停滞超时（修改点：任务卡住排查）
  *
  * GitHub/加速代理的连接可能在中途停止吐数据而不断开，此时下载与上传都会无限期等待，
@@ -401,6 +541,26 @@ export class RepoBackupTaskHandler implements TaskHandler {
     return buildStats(1);
   }
 
+  /**
+   * 本处理器自己划分执行步骤（修改点：阶段 2 拆分 Workflow 步骤）
+   *
+   * 声明之后 JobWorkflow 不再把 execute() 整体包进单个 execute-task 步骤，
+   * 而是在 run() 顶层驱动它 —— 因为 Workflows 不支持嵌套步骤，
+   * 「被包住」和「自己开步骤」只能二选一（详见 TaskHandler.usesExecutionSteps）。
+   *
+   * 换来的是：每个 ref × 目标各自成为一个步骤，于是各自拿到一份独立的
+   * CPU 与外部 subrequest 额度，且已完成的组合结果会被平台缓存下来 ——
+   * 后面的组合撞上限被杀，不会再把前面做成的活一起带走。
+   *
+   * 代价与纪律（改这个文件前务必先读完）：
+   * - execute() 里**步骤之外**的代码会在引擎重启 / 步骤间重放时被重复执行。
+   *   所以步骤之外只许有「只读查询 + 纯计算」，所有写操作一律收进步骤。
+   * - 步骤之外的控制流只许依赖 payload 与**上一个步骤的返回值**，不许读
+   *   Date.now()。预算 / 吞吐 / 重试时刻因此全部改为「步骤内算、随返回值缓存、
+   *   步骤外只做累加」。
+   */
+  readonly usesExecutionSteps = true;
+
   async execute(job: InternalJob, context: ExecutionContext): Promise<void> {
     const payload = (job.payload || {}) as RepoBackupPayload;
     const force = payload.force === true;
@@ -421,7 +581,40 @@ export class RepoBackupTaskHandler implements TaskHandler {
     const codeRepo = factory.getCodeRepositoryRepository();
     const mountRepository = factory.getMountRepository();
 
-    const startedMs = Date.now();
+    /**
+     * 步骤执行器（修改点：阶段 2 拆分 Workflow 步骤）
+     *
+     * Workers 下 context.runStep 由 JobWorkflow 提供，底层就是 step.do；
+     * Node/Docker 下它不存在，于是退化成「直接调用」—— 那里既没有 CPU 配额
+     * 也没有步骤超时，不需要拆分，行为与拆分前**逐字相同**。
+     */
+    const splitIntoSteps = typeof context.runStep === "function";
+    const runStep = <T>(name: string, options: any, fn: () => Promise<T>): Promise<T> =>
+      splitIntoSteps ? context.runStep!<T>(name, options, fn) : fn();
+
+    /**
+     * 包一层「步骤抛出也不中断整轮」
+     *
+     * 步骤体内部已经把业务异常都接住并转成返回值了，所以这里兜到的是
+     * 步骤超时 / 重试耗尽 / 未预期运行时错误。单个组合崩掉绝不能让剩下的组合
+     * 没机会跑 —— 这正是本阶段要求的「隔离失败」。
+     *
+     * @param fallback 把步骤级错误翻译成与正常返回值同形状的失败结果
+     */
+    const runStepSafely = async <T>(
+      name: string,
+      options: any,
+      fn: () => Promise<T>,
+      fallback: (message: string) => T,
+    ): Promise<T> => {
+      try {
+        return await runStep(name, options, fn);
+      } catch (error: any) {
+        const message = String(error?.message || error || "未知错误");
+        console.error(`[RepoBackupTaskHandler] 步骤 ${name} 异常退出（超时或重试耗尽）: ${message}`);
+        return fallback(message);
+      }
+    };
 
     /**
      * 本次作业的传输预算（修改点：大仓库备份超 CPU 限制）
@@ -429,14 +622,22 @@ export class RepoBackupTaskHandler implements TaskHandler {
      * Workers 下是「软截止 + 流量上限 + 单归档体积上限」，Node 下默认全关
      * （那里没有 CPU 配额也没有步骤超时，加限制只会让大仓库备份不成）。
      * 口径与环境变量见 repobackup/transferBudget.js 的文件头。
+     *
+     * 修改点（阶段 2 拆分 Workflow 步骤）：软截止的**含义变了**。
+     * 拆分前它拦的是「同一次调用里别再领新活」，因为所有组合共用一份 CPU 配额；
+     * 拆分后每个组合是独立 invocation（wall time 无上限、CPU 额度各自独立），
+     * 它拦的变成「这一轮作业别没完没了地做下去」。取值一个没改，
+     * 但别再指望它能救「单个归档本身就超限」——那是下一阶段的事。
      */
     const budget = resolveTransferBudget(env);
-    const deadlineAtMs = budget.softDeadlineMs > 0 ? startedMs + budget.softDeadlineMs : 0;
     /**
      * 本次作业已经实际搬过的字节数（含失败/中止的那一趟）
      *
      * 与 stats 里的 bytesTransferred 分开记：后者是给前端看的进度，
      * 只累计写成功的部分；预算要算的是「这次调用真花掉了多少」，失败的那趟也算。
+     *
+     * 修改点（阶段 2）：只在步骤**之外**按步骤返回值累加。
+     * 如果在步骤内部累加，重放时步骤体不执行（直接回灌缓存结果），累加就丢了。
      */
     let budgetBytes = 0;
 
@@ -455,6 +656,9 @@ export class RepoBackupTaskHandler implements TaskHandler {
     let lastArchiveBytes = 0;
 
     // ---------- 1. 读取仓库配置 ----------
+    // 修改点（阶段 2）：这一段是纯只读查询，文档明确允许放在步骤之外
+    //（原文：「calls that have no side effects can be done outside of steps」）。
+    // 代价是每次重放多几次 D1 读；收益是凭据与仓库行完全不进步骤返回值。
     const repoRow = await codeRepo.findRepositoryById(payload.repositoryId);
     if (!repoRow) {
       throw new NotFoundError(`代码仓库不存在: ${payload.repositoryId}`);
@@ -495,6 +699,10 @@ export class RepoBackupTaskHandler implements TaskHandler {
      * 预解析路径以前直接把 `item.ref`（已经是具体 Tag）当成 trackRef 一路传下去，
      * 水位就落到了错的行上。现在跟踪键单独取，并用 resolveTrackingRefKey
      * 对历史 payload（没有该字段）做收敛兜底。
+     *
+     * 修改点（阶段 2）：这个数组同时是**步骤名的来源**，所以它必须完全确定 ——
+     * 它只依赖 payload 与 repoRow，遍历顺序固定，没有随机或时间参与，
+     * 满足文档对动态步骤名的要求（「constructed in a deterministic way」）。
      */
     const backupPlan: Array<{
       trackRef: string | null;
@@ -566,82 +774,32 @@ export class RepoBackupTaskHandler implements TaskHandler {
     let deferredMessage: string | null = null;
 
     /**
-     * 记录一次错误；若属于可延迟重试类别则返回延迟计划，否则返回 null
-     * （永久性错误仍然走原来的「记失败」路径）
+     * 把错误转成**可序列化**的延迟重试计划（修改点：阶段 2 拆分 Workflow 步骤）
+     *
+     * 只许在步骤**内部**调用。planRetryForError 里的 retryAtMs 是
+     * `Date.now() + delay`，是个不确定值；在步骤内算好、随返回值缓存下来，
+     * 重放时拿回的才是同一个时刻，否则日志与前端显示的重试时间会每次都漂。
      */
-    const noteDeferral = (error: unknown) => {
+    const toDeferral = (error: unknown): SerializableDeferral | null => {
       const plan = planRetryForError(error);
       if (!plan.deferrable || plan.retryAtMs === null) return null;
+      return { kind: plan.kind, retryAtMs: plan.retryAtMs, message: plan.message };
+    };
+
+    /**
+     * 登记一次延迟重试（修改点：阶段 2 拆分 Workflow 步骤）
+     *
+     * 与 toDeferral 相反，这个只许在步骤**外部**调用：它改的是跨步骤累计状态，
+     * 而输入全部来自已缓存的步骤返回值，所以重放时能一字不差地重新累加出来。
+     */
+    const noteDeferral = (plan: SerializableDeferral | null) => {
+      if (!plan) return null;
       if (deferredRetryAtMs === null || plan.retryAtMs < deferredRetryAtMs) {
         deferredRetryAtMs = plan.retryAtMs;
         deferredKind = plan.kind;
         deferredMessage = plan.message;
       }
       return plan;
-    };
-
-    /** 软截止是否已过（修改点：大仓库备份超 CPU 限制） */
-    const deadlinePassed = () => deadlineAtMs > 0 && Date.now() >= deadlineAtMs;
-
-    /**
-     * 预算是否已耗尽（修改点：大仓库备份超 CPU 限制）
-     *
-     * 只在「准备领一份新活」之前调用（下一个引用、下一个目标），
-     * 不在传输中途调用 —— 中途掐断只会留下半个文件，而我们宁可让这一趟走完。
-     *
-     * 修改点（大仓库备份 CPU/耗时优化）：除了「截止到了没」「流量用完没」，
-     * 再加一问「这一趟按实测速度还跑得完吗」。
-     * 原先只看前两项，于是一个在软截止前 1 秒开工、要跑 4 分钟的目标照样会被放进去 ——
-     * 传输开始后没有收手机制，它只能一路跑到 Workflow 步骤超时被动失败，
-     * 整趟的 CPU、流量全白费。有了上一趟的实测吞吐就能提前让位。
-     *
-     * @returns 耗尽原因（给管理员看的文本）；还够用则返回 null
-     */
-    const budgetExhausted = (): string | null => {
-      if (deadlinePassed()) {
-        return (
-          `本次运行已持续 ${formatDuration(Date.now() - startedMs)}，` +
-          `达到单次作业的时间上限（${formatDuration(budget.softDeadlineMs)}）`
-        );
-      }
-      if (budget.jobByteBudget > 0 && budgetBytes >= budget.jobByteBudget) {
-        return (
-          `本次运行已传输 ${formatBytes(budgetBytes)}，` +
-          `达到单次作业的流量上限（${formatBytes(budget.jobByteBudget)}）`
-        );
-      }
-
-      /**
-       * 来不及再搬一趟了
-       *
-       * estimateTransferMs 在「没有任何实测样本」时返回 0，fitsBeforeDeadline 对 0
-       * 一律放行 —— 这条就是前进保证：本次运行的第一趟永远无条件执行，
-       * 不会出现「每轮都估着来不及、于是永远备不上」。
-       * 而第二趟起之所以敢推迟，是因为下一轮它就是第一个目标（既有的
-       * 「只补写缺失目标」自愈路径），到那时会无条件跑。
-       */
-      const estimateMs = estimateTransferMs(lastArchiveBytes, observedMs > 0 ? observedBytes / observedMs : 0);
-      const fit = fitsBeforeDeadline({ estimateMs, nowMs: Date.now(), deadlineAtMs });
-      if (!fit.fits) {
-        return (
-          `按本次实测速度（${formatBytes(Math.round((observedBytes / observedMs) * 1000))}/秒）估算，` +
-          `再搬一趟约需 ${formatDuration(estimateMs)}，` +
-          `而距本次运行的时间上限只剩 ${formatDuration(Math.max(0, fit.remainingMs))}，来不及`
-        );
-      }
-      return null;
-    };
-
-    /**
-     * 把「预算用尽」登记成一次延迟重试（修改点：大仓库备份超 CPU 限制）
-     *
-     * 复用第 2 期那套延迟机制，不另起一套状态：BudgetExhaustedError 在
-     * repobackup/errors.js 里就归在「可延迟」类别，所以 noteDeferral 必然返回计划。
-     */
-    const noteBudgetDeferral = (reason: string) => {
-      const plan = noteDeferral(new BudgetExhaustedError(reason));
-      // BudgetExhaustedError 一定可延迟，这里只是满足类型收窄
-      return plan!;
     };
 
     // 修改点（任务卡住排查 / 详情完善）：当前执行阶段与目标，让「任务管理」能看出卡在哪一步
@@ -688,6 +846,9 @@ export class RepoBackupTaskHandler implements TaskHandler {
     await report(0);
 
     // ---------- 2. 解析 Provider（失败即整体失败） ----------
+    // 修改点（阶段 2）：刻意留在步骤之外。它是「解密 + 构造对象」，没有副作用，
+    // 重放时重做一遍只是一点 CPU；更重要的是**凭据绝不能进步骤返回值**——
+    // 步骤输出会被平台持久化，那等于把密钥搬出了 D1 的加密字段。
     const providerConfig = await parseProviderConfig(provider, repoRow.config_json, encryptionSecret);
     // 修改点（第 3 期 请求调度）：把 db/env 交给 provider，让备份过程的全部
     // GitHub API 请求统一经过请求调度器（全局并发 <=2、间隔 >=800ms、
@@ -700,14 +861,95 @@ export class RepoBackupTaskHandler implements TaskHandler {
       encryptionSecret,
     });
 
+    // ---------- 3. 作业时间锚点（修改点：阶段 2 拆分 Workflow 步骤）----------
+    /**
+     * 为什么「开工时刻」要做成一个步骤的返回值
+     *
+     * 软截止原先是 `Date.now() - handler 进入时刻`。拆分之后主干跑在步骤之外，
+     * 引擎每次重放都会重新执行它 —— 那个「进入时刻」于是每次都变成「刚刚」，
+     * 软截止永远判不到，预算形同虚设。收进步骤返回值后它被缓存下来，
+     * 重放拿到的是同一个时刻，判定才稳定。
+     *
+     * 这就是文档那条红线的直接应用：
+     *   「🔴 Bad: Condition based on non-deterministic value outside a step」
+     *   「✅ Good: Wrap non-deterministic values in a step」
+     */
+    const planRun = await runStep("plan-run", META_STEP_CONFIG, async () => ({
+      startedAtMs: Date.now(),
+      refCount: backupPlan.length,
+      targetCount: mounts.length,
+    }));
+    const startedMs = planRun.startedAtMs;
+    const deadlineAtMs = budget.softDeadlineMs > 0 ? startedMs + budget.softDeadlineMs : 0;
+
+    /** 软截止是否已过（修改点：大仓库备份超 CPU 限制） */
+    const deadlinePassed = () => deadlineAtMs > 0 && Date.now() >= deadlineAtMs;
+
+    /**
+     * 预算是否已耗尽（修改点：大仓库备份超 CPU 限制）
+     *
+     * 只在「准备领一份新活」之前调用（下一个引用、下一个目标），
+     * 不在传输中途调用 —— 中途掐断只会留下半个文件，而我们宁可让这一趟走完。
+     *
+     * 修改点（大仓库备份 CPU/耗时优化）：除了「截止到了没」「流量用完没」，
+     * 再加一问「这一趟按实测速度还跑得完吗」。
+     * 原先只看前两项，于是一个在软截止前 1 秒开工、要跑 4 分钟的目标照样会被放进去 ——
+     * 传输开始后没有收手机制，它只能一路跑到 Workflow 步骤超时被动失败，
+     * 整趟的 CPU、流量全白费。有了上一趟的实测吞吐就能提前让位。
+     *
+     * 修改点（阶段 2 拆分 Workflow 步骤）：**只许在步骤体内部调用**。
+     * 它读 Date.now()，在步骤外调用会让「issue 哪些步骤」变成不确定的，
+     * 正是文档禁止的那种写法。现在两个调用点都在步骤里：
+     * prepare-ref 开头（这个引用还要不要开工）与 transfer 开头（这个目标还搬不搬）。
+     *
+     * @returns 耗尽原因（给管理员看的文本）；还够用则返回 null
+     */
+    const budgetExhausted = (): string | null => {
+      if (deadlinePassed()) {
+        return (
+          `本次运行已持续 ${formatDuration(Date.now() - startedMs)}，` +
+          `达到单次作业的时间上限（${formatDuration(budget.softDeadlineMs)}）`
+        );
+      }
+      if (budget.jobByteBudget > 0 && budgetBytes >= budget.jobByteBudget) {
+        return (
+          `本次运行已传输 ${formatBytes(budgetBytes)}，` +
+          `达到单次作业的流量上限（${formatBytes(budget.jobByteBudget)}）`
+        );
+      }
+
+      /**
+       * 来不及再搬一趟了
+       *
+       * estimateTransferMs 在「没有任何实测样本」时返回 0，fitsBeforeDeadline 对 0
+       * 一律放行 —— 这条就是前进保证：本次运行的第一趟永远无条件执行，
+       * 不会出现「每轮都估着来不及、于是永远备不上」。
+       * 而第二趟起之所以敢推迟，是因为下一轮它就是第一个目标（既有的
+       * 「只补写缺失目标」自愈路径），到那时会无条件跑。
+       */
+      const estimateMs = estimateTransferMs(lastArchiveBytes, observedMs > 0 ? observedBytes / observedMs : 0);
+      const fit = fitsBeforeDeadline({ estimateMs, nowMs: Date.now(), deadlineAtMs });
+      if (!fit.fits) {
+        return (
+          `按本次实测速度（${formatBytes(Math.round((observedBytes / observedMs) * 1000))}/秒）估算，` +
+          `再搬一趟约需 ${formatDuration(estimateMs)}，` +
+          `而距本次运行的时间上限只剩 ${formatDuration(Math.max(0, fit.remainingMs))}，来不及`
+        );
+      }
+      return null;
+    };
+
     currentStage = "resolving";
     await report(0);
 
     let processed = 0;
     let firstError: Error | null = null;
+    /** 作业被取消：停止后续引用（与原实现的 break 行为一致） */
+    let runCancelled = false;
 
-    // ---------- 3. 逐个引用（分支）备份 ----------
-    for (const planItem of backupPlan) {
+    // ---------- 4. 逐个引用（分支）备份 ----------
+    for (let refIndex = 0; refIndex < backupPlan.length; refIndex += 1) {
+      const planItem = backupPlan[refIndex];
       const trackRef = planItem.trackRef;
       // 修改点（P0 水位键错位）：本轮推进水位要用的状态键，与展示用的 trackRef 分开
       const trackingRef = planItem.trackingRef;
@@ -722,94 +964,337 @@ export class RepoBackupTaskHandler implements TaskHandler {
       itemResults.push(itemResult);
 
       const refStartedMs = Date.now();
-      let backupId: string | null = null;
-      /** 本引用内出现的可延迟重试错误（修改点：第 2 期），决定这个引用记「失败」还是「已安排重试」 */
-      let refDeferral: ReturnType<typeof noteDeferral> = null;
+      /** 本引用内出现的可延迟重试计划（修改点：第 2 期），决定这个引用记「失败」还是「已安排重试」 */
+      let refDeferral: SerializableDeferral | null = null;
 
       /**
-       * 开工前先看预算（修改点：大仓库备份超 CPU 限制）
+       * ---------- 4.1 prepare-ref 步骤 ----------
        *
-       * 到这一步连 GitHub 都还没请求，什么都没做，所以这里只记任务条目留痕，
-       * 不往 code_repository_backups 里写「什么都没干」的记录 —— 备份历史是给人
-       * 核对快照用的，塞进一堆「没轮到」会把它变成噪音。重试时间由收尾统一交给调度层。
-       *
-       * 用 continue 而不是 break：剩下的每个引用都留一条说明，
-       * 否则任务详情里它们会是一排永远停在 processing 的条目。
+       * 一个引用「要不要备、备哪个版本、往哪几个目标补写、用哪个备份记录」
+       * 全在这一个步骤里定下来，并随返回值缓存。这解决了三件事：
+       * - 版本解析（GitHub API）不会因为重放被重复请求，额度不白烧；
+       * - backupId 由 generateId() 生成，是个不确定值 —— 缓存之后重放拿回同一个，
+       *   不会每次重放都 createBackup 出一条新的备份历史（「避免重复写历史」）；
+       * - 「补写哪几个目标」是后面 transfer 步骤名的来源，必须确定。
        */
-      const refBudgetReason = budgetExhausted();
-      if (refBudgetReason) {
-        const plan = noteBudgetDeferral(refBudgetReason);
-        const retryAtText = describeRetryAt(plan.retryAtMs as number);
-        itemResult.status = "skipped";
-        itemResult.message = `${refBudgetReason}，本引用留到下一轮（${retryAtText}）继续`;
-        itemResult.durationMs = Date.now() - refStartedMs;
-        itemResult.meta = {
-          ...(itemResult.meta || {}),
-          outcome: REPO_OUTCOME.DEFERRED,
-          retryAt: retryAtText,
-        };
-        outcomes.push({ ref: trackRef ?? null, status: "deferred" });
-        processed += 1;
-        await report(processed);
-        console.warn(`[RepoBackupTaskHandler] ${repoIdentifier}@${trackRef || ""} 预算用尽，推迟：${refBudgetReason}`);
-        continue;
+      const prep = await runStepSafely<PrepareRefResult>(
+        `prepare-ref:r${refIndex}`,
+        META_STEP_CONFIG,
+        async () => {
+          const result: PrepareRefResult = {
+            decision: "failed",
+            backupId: null,
+            missingMountIds: [],
+            doneMountIds: [],
+            pathAtMs: Date.now(),
+            version: null,
+            deferral: null,
+            error: null,
+            budgetReason: null,
+          };
+
+          /**
+           * 开工前先看预算（修改点：大仓库备份超 CPU 限制）
+           *
+           * 到这一步连 GitHub 都还没请求，什么都没做，所以这里只记任务条目留痕，
+           * 不往 code_repository_backups 里写「什么都没干」的记录 —— 备份历史是给人
+           * 核对快照用的，塞进一堆「没轮到」会把它变成噪音。重试时间由收尾统一交给调度层。
+           */
+          const refBudgetReason = budgetExhausted();
+          if (refBudgetReason) {
+            result.decision = "deferred";
+            result.budgetReason = refBudgetReason;
+            // BudgetExhaustedError 一定可延迟，这里的 ! 只是类型收窄
+            result.deferral = toDeferral(new BudgetExhaustedError(refBudgetReason))!;
+            console.warn(
+              `[RepoBackupTaskHandler] ${repoIdentifier}@${trackRef || ""} 预算用尽，推迟：${refBudgetReason}`,
+            );
+            return result;
+          }
+
+          let backupId: string | null = null;
+          try {
+            if (await context.isCancelled(job.jobId)) {
+              throw new Error("cancelled");
+            }
+
+            /**
+             * 修改点（第 4 期 需求 4）：有预解析版本时**不发任何 GitHub 请求**。
+             *
+             * 这一步是本期省额度的关键：原来每个备份周期都要为每个仓库打一次
+             * /branches 或 /commits，即使最终判定「无更新」而跳过。现在那次请求
+             * 已经在 repo_backup_check 里付过了，结果也落了库，备份阶段只负责下载。
+             *
+             * 另一个好处是一致性：检测到的 commitSha 与实际下载的归档严格同一个
+             *（openSourceArchive 用 commitSha 拼 codeload 直链），不会因为两次解析
+             * 之间分支又有新提交而拿到对不上的内容。
+             */
+            const version = planItem.preresolved
+              ? {
+                  refType: planItem.preresolved.refType,
+                  ref: planItem.preresolved.ref,
+                  commitSha: planItem.preresolved.commitSha,
+                  version:
+                    planItem.preresolved.version ??
+                    `${planItem.preresolved.ref ?? ""}@${planItem.preresolved.commitSha.slice(0, 7)}`,
+                  publishedAt: planItem.preresolved.publishedAt ?? null,
+                }
+              : await providerInstance.resolveLatestVersion({
+                  repoIdentifier,
+                  trackMode,
+                  trackRef: trackRef ?? null,
+                  // 修改点（第 1 期请求数量优化）：把本轮要解析的引用总数告诉 provider，
+                  // 多分支时它会改用 1 次 /branches 批量请求代替 N 次单分支请求
+                  refCount: backupPlan.length,
+                });
+
+            result.version = {
+              refType: version.refType,
+              ref: version.ref ?? null,
+              commitSha: version.commitSha,
+              version: version.version ?? null,
+              publishedAt: version.publishedAt ?? null,
+            };
+
+            // 3.2 去重：仅当「所有目标都已有该 commit 的成功副本」且非强制时才跳过
+            //     修改点（多备份目标优化）：任一目标缺副本都要重跑，保证自愈
+            const existing = await codeRepo.findBackupByCommit(repoRow.id, version.commitSha);
+            let missingMounts = mounts;
+
+            if (existing) {
+              if (force) {
+                missingMounts = mounts;
+              } else {
+                const existingTargets = await codeRepo.findTargetsByBackup(existing.id);
+                const doneMountIds = new Set(
+                  existingTargets.filter((t: any) => t.status === "success").map((t: any) => String(t.mount_id)),
+                );
+                missingMounts = mounts.filter((m) => !doneMountIds.has(String(m.id)));
+                result.doneMountIds = mounts
+                  .filter((m) => doneMountIds.has(String(m.id)))
+                  .map((m) => String(m.id));
+
+                if (missingMounts.length === 0) {
+                  /**
+                   * 修改点（第 4 期）：所有目标都已有该版本的副本 —— 这说明水位落后于事实。
+                   * 正常链路不会走到这里（检测阶段就会判定「无更新」而不创建备份任务），
+                   * 能走到说明是以下几种情况之一：
+                   *   · 迁移回填时这个引用没有成功备份记录可取（例如 ref 名变过）
+                   *   · 用户手动强制备份过一次，水位没跟上
+                   *   · 并发：两个备份任务备同一个 commit
+                   * 不在这里把水位补上，下一轮检测还会判「有更新」，于是永远在这条
+                   * 「创建任务 → 发现已存在 → 跳过」的空转上打转。
+                   */
+                  await advanceBackedUpWatermark(
+                    codeRepo,
+                    repoRow.id,
+                    // 修改点（P0 水位键错位）：用跟踪键，不用 provider 解析出的具体 Tag。
+                    // 这里原先传 `version.ref ?? trackRef`，release 模式跟踪「最新」时
+                    // 会把水位写到一行全新的 ref='v9.9.9' 上，跟踪行永远不更新
+                    trackingRefType,
+                    trackingRef,
+                    version.commitSha,
+                    // 修改点（正常跳过时的状态一致性）：这次跳过恰好证明了
+                    // 「当前版本就是已备份的那个版本」，把它记成一次成功检测，
+                    // 仓库管理页才会和任务列表一样显示「已是最新」而不是「成功完成」
+                    { markDetected: true, repoRow },
+                  );
+
+                  result.decision = "up_to_date";
+                  console.log(`[RepoBackupTaskHandler] 跳过重复备份: ${repoIdentifier} @ ${version.commitSha}`);
+                  return result;
+                }
+              }
+            }
+
+            if (missingMounts.length < mounts.length) {
+              console.log(
+                `[RepoBackupTaskHandler] 上次备份有 ${mounts.length - missingMounts.length} 个目标已完成，本次只补写剩余目标`,
+              );
+            }
+
+            // 3.3 创建/复用备份记录
+            // 注意：(repository_id, commit_sha) 上有唯一索引，force 重跑时必须复用原记录而非新插入
+            const startedAt = nowIso();
+            if (existing) {
+              backupId = existing.id;
+              await codeRepo.updateBackup(backupId, {
+                status: "running",
+                ref_type: version.refType,
+                ref: version.ref,
+                version: version.version,
+                job_id: job.jobId,
+                error_message: null,
+                started_at: startedAt,
+                finished_at: null,
+              });
+            } else {
+              backupId = generateId("bk");
+              await codeRepo.createBackup({
+                id: backupId,
+                repository_id: repoRow.id,
+                ref_type: version.refType,
+                ref: version.ref,
+                commit_sha: version.commitSha,
+                version: version.version,
+                status: "running",
+                job_id: job.jobId,
+                started_at: startedAt,
+              });
+            }
+
+            result.decision = "transfer";
+            result.backupId = backupId;
+            result.missingMountIds = missingMounts.map((m) => String(m.id));
+            return result;
+          } catch (error: any) {
+            // 修改点（第 2 期 错误分类）：先排除「任务被取消」。
+            // 传输停滞看门狗触发的 abort 现在被归类为「暂时性错误」，如果任务其实已经
+            // 被取消，就不能按可重试处理，否则会安排一次没人想要的延迟重试。
+            const cancelled =
+              String(error?.message || "").toLowerCase() === "cancelled" ||
+              (await Promise.resolve(context.isCancelled(job.jobId)).catch(() => false));
+            const message = cancelled ? "备份已取消" : String(error?.message || error || "未知错误");
+            result.error = message;
+            result.backupId = backupId;
+
+            // 修改点（第 2 期 限流 = 延迟，不是失败）：
+            // 限流 / 超时 / 5xx 这类错误会自己好，既不该写进失败历史，也不该累计失败数，
+            // 只记下「最早可以重试的时间」，本轮结束后交给调度层安排延迟重试。
+            const deferral = cancelled ? null : toDeferral(error);
+
+            if (deferral) {
+              const retryAtText = describeRetryAt(deferral.retryAtMs);
+
+              if (backupId) {
+                // 已经建好的记录不能留在 running（会永久挡住下一次定时备份），
+                // 但绝不能写 failed —— 记 deferred，表示「本次没备份，已安排重试」
+                // 修改点（状态显示不一致修复）：原先是 skipped，与「无需备份」共用同一个值
+                await codeRepo
+                  .updateBackup(backupId, {
+                    status: "deferred",
+                    error_message: `本次未能完成，已安排在 ${retryAtText} 自动重试：${message}`,
+                    finished_at: nowIso(),
+                  })
+                  .catch((e: any) =>
+                    console.warn("[RepoBackupTaskHandler] 更新延迟记录失败:", e?.message || e),
+                  );
+              } else {
+                // 修改点（备份历史缺记录）：解析版本阶段就延迟时，原先**一条记录都不写**
+                // （当时的理由是「写进备份历史只会污染它」—— 那是只有 failed/skipped 两种
+                // 取值时的取舍）。结果是任务列表里明明有「跳过」，点开该仓库的备份历史
+                // 却什么都没有，用户无法核对「这次到底有没有尝试过备份」。
+                // 现在 deferred 是一个独立且明确的非失败状态，补一条留痕才说得通：
+                // 它记录的是「这次尝试没有产生任何快照，已安排在 X 之后重试」。
+                await codeRepo
+                  .createBackup({
+                    id: generateId("bk"),
+                    repository_id: repoRow.id,
+                    ref_type: trackMode === "branch" ? "branch" : "tag",
+                    ref: trackRef ?? null,
+                    // 占位 commit_sha：真 sha 要等解析成功才有，DTO 读取时会还原为 null
+                    commit_sha: buildUnresolvedCommitSha(),
+                    version: null,
+                    status: "deferred",
+                    job_id: job.jobId,
+                    error_message: `本次未能完成，已安排在 ${retryAtText} 自动重试：${message}`,
+                    started_at: new Date(refStartedMs).toISOString(),
+                    finished_at: nowIso(),
+                  })
+                  .catch((e: any) =>
+                    console.warn("[RepoBackupTaskHandler] 写入延迟留痕记录出错:", e?.message || e),
+                  );
+              }
+
+              result.decision = "deferred";
+              result.deferral = deferral;
+              // 不写 last_error：限流不是这个仓库的问题，留给收尾统一写「已安排重试」的说明
+              console.warn(
+                `[RepoBackupTaskHandler] 备份被推迟: ${repoIdentifier}@${trackRef || ""} ${message}`,
+              );
+              return result;
+            }
+
+            if (backupId) {
+              await codeRepo
+                .updateBackup(backupId, {
+                  status: cancelled ? "skipped" : "failed",
+                  error_message: message,
+                  finished_at: nowIso(),
+                })
+                .catch((e: any) => console.warn("[RepoBackupTaskHandler] 更新备份记录失败:", e?.message || e));
+            } else {
+              // 修改点（历史记录需显示失败记录）：
+              // 解析版本阶段就失败时（限流、网络不通、分支不存在）原本一条记录都不会写，
+              // 备份历史里因此永远只看到成功的版本。这里补一条失败留痕，
+              // commit_sha 用占位值绕过 NOT NULL + 唯一索引，DTO 读取时会还原为 null。
+              await codeRepo
+                .createBackup({
+                  id: generateId("bk"),
+                  repository_id: repoRow.id,
+                  ref_type: trackMode === "branch" ? "branch" : "tag",
+                  ref: trackRef ?? null,
+                  commit_sha: buildUnresolvedCommitSha(),
+                  version: null,
+                  status: cancelled ? "skipped" : "failed",
+                  job_id: job.jobId,
+                  error_message: message,
+                  started_at: new Date(refStartedMs).toISOString(),
+                  finished_at: nowIso(),
+                })
+                .catch((e: any) => console.warn("[RepoBackupTaskHandler] 写入失败留痕记录出错:", e?.message || e));
+            }
+
+            await codeRepo
+              .updateRepository(repoRow.id, { last_error: message })
+              .catch((e: any) => console.warn("[RepoBackupTaskHandler] 更新仓库状态失败:", e?.message || e));
+
+            result.decision = cancelled ? "cancelled" : "failed";
+            console.error(`[RepoBackupTaskHandler] 备份失败: ${repoIdentifier}@${trackRef || ""}`, message);
+            return result;
+          }
+        },
+        (message) => ({
+          decision: "failed",
+          backupId: null,
+          missingMountIds: [],
+          doneMountIds: [],
+          pathAtMs: Date.now(),
+          version: null,
+          deferral: null,
+          error: `准备阶段步骤异常退出：${message}`,
+          budgetReason: null,
+        }),
+      );
+
+      // 步骤外只做累加，输入全部来自已缓存的返回值 → 重放可重现
+      if (prep.deferral) {
+        noteDeferral(prep.deferral);
+        refDeferral = prep.deferral;
       }
 
-      try {
-        if (await context.isCancelled(job.jobId)) {
-          throw new Error("cancelled");
-        }
+      const version = prep.version;
 
-        // 3.1 取该引用的版本
-        currentStage = "resolving";
-        await report(processed);
+      // 修改点（详情完善）：targets 记录每个目标的写入结果，供任务详情逐条展示
+      // 修改点（状态显示不一致修复）：新增 "deferred" —— 目标撞上限流时既不能记
+      // success 也不能记 failed，它属于「本次没写成，已安排重试」
+      const targetSummaries: Array<{
+        mountId: string;
+        name: string | null;
+        mountPath: string | null;
+        status: "pending" | "processing" | "success" | "failed" | "skipped" | "deferred";
+        sizeBytes?: number | null;
+        error?: string | null;
+      }> = mounts.map((m) => ({
+        mountId: String(m.id),
+        name: m.name ?? null,
+        mountPath: m.mount_path ?? null,
+        // 已有副本的目标在详情里标为「跳过」，与本次要补写的目标区分开
+        status: prep.doneMountIds.includes(String(m.id)) ? "skipped" : "pending",
+      }));
+      const summaryOf = (mountId: any) => targetSummaries.find((t) => t.mountId === String(mountId));
 
-        /**
-         * 修改点（第 4 期 需求 4）：有预解析版本时**不发任何 GitHub 请求**。
-         *
-         * 这一步是本期省额度的关键：原来每个备份周期都要为每个仓库打一次
-         * /branches 或 /commits，即使最终判定「无更新」而跳过。现在那次请求
-         * 已经在 repo_backup_check 里付过了，结果也落了库，备份阶段只负责下载。
-         *
-         * 另一个好处是一致性：检测到的 commitSha 与实际下载的归档严格同一个
-         *（openSourceArchive 用 commitSha 拼 codeload 直链），不会因为两次解析
-         * 之间分支又有新提交而拿到对不上的内容。
-         */
-        const version = planItem.preresolved
-          ? {
-              refType: planItem.preresolved.refType,
-              ref: planItem.preresolved.ref,
-              commitSha: planItem.preresolved.commitSha,
-              version: planItem.preresolved.version ?? `${planItem.preresolved.ref ?? ""}@${planItem.preresolved.commitSha.slice(0, 7)}`,
-              publishedAt: planItem.preresolved.publishedAt ?? null,
-            }
-          : await providerInstance.resolveLatestVersion({
-              repoIdentifier,
-              trackMode,
-              trackRef: trackRef ?? null,
-              // 修改点（第 1 期请求数量优化）：把本轮要解析的引用总数告诉 provider，
-              // 多分支时它会改用 1 次 /branches 批量请求代替 N 次单分支请求
-              refCount: backupPlan.length,
-            });
-
-        // 修改点（详情完善）：targets 记录每个目标的写入结果，供任务详情逐条展示
-        // 修改点（状态显示不一致修复）：新增 "deferred" —— 目标撞上限流时既不能记
-        // success 也不能记 failed，它属于「本次没写成，已安排重试」
-        const targetSummaries: Array<{
-          mountId: string;
-          name: string | null;
-          mountPath: string | null;
-          status: "pending" | "processing" | "success" | "failed" | "skipped" | "deferred";
-          sizeBytes?: number | null;
-          error?: string | null;
-        }> = mounts.map((m) => ({
-          mountId: String(m.id),
-          name: m.name ?? null,
-          mountPath: m.mount_path ?? null,
-          status: "pending",
-        }));
-        const summaryOf = (mountId: any) => targetSummaries.find((t) => t.mountId === String(mountId));
-
+      if (version) {
         itemResult.meta = {
           refType: version.refType,
           ref: version.ref,
@@ -817,822 +1302,807 @@ export class RepoBackupTaskHandler implements TaskHandler {
           version: version.version,
           targets: targetSummaries,
         };
+      }
 
-        // 3.2 去重：仅当「所有目标都已有该 commit 的成功副本」且非强制时才跳过
-        //     修改点（多备份目标优化）：任一目标缺副本都要重跑，保证自愈
-        const existing = await codeRepo.findBackupByCommit(repoRow.id, version.commitSha);
-        let missingMounts = mounts;
+      // ---------- 4.2 prepare 的非 transfer 结论，各自收尾 ----------
+      if (prep.decision === "up_to_date") {
+        itemResult.status = "skipped";
+        // 修改点（状态显示不一致修复）：这是「已是最新、无需备份」，属于成功结果，
+        // 不是失败；用统一词汇标出来，前端据此显示「已是最新」而不是红字
+        itemResult.meta = {
+          ...(itemResult.meta || {}),
+          outcome: REPO_OUTCOME.UP_TO_DATE,
+        };
+        itemResult.message = `已存在该版本的备份（${version?.version ?? ""}），跳过`;
+        itemResult.durationMs = Date.now() - refStartedMs;
+        outcomes.push({ ref: version?.ref ?? trackRef ?? null, status: "skipped" });
+        processed += 1;
+        await report(processed);
+        continue;
+      }
 
-        if (existing) {
-          if (force) {
-            missingMounts = mounts;
-          } else {
-            const existingTargets = await codeRepo.findTargetsByBackup(existing.id);
-            const doneMountIds = new Set(
-              existingTargets.filter((t: any) => t.status === "success").map((t: any) => String(t.mount_id)),
-            );
-            missingMounts = mounts.filter((m) => !doneMountIds.has(String(m.id)));
+      if (prep.decision === "deferred") {
+        const retryAtText = prep.deferral ? describeRetryAt(prep.deferral.retryAtMs) : "稍后";
+        itemResult.status = "skipped";
+        itemResult.message = prep.budgetReason
+          ? `${prep.budgetReason}，本引用留到下一轮（${retryAtText}）继续`
+          : `已延迟重试（${describeErrorKind(prep.deferral?.kind || "")}，重试时间 ${retryAtText}）：${prep.error || ""}`;
+        itemResult.durationMs = Date.now() - refStartedMs;
+        itemResult.meta = {
+          ...(itemResult.meta || {}),
+          outcome: REPO_OUTCOME.DEFERRED,
+          retryAt: retryAtText,
+        };
+        outcomes.push({ ref: version?.ref ?? trackRef ?? null, status: "deferred" });
+        processed += 1;
+        await report(processed);
+        continue;
+      }
 
-            // 已有副本的目标在详情里标为「跳过」，与本次要补写的目标区分开
-            for (const mountId of doneMountIds) {
-              const summary = summaryOf(mountId);
-              if (summary) summary.status = "skipped";
+      if (prep.decision === "cancelled" || prep.decision === "failed") {
+        const cancelled = prep.decision === "cancelled";
+        const message = prep.error || "未知错误";
+        itemResult.status = cancelled ? "skipped" : "failed";
+        itemResult.error = message;
+        itemResult.durationMs = Date.now() - refStartedMs;
+        // 修改点（状态显示不一致修复）：取消是「被阻止」，真错误才是「失败」
+        itemResult.meta = {
+          ...(itemResult.meta || {}),
+          outcome: cancelled ? REPO_OUTCOME.BLOCKED : REPO_OUTCOME.FAILED,
+        };
+        outcomes.push({
+          ref: version?.ref ?? trackRef ?? null,
+          status: cancelled ? "skipped" : "failed",
+          error: message,
+        });
+        if (!cancelled && !firstError) firstError = new Error(message);
+        if (cancelled) runCancelled = true;
+        processed += 1;
+        await report(processed);
+        if (runCancelled) {
+          console.log("[RepoBackupTaskHandler] 任务已取消，停止后续引用");
+          break;
+        }
+        continue;
+      }
+
+      // 走到这里 decision === "transfer"，backupId 与 version 必然有值
+      const backupId = prep.backupId as string;
+      const resolvedVersion = version as NonNullable<PrepareRefResult["version"]>;
+
+      // ---------- 4.3 逐个目标写入，每个组合一个独立步骤 ----------
+      const targetErrors: string[] = [];
+      /**
+       * 因预算用尽而没轮到的目标说明（修改点：大仓库备份超 CPU 限制）
+       *
+       * 与 targetErrors 分开装，因为两者的去向不同：
+       * targetErrors 会写进 code_repositories.last_error，前端看到它非空就渲染红色失败；
+       * 而「没轮到」是设计内的正常流程，大仓库每轮都会出现，
+       * 混进 last_error 会让这类仓库长期显示成故障。它只进备份记录的 error_message
+       * 与任务条目说明 —— 能查到，但不报警。
+       */
+      const budgetNotes: string[] = [];
+      let successTargets = 0;
+      let attemptedTargets = 0;
+      /**
+       * 本次写入成功的第一个目标（修改点：阶段 2 拆分 Workflow 步骤）
+       *
+       * 备份记录的「主路径」原先优先取本次写入的那个，只有补写场景
+       * （本次一个都没写、靠历史副本凑齐）才回退到已有的目标行。
+       * 拆分后 finalize-ref 是独立步骤、只能看 D1，所以这个偏好必须显式传进去 ——
+       * 否则多目标时主路径会变成「D1 返回的第一行」，与改动前选中的目标不一样。
+       */
+      let runPrimary: { storagePath: string; manifestPath: string | null; sizeBytes: number | null } | null = null;
+
+      for (let mountIndex = 0; mountIndex < mounts.length; mountIndex += 1) {
+        const mount = mounts[mountIndex];
+        // 本次要补写哪些目标由 prepare-ref 定下并缓存 → 步骤集合完全确定
+        if (!prep.missingMountIds.includes(String(mount.id))) continue;
+
+        /**
+         * 取消检查放在步骤之外（修改点：阶段 2 拆分 Workflow 步骤）
+         *
+         * 严格说这是个「步骤外的不确定条件」，但它是**单调**的：一旦取消就永远取消，
+         * 只可能让步骤变少、绝不会变成另一组步骤。而且取消本就应该立刻生效，
+         * 不该等下一个步骤跑完。真相始终在 D1 里（finalize-ref 按目标行重算结论），
+         * 所以少跑几个步骤不会得出错误结果。
+         */
+        if (await context.isCancelled(job.jobId)) {
+          runCancelled = true;
+          break;
+        }
+
+        attemptedTargets += 1;
+        const label = mount.name || mount.mount_path;
+        currentTarget = { name: mount.name ?? null, mountPath: mount.mount_path ?? null };
+        currentStage = "transferring";
+
+        const transfer = await runStepSafely<TransferResult>(
+          `transfer:r${refIndex}:m${mountIndex}`,
+          TRANSFER_STEP_CONFIG,
+          async () => {
+            const outcome: TransferResult = {
+              status: "failed",
+              mountId: String(mount.id),
+              label: String(label),
+              storagePath: null,
+              manifestPath: null,
+              manifestWarning: null,
+              sizeBytes: null,
+              bytes: 0,
+              transferMs: 0,
+              error: null,
+              deferral: null,
+              budgetReason: null,
+            };
+
+            /**
+             * 领下一个目标之前先看预算（修改点：大仓库备份超 CPU 限制）
+             *
+             * 这是最关键的一道口子：多目标的代价是「每个目标都要把整个归档重新拉一遍」，
+             * 一个 354MB 的仓库写三个目标就是三趟 354MB。前面的目标跑完之后预算往往
+             * 已经见底，此时领下一个目标必然撞上 CPU / 步骤超时 —— 而撞上就什么都留不下。
+             *
+             * 这里记 deferred（不是 failed）：已写成功的目标照常落库，
+             * 下一轮 prepare-ref 的去重逻辑会发现「只缺这几个目标」并只补写它们，
+             * 即既有的自愈路径，不需要为此另写一套续传。
+             *
+             * 修改点（阶段 2）：判定移到步骤**内部**，结论随返回值缓存 ——
+             * 否则「这个目标跑不跑」在重放时会变，步骤集合就不确定了。
+             */
+            const targetBudgetReason = budgetExhausted();
+            if (targetBudgetReason) {
+              outcome.status = "deferred";
+              outcome.budgetReason = targetBudgetReason;
+              outcome.deferral = toDeferral(new BudgetExhaustedError(targetBudgetReason))!;
+
+              await codeRepo
+                .upsertBackupTarget({
+                  id: generateId("bkt"),
+                  backup_id: backupId,
+                  mount_id: mount.id,
+                  mount_path: mount.mount_path,
+                  status: "deferred",
+                  error_message: targetBudgetReason,
+                })
+                .catch((e: any) =>
+                  console.warn("[RepoBackupTaskHandler] 记录目标延迟状态出错:", e?.message || e),
+                );
+
+              console.warn(`[RepoBackupTaskHandler] 目标未轮到（${label}）：${targetBudgetReason}`);
+              return outcome;
             }
 
-            if (missingMounts.length === 0) {
-              /**
-               * 修改点（第 4 期）：所有目标都已有该版本的副本 —— 这说明水位落后于事实。
-               * 正常链路不会走到这里（检测阶段就会判定「无更新」而不创建备份任务），
-               * 能走到说明是以下几种情况之一：
-               *   · 迁移回填时这个引用没有成功备份记录可取（例如 ref 名变过）
-               *   · 用户手动强制备份过一次，水位没跟上
-               *   · 并发：两个备份任务备同一个 commit
-               * 不在这里把水位补上，下一轮检测还会判「有更新」，于是永远在这条
-               * 「创建任务 → 发现已存在 → 跳过」的空转上打转。
-               */
-              await advanceBackedUpWatermark(
-                codeRepo,
-                repoRow.id,
-                // 修改点（P0 水位键错位）：用跟踪键，不用 provider 解析出的具体 Tag。
-                // 这里原先传 `version.ref ?? trackRef`，release 模式跟踪「最新」时
-                // 会把水位写到一行全新的 ref='v9.9.9' 上，跟踪行永远不更新
-                trackingRefType,
-                trackingRef,
-                version.commitSha,
-                // 修改点（正常跳过时的状态一致性）：这次跳过恰好证明了
-                // 「当前版本就是已备份的那个版本」，把它记成一次成功检测，
-                // 仓库管理页才会和任务列表一样显示「已是最新」而不是「成功完成」
-                { markDetected: true, repoRow },
+            /**
+             * 修改点（阶段 2 拆分 Workflow 步骤）：目录时间戳改用 prepare-ref 缓存的时刻
+             *
+             * planBackupPaths 默认 `at = new Date()`，而目录名里带时间戳
+             * （`时间__分支__sha`）。拆分之后这个步骤会被重试、也会在实例重放时
+             * 重新执行，用「当前时刻」就会每次落到一个**新目录**里 ——
+             * 那正是本阶段必须避免的「重复上传 / 重复生成 manifest」。
+             * 改用 prep.pathAtMs（已缓存）之后，同一个组合无论跑几次都落在同一个路径上，
+             * 覆盖写而不是多留一份。路径格式一个字没改，dedupeBackupDirs 仍作兜底。
+             */
+            const paths = planBackupPaths({
+              mountPath: mount.mount_path,
+              pathPrefix: repoRow.target_path_prefix,
+              provider,
+              repoIdentifier,
+              commitSha: resolvedVersion.commitSha,
+              ref: resolvedVersion.ref,
+              at: new Date(prep.pathAtMs),
+            });
+
+            // 修改点（任务卡住排查）：传输护栏必须在发起请求前创建，
+            // 它的 signal 要交给 provider，才能在停滞时把整个响应中止掉
+            // 修改点（大仓库备份超 CPU 限制）：停滞阈值与体积上限都取自本次作业的预算
+            const guard = createTransferGuard({
+              stallTimeoutMs: budget.stallTimeoutMs,
+              maxBytes: budget.maxArchiveBytes,
+              onProgress: (bytes) => {
+                // 只补 bytesTransferred 这一个字段，避免与 report() 的完整快照互相覆盖；
+                // 失败不影响传输（updateProgress 在 Workers 下是异步 D1 写）
+                Promise.resolve(
+                  context.updateProgress(job.jobId, { bytesTransferred: bytesTransferred + bytes }),
+                ).catch(() => {});
+              },
+            });
+
+            try {
+              // createDirectory 对已存在目录是幂等的（返回 alreadyExists）
+              // 修改点（备份目录按分支分层）：直接建「本次备份的专属目录」，
+              // 其上层（仓库目录 / 分支目录）由驱动的多级创建一并带出；
+              // 创建失败不回滚：归档与 manifest 都要落在这个目录里，后续 uploadFile 会再兜一次
+              try {
+                await fileSystem.createDirectory(paths.backupDirPath, job.userId, job.userType);
+              } catch (dirError: any) {
+                // 部分对象存储没有真实目录概念，创建失败不影响后续写入
+                console.warn(
+                  `[RepoBackupTaskHandler] 创建目录失败（继续尝试上传）: ${paths.backupDirPath}`,
+                  dirError?.message || dirError,
+                );
+              }
+
+              console.log(
+                `[RepoBackupTaskHandler] 开始备份 ${repoIdentifier}@${resolvedVersion.ref || ""} ${resolvedVersion.version} -> ${paths.archivePath}`,
               );
 
-              itemResult.status = "skipped";
-              // 修改点（状态显示不一致修复）：这是「已是最新、无需备份」，属于成功结果，
-              // 不是失败；用统一词汇标出来，前端据此显示「已是最新」而不是红字
-              itemResult.meta = {
-                ...(itemResult.meta || {}),
-                outcome: REPO_OUTCOME.UP_TO_DATE,
-              };
-              itemResult.message = `已存在该版本的备份（${version.version}），跳过`;
-              itemResult.durationMs = Date.now() - refStartedMs;
-              outcomes.push({ ref: version.ref ?? trackRef ?? null, status: "skipped" });
-              processed += 1;
               await report(processed);
-              console.log(`[RepoBackupTaskHandler] 跳过重复备份: ${repoIdentifier} @ ${version.commitSha}`);
-              continue;
-            }
-          }
-        }
 
-        if (missingMounts.length < mounts.length) {
-          console.log(
-            `[RepoBackupTaskHandler] 上次备份有 ${mounts.length - missingMounts.length} 个目标已完成，本次只补写剩余目标`,
-          );
-        }
+              const archive = await providerInstance.openSourceArchive({
+                repoIdentifier,
+                refType: resolvedVersion.refType,
+                ref: resolvedVersion.ref,
+                commitSha: resolvedVersion.commitSha,
+                signal: guard.signal,
+              });
 
-        // 3.3 创建/复用备份记录
-        // 注意：(repository_id, commit_sha) 上有唯一索引，force 重跑时必须复用原记录而非新插入
-        const startedAt = nowIso();
-        if (existing) {
-          backupId = existing.id;
-          await codeRepo.updateBackup(backupId, {
-            status: "running",
-            ref_type: version.refType,
-            ref: version.ref,
-            version: version.version,
-            job_id: job.jobId,
-            error_message: null,
-            started_at: startedAt,
-            finished_at: null,
-          });
-        } else {
-          backupId = generateId("bk");
-          await codeRepo.createBackup({
-            id: backupId,
-            repository_id: repoRow.id,
-            ref_type: version.refType,
-            ref: version.ref,
-            commit_sha: version.commitSha,
-            version: version.version,
-            status: "running",
-            job_id: job.jobId,
-            started_at: startedAt,
-          });
-        }
+              // 拿到响应之后才启动停滞看门狗：
+              // 「等响应头」那一段由 provider 自己的超时 + 重试负责，两者职责不重叠，
+              // 报错信息也才对得上（超时 vs 传输停滞）
+              guard.arm();
+              const countedStream = guard.wrap(archive.stream);
+              const counter = guard.counter;
 
-        // 3.4 逐个目标写入
-        const targetErrors: string[] = [];
-        /**
-         * 因预算用尽而没轮到的目标说明（修改点：大仓库备份超 CPU 限制）
-         *
-         * 与 targetErrors 分开装，因为两者的去向不同：
-         * targetErrors 会写进 code_repositories.last_error，前端看到它非空就渲染红色失败；
-         * 而「没轮到」是设计内的正常流程，大仓库每轮都会出现，
-         * 混进 last_error 会让这类仓库长期显示成故障。它只进备份记录的 error_message
-         * 与任务条目说明 —— 能查到，但不报警。
-         */
-        const budgetNotes: string[] = [];
-        let primaryStoragePath: string | null = null;
-        let primaryManifestPath: string | null = null;
-        let primarySizeBytes: number | null = null;
-        let successTargets = 0;
+              let uploadResult: any;
+              /**
+               * 只掐「真的在搬字节」这一段（修改点：大仓库备份 CPU/耗时优化）
+               *
+               * 不从 openSourceArchive 开始计时：那一段可能包含限流退避与重试等待，
+               * 把它算进吞吐会让速度被严重低估，于是后面的目标被过度推迟。
+               * 建目录、写 manifest 这些固定开销同样不计入，由 fitsBeforeDeadline
+               * 的余量系数一并兜住。
+               */
+              const transferStartedMs = Date.now();
+              try {
+                uploadResult = await fileSystem.uploadFile(
+                  paths.archivePath,
+                  countedStream,
+                  job.userId,
+                  job.userType,
+                  {
+                    filename: paths.archiveFileName,
+                    contentType: archive.contentType || "application/gzip",
+                    // GitHub tarball 通常是 chunked 无 content-length，此时传 0 表示未知，
+                    // 上游的配额守卫会跳过 best-effort 判断，S3 走 lib-storage 自动分片
+                    contentLength: archive.contentLength || 0,
+                    /**
+                     * 修改点（大仓库备份 CPU/耗时优化）：把分片上传并发提到 2
+                     *
+                     * S3 驱动默认在 Workers 下用 queueSize = 1，而 lib-storage 的
+                     * queueSize 同时是**消费源流的并发度** —— 只有 1 个消费者时它必须
+                     * 「读满一片 → 传完这一片 → 再读下一片」，下载与上传完全串行，
+                     * 单趟 wall-clock ≈ 下载 + 上传。备份搬的是几百 MB 的归档，
+                     * 串行会让一次运行能完成的目标数直接腰斩。
+                     * 该字段只有 S3 驱动认（其余驱动忽略多余的 option），
+                     * 0 表示不覆盖，此时行为与改动前完全一致。
+                     */
+                    uploadTuning:
+                      budget.uploadQueueSize > 0 ? { queueSize: budget.uploadQueueSize } : undefined,
+                  },
+                );
+              } catch (uploadError: any) {
+                /**
+                 * 体积超限优先判（修改点：大仓库备份超 CPU 限制）
+                 *
+                 * 护栏掐断时底层报的是 stream/abort 错误，必须换成真实原因，
+                 * 否则管理员看到的是一句莫名其妙的 "aborted"。
+                 * 这里抛**永久性**错误：这个仓库在当前环境下就是传不动，
+                 * 安排重试只会每轮都白拉一遍几 GB 的流量。
+                 */
+                if (guard.isOversize()) {
+                  throw new ArchiveTooLargeError(
+                    `归档体积超过单次备份上限 ${formatBytes(budget.maxArchiveBytes)}` +
+                      `（传输到 ${formatBytes(counter.value)} 时中止）。` +
+                      `如确需备份该仓库，请调大 REPO_BACKUP_MAX_ARCHIVE_MB，或改用 Docker/Node 部署`,
+                  );
+                }
+                // 看门狗触发时底层报的是 abort/stream 错误，换成人看得懂的原因
+                // 修改点（大仓库备份超 CPU 限制）：这里原先抛的是普通 Error，
+                // 会被 classifyRepoBackupError 判成永久性错误 —— 与本文件
+                // 「传输停滞属于暂时性错误」的设计说明不符，连接抽风被记成了备份失败。
+                // 改抛 TransientError，让它真正落进「可延迟重试」类别。
+                if (guard.isStalled()) {
+                  throw new TransientError(
+                    `传输停滞超过 ${Math.round(budget.stallTimeoutMs / 1000)} 秒` +
+                      `（已传 ${formatBytes(counter.value)}）已中止，可能是 GitHub 或加速代理无响应`,
+                  );
+                }
+                throw uploadError;
+              } finally {
+                guard.dispose();
+                // 修改点（大仓库备份超 CPU 限制）：成功与否都要计入本次作业的流量预算 ——
+                // 失败的那一趟同样花掉了 CPU 与带宽，不记的话预算就形同虚设
+                // 修改点（阶段 2）：改为随返回值交给步骤外累加，理由见 budgetBytes 的注释
+                outcome.bytes = counter.value;
+              }
 
-        for (const mount of missingMounts) {
-          if (await context.isCancelled(job.jobId)) {
-            throw new Error("cancelled");
-          }
+              const sizeBytes = counter.value > 0 ? counter.value : null;
 
-          /**
-           * 领下一个目标之前先看预算（修改点：大仓库备份超 CPU 限制）
-           *
-           * 这是最关键的一道口子：多目标的代价是「每个目标都要把整个归档重新拉一遍」，
-           * 一个 354MB 的仓库写三个目标就是三趟 354MB。前面的目标跑完之后预算往往
-           * 已经见底，此时领下一个目标必然撞上 CPU / 步骤超时 —— 而撞上就什么都留不下。
-           *
-           * 这里记 deferred（不是 failed）：已写成功的目标照常落库，
-           * 下一轮 3.2 的去重逻辑会发现「只缺这几个目标」并只补写它们，
-           * 即既有的自愈路径，不需要为此另写一套续传。
-           */
-          const targetBudgetReason = budgetExhausted();
-          if (targetBudgetReason) {
-            const plan = noteBudgetDeferral(targetBudgetReason);
-            if (!refDeferral) refDeferral = plan;
+              /**
+               * 记一条吞吐样本（修改点：大仓库备份 CPU/耗时优化）
+               *
+               * 只在传输**成功走完**时记：失败那趟的字节数是半截的、耗时却可能很长
+               * （停滞要等满看门狗阈值），拿它算速度会把后续目标全判成「来不及」。
+               * 失败趟的流量仍然计入 bytes（在上面的 finally 里），两者口径不同：
+               * 预算问「花掉了多少」，吞吐问「正常情况下多快」。
+               */
+              const transferMs = Date.now() - transferStartedMs;
+              if (counter.value > 0 && transferMs > 0) {
+                outcome.transferMs = transferMs;
+              }
 
-            const label = mount.name || mount.mount_path;
-            budgetNotes.push(`${label}: ${targetBudgetReason}，已安排下一轮补写`);
+              // manifest 是归档旁的便利副本，元信息在数据库记录中已完整保存。
+              // 这里不因它失败而判定该目标失败，但必须把问题暴露给管理员。
+              let manifestPath: string | null = null;
+              let manifestWarning: string | null = null;
+              try {
+                currentStage = "manifest";
+                const manifest = this.buildManifest({
+                  provider,
+                  repoIdentifier,
+                  repoRow,
+                  version: resolvedVersion,
+                  backupId,
+                  jobId: job.jobId,
+                  archive: {
+                    path: uploadResult?.storagePath || paths.archivePath,
+                    fileName: paths.archiveFileName,
+                    contentType: archive.contentType || "application/gzip",
+                    sizeBytes,
+                  },
+                  mount,
+                });
+                const manifestBytes = new TextEncoder().encode(JSON.stringify(manifest, null, 2));
+                await fileSystem.uploadFile(paths.manifestPath, manifestBytes, job.userId, job.userType, {
+                  filename: paths.manifestFileName,
+                  contentType: "application/json",
+                  contentLength: manifestBytes.byteLength,
+                });
+                manifestPath = paths.manifestPath;
+              } catch (manifestError: any) {
+                manifestWarning = `manifest 写入失败: ${manifestError?.message || String(manifestError)}`;
+                console.warn(`[RepoBackupTaskHandler] ${manifestWarning}`);
+              }
 
-            const pendingSummary = summaryOf(mount.id);
-            if (pendingSummary) {
-              pendingSummary.status = "deferred";
-              pendingSummary.error = `本次未轮到：${targetBudgetReason}`;
-            }
+              const storagePath = uploadResult?.storagePath || paths.archivePath;
 
-            await codeRepo
-              .upsertBackupTarget({
+              // 修改点（多备份目标优化）：每个目标单独记录结果
+              await codeRepo.upsertBackupTarget({
                 id: generateId("bkt"),
                 backup_id: backupId,
                 mount_id: mount.id,
                 mount_path: mount.mount_path,
-                status: "deferred",
-                error_message: targetBudgetReason,
-              })
-              .catch((e: any) =>
-                console.warn("[RepoBackupTaskHandler] 记录目标延迟状态出错:", e?.message || e),
-              );
+                storage_path: storagePath,
+                manifest_path: manifestPath,
+                size_bytes: sizeBytes,
+                status: "success",
+                error_message: manifestWarning,
+              });
 
-            console.warn(`[RepoBackupTaskHandler] 目标未轮到（${label}）：${targetBudgetReason}`);
-            await report(processed);
-            continue;
+              outcome.status = "success";
+              outcome.sizeBytes = sizeBytes;
+              outcome.storagePath = storagePath;
+              outcome.manifestPath = manifestPath;
+              outcome.manifestWarning = manifestWarning;
+
+              console.log(`[RepoBackupTaskHandler] 目标写入完成: ${storagePath}`);
+
+              /**
+               * 收掉同分支同 sha 的重复目录（修改点：同分支同 sha 只保留一个目录）
+               *
+               * 为什么放在「这个目标刚写完」而不是统一收尾：
+               * - 分支目录路径带挂载点前缀，本来就得逐挂载点扫一遍；
+               * - 写完就扫，哪怕后面的目标撞上预算用尽、或整个 isolate 被 CPU 限制杀掉，
+               *   已经写完的这个挂载点也已经是干净的了。
+               *
+               * 保护名单（referencedDirs）在 upsertBackupTarget **之后**才查 ——
+               * 这样本次刚写的目录必然在名单里，绝不会被自己的去重删掉。
+               *
+               * 时间上限已过就不扫了：和旧版本清理同一个理由，它是一串网络往返，
+               * 在快撞上步骤超时的时候开这个头很可能半途被打断；而重复目录多留一轮毫无影响，
+               * 下一次该分支备份成功后照样会扫。
+               */
+              if (deadlinePassed()) {
+                console.warn("[RepoBackupTaskHandler] 本次运行已达时间上限，跳过重复目录去重（下一轮继续）");
+              } else {
+                try {
+                  const referencedDirs = toReferencedDirs(await codeRepo.findReferencedPaths(repoRow.id));
+                  await dedupeBackupDirs({
+                    fileSystem,
+                    refDirPath: paths.refDirPath,
+                    referencedDirs,
+                    userId: job.userId,
+                    userType: job.userType,
+                  });
+                } catch (dedupeError: any) {
+                  // 去重是收拾现场，失败绝不能改变备份结论（本目标已经写成功了）
+                  console.warn(
+                    "[RepoBackupTaskHandler] 重复目录去重失败（不影响备份结论）:",
+                    dedupeError?.message || dedupeError,
+                  );
+                }
+              }
+
+              return outcome;
+            } catch (targetError: any) {
+              guard.dispose();
+              // 单个目标失败不影响其他目标；下次运行会自动补写
+              const message = String(targetError?.message || targetError || "未知错误");
+
+              // 修改点（第 2 期 错误分类）：先判断这个目标的失败是不是「限流 / 暂时性」。
+              // 是的话本轮不能以失败收尾——目标行记 deferred（而不是 failed），
+              // 并记下重试时间，由本轮收尾统一把延迟交给调度层。
+              // 修改点（状态显示不一致修复）：这里原先写 skipped，与「无需备份」混为一谈，
+              // 前端两个页面各自解读成「跳过」和「失败」。改用独立的 deferred。
+              const targetDeferral = toDeferral(targetError);
+              outcome.status = targetDeferral ? "deferred" : "failed";
+              outcome.error = message;
+              outcome.deferral = targetDeferral;
+
+              await codeRepo
+                .upsertBackupTarget({
+                  id: generateId("bkt"),
+                  backup_id: backupId,
+                  mount_id: mount.id,
+                  mount_path: mount.mount_path,
+                  status: targetDeferral ? "deferred" : "failed",
+                  error_message: message,
+                })
+                .catch((e: any) =>
+                  console.warn("[RepoBackupTaskHandler] 记录目标失败状态出错:", e?.message || e),
+                );
+
+              console.error(
+                `[RepoBackupTaskHandler] 目标写入${targetDeferral ? "被推迟" : "失败"} (${label}):`,
+                message,
+              );
+              return outcome;
+            }
+          },
+          (message) => ({
+            status: "failed",
+            mountId: String(mount.id),
+            label: String(label),
+            storagePath: null,
+            manifestPath: null,
+            manifestWarning: null,
+            sizeBytes: null,
+            bytes: 0,
+            transferMs: 0,
+            error: `传输步骤异常退出：${message}`,
+            deferral: null,
+            budgetReason: null,
+          }),
+        );
+
+        /**
+         * 步骤外累加（修改点：阶段 2 拆分 Workflow 步骤）
+         *
+         * 全部只依赖 transfer 这个已缓存的返回值，所以重放时会一字不差地重新算出来。
+         * 这些量原先是在传输代码里就地 += 的，拆分后必须搬到这里 ——
+         * 否则重放时步骤体根本不执行（直接回灌缓存），累加就全丢了。
+         */
+        budgetBytes += transfer.bytes;
+        if (transfer.status === "success") {
+          successTargets += 1;
+          totalBytes += transfer.sizeBytes ?? 0;
+          bytesTransferred += transfer.bytes;
+          if (transfer.transferMs > 0 && transfer.bytes > 0) {
+            observedBytes += transfer.bytes;
+            observedMs += transfer.transferMs;
+            lastArchiveBytes = transfer.bytes;
+          }
+          if (!runPrimary && transfer.storagePath) {
+            runPrimary = {
+              storagePath: transfer.storagePath,
+              manifestPath: transfer.manifestPath,
+              sizeBytes: transfer.sizeBytes,
+            };
+          }
+          if (transfer.manifestWarning) {
+            targetErrors.push(`${transfer.label}: ${transfer.manifestWarning}`);
+          }
+        } else if (transfer.budgetReason) {
+          budgetNotes.push(`${transfer.label}: ${transfer.budgetReason}，已安排下一轮补写`);
+        } else if (transfer.deferral) {
+          targetErrors.push(
+            `${transfer.label}: 已延迟重试（${describeErrorKind(transfer.deferral.kind)}）${transfer.error || ""}`,
+          );
+        } else {
+          targetErrors.push(`${transfer.label}: ${transfer.error || "未知错误"}`);
+        }
+
+        if (transfer.deferral) {
+          noteDeferral(transfer.deferral);
+          if (!refDeferral) refDeferral = transfer.deferral;
+        }
+
+        const targetSummary = summaryOf(mount.id);
+        if (targetSummary) {
+          targetSummary.status = transfer.status;
+          targetSummary.sizeBytes = transfer.sizeBytes;
+          targetSummary.error = transfer.budgetReason
+            ? `本次未轮到：${transfer.budgetReason}`
+            : transfer.deferral
+              ? `已安排自动重试：${transfer.error || ""}`
+              : transfer.status === "success"
+                ? transfer.manifestWarning
+                : transfer.error;
+        }
+
+        await report(processed);
+      }
+
+      currentTarget = { name: null, mountPath: null };
+
+      /**
+       * ---------- 4.4 finalize-ref 步骤 ----------
+       *
+       * 这个引用的最终结论**不看本次写入结果，而是重新按「该备份的全部目标行」算**
+       * （原实现就是这样，拆分后这一点更关键）：目标行在 D1 里是唯一真相，
+       * 所以「上次部分失败、本次补写成功」能正确收敛为 success，
+       * 而「某个 transfer 步骤被跳过或被杀掉」也不会让结论算错。
+       */
+      const fin = await runStepSafely<FinalizeRefResult>(
+        `finalize-ref:r${refIndex}`,
+        META_STEP_CONFIG,
+        async () => {
+          const finishedAt = nowIso();
+
+          // 修改点（多备份目标优化）：按「该备份的全部目标行」重算状态，
+          // 而不是只看本次写入结果 —— 这样"上次部分失败、本次补写成功"能正确收敛为 success
+          const allTargets = await codeRepo.findTargetsByBackup(backupId);
+          const okMountIds = new Set(
+            allTargets.filter((t: any) => t.status === "success").map((t: any) => String(t.mount_id)),
+          );
+          const doneCount = mounts.filter((m) => okMountIds.has(String(m.id))).length;
+          const anyDone = doneCount > 0;
+          const allDone = doneCount === mounts.length;
+
+          const backupWarning = targetErrors.length > 0 ? targetErrors.join("；") : null;
+          // 修改点（大仓库备份超 CPU 限制）：「没轮到」的说明单独成句，不进 last_error
+          const budgetNote = budgetNotes.length > 0 ? budgetNotes.join("；") : null;
+
+          if (!anyDone) {
+            // 所有目标都没有副本
+            // 修改点（大仓库备份超 CPU 限制）：可能一个目标都没轮到（预算在本引用之前就见底），
+            // 此时 targetErrors 是空的，不能笼统地说「均写入失败」—— 那是在谎报故障
+            const message = backupWarning || budgetNote || "所有备份目标均写入失败";
+
+            // 修改点（第 2 期 延迟重试）：写入阶段撞上限流/暂时性故障时不算失败。
+            // 记录必须离开 running（否则会挡住下一次定时备份），但绝不能写 failed，
+            // 于是记 deferred，并在 error_message 里带上自动重试时间。
+            // 修改点（状态显示不一致修复）：原先是 skipped —— 与「无需备份」共用一个值，
+            // 前端只能靠猜，任务列表显示「跳过」而仓库管理显示成失败。
+            await codeRepo.updateBackup(backupId, {
+              status: refDeferral ? "deferred" : "failed",
+              error_message: refDeferral
+                ? `本次未能完成，已安排在 ${describeRetryAt(refDeferral.retryAtMs)} 自动重试：${message}`
+                : message,
+              finished_at: finishedAt,
+            });
+
+            return {
+              status: refDeferral ? "deferred" : "failed",
+              doneCount,
+              totalTargets: mounts.length,
+              primaryStoragePath: null,
+              primarySizeBytes: null,
+              note: backupWarning,
+              warning: refDeferral ? null : backupWarning,
+              message,
+            } as FinalizeRefResult;
           }
 
-          const paths = planBackupPaths({
-            mountPath: mount.mount_path,
-            pathPrefix: repoRow.target_path_prefix,
-            provider,
-            repoIdentifier,
-            commitSha: version.commitSha,
-            ref: version.ref,
-          });
+          // 主路径：优先用本次写入的；补写场景下回退到此前已成功的目标
+          const primaryRow = allTargets.find((t: any) => t.status === "success" && t.storage_path);
+          const primaryStoragePath = runPrimary?.storagePath ?? primaryRow?.storage_path ?? null;
+          const primaryManifestPath = runPrimary ? runPrimary.manifestPath : (primaryRow?.manifest_path ?? null);
+          const primarySizeBytes = runPrimary ? runPrimary.sizeBytes : (primaryRow?.size_bytes ?? null);
 
-          currentTarget = { name: mount.name ?? null, mountPath: mount.mount_path ?? null };
-          const targetSummary = summaryOf(mount.id);
-          if (targetSummary) targetSummary.status = "processing";
+          // 修改点（多备份目标优化）：全部目标有副本 -> success；部分 -> partial
+          const status: "success" | "partial" = allDone ? "success" : "partial";
 
-          // 修改点（任务卡住排查）：传输护栏必须在发起请求前创建，
-          // 它的 signal 要交给 provider，才能在停滞时把整个响应中止掉
-          // 修改点（大仓库备份超 CPU 限制）：停滞阈值与体积上限都取自本次作业的预算
-          const guard = createTransferGuard({
-            stallTimeoutMs: budget.stallTimeoutMs,
-            maxBytes: budget.maxArchiveBytes,
-            onProgress: (bytes) => {
-              // 只补 bytesTransferred 这一个字段，避免与 report() 的完整快照互相覆盖；
-              // 失败不影响传输（updateProgress 在 Workers 下是异步 D1 写）
-              Promise.resolve(
-                context.updateProgress(job.jobId, { bytesTransferred: bytesTransferred + bytes }),
-              ).catch(() => {});
-            },
-          });
-
+          // 修改点（版本保留优化）：备份成功后清理超出保留数量的最旧版本
+          let pruneMessage = "";
           try {
-            // createDirectory 对已存在目录是幂等的（返回 alreadyExists）
-            // 修改点（备份目录按分支分层）：直接建「本次备份的专属目录」，
-            // 其上层（仓库目录 / 分支目录）由驱动的多级创建一并带出；
-            // 创建失败不回滚：归档与 manifest 都要落在这个目录里，后续 uploadFile 会再兜一次
-            try {
-              await fileSystem.createDirectory(paths.backupDirPath, job.userId, job.userType);
-            } catch (dirError: any) {
-              // 部分对象存储没有真实目录概念，创建失败不影响后续写入
-              console.warn(
-                `[RepoBackupTaskHandler] 创建目录失败（继续尝试上传）: ${paths.backupDirPath}`,
-                dirError?.message || dirError,
-              );
-            }
-
-            console.log(
-              `[RepoBackupTaskHandler] 开始备份 ${repoIdentifier}@${version.ref || ""} ${version.version} -> ${paths.archivePath}`,
-            );
-
-            currentStage = "transferring";
+            currentStage = "pruning";
             await report(processed);
-
-            const archive = await providerInstance.openSourceArchive({
-              repoIdentifier,
-              refType: version.refType,
-              ref: version.ref,
-              commitSha: version.commitSha,
-              signal: guard.signal,
-            });
-
-            // 拿到响应之后才启动停滞看门狗：
-            // 「等响应头」那一段由 provider 自己的超时 + 重试负责，两者职责不重叠，
-            // 报错信息也才对得上（超时 vs 传输停滞）
-            guard.arm();
-            const countedStream = guard.wrap(archive.stream);
-            const counter = guard.counter;
-
-            let uploadResult: any;
             /**
-             * 只掐「真的在搬字节」这一段（修改点：大仓库备份 CPU/耗时优化）
+             * 修改点（大仓库备份超 CPU 限制）：软截止已过就不清理了
              *
-             * 不从 openSourceArchive 开始计时：那一段可能包含限流退避与重试等待，
-             * 把它算进吞吐会让速度被严重低估，于是后面的目标被过度推迟。
-             * 建目录、写 manifest 这些固定开销同样不计入，由 fitsBeforeDeadline
-             * 的余量系数一并兜住。
-             */
-            const transferStartedMs = Date.now();
-            try {
-              uploadResult = await fileSystem.uploadFile(
-                paths.archivePath,
-                countedStream,
-                job.userId,
-                job.userType,
-                {
-                  filename: paths.archiveFileName,
-                  contentType: archive.contentType || "application/gzip",
-                  // GitHub tarball 通常是 chunked 无 content-length，此时传 0 表示未知，
-                  // 上游的配额守卫会跳过 best-effort 判断，S3 走 lib-storage 自动分片
-                  contentLength: archive.contentLength || 0,
-                  /**
-                   * 修改点（大仓库备份 CPU/耗时优化）：把分片上传并发提到 2
-                   *
-                   * S3 驱动默认在 Workers 下用 queueSize = 1，而 lib-storage 的
-                   * queueSize 同时是**消费源流的并发度** —— 只有 1 个消费者时它必须
-                   * 「读满一片 → 传完这一片 → 再读下一片」，下载与上传完全串行，
-                   * 单趟 wall-clock ≈ 下载 + 上传。备份搬的是几百 MB 的归档，
-                   * 串行会让一次运行能完成的目标数直接腰斩。
-                   * 该字段只有 S3 驱动认（其余驱动忽略多余的 option），
-                   * 0 表示不覆盖，此时行为与改动前完全一致。
-                   */
-                  uploadTuning:
-                    budget.uploadQueueSize > 0 ? { queueSize: budget.uploadQueueSize } : undefined,
-                },
-              );
-            } catch (uploadError: any) {
-              /**
-               * 体积超限优先判（修改点：大仓库备份超 CPU 限制）
-               *
-               * 护栏掐断时底层报的是 stream/abort 错误，必须换成真实原因，
-               * 否则管理员看到的是一句莫名其妙的 "aborted"。
-               * 这里抛**永久性**错误：这个仓库在当前环境下就是传不动，
-               * 安排重试只会每轮都白拉一遍几 GB 的流量。
-               */
-              if (guard.isOversize()) {
-                throw new ArchiveTooLargeError(
-                  `归档体积超过单次备份上限 ${formatBytes(budget.maxArchiveBytes)}` +
-                    `（传输到 ${formatBytes(counter.value)} 时中止）。` +
-                    `如确需备份该仓库，请调大 REPO_BACKUP_MAX_ARCHIVE_MB，或改用 Docker/Node 部署`,
-                );
-              }
-              // 看门狗触发时底层报的是 abort/stream 错误，换成人看得懂的原因
-              // 修改点（大仓库备份超 CPU 限制）：这里原先抛的是普通 Error，
-              // 会被 classifyRepoBackupError 判成永久性错误 —— 与本文件
-              // 「传输停滞属于暂时性错误」的设计说明不符，连接抽风被记成了备份失败。
-              // 改抛 TransientError，让它真正落进「可延迟重试」类别。
-              if (guard.isStalled()) {
-                throw new TransientError(
-                  `传输停滞超过 ${Math.round(budget.stallTimeoutMs / 1000)} 秒` +
-                    `（已传 ${formatBytes(counter.value)}）已中止，可能是 GitHub 或加速代理无响应`,
-                );
-              }
-              throw uploadError;
-            } finally {
-              guard.dispose();
-              // 修改点（大仓库备份超 CPU 限制）：成功与否都要计入本次作业的流量预算 ——
-              // 失败的那一趟同样花掉了 CPU 与带宽，不记的话预算就形同虚设
-              budgetBytes += counter.value;
-            }
-
-            const sizeBytes = counter.value > 0 ? counter.value : null;
-            totalBytes += sizeBytes ?? 0;
-            bytesTransferred += counter.value;
-
-            /**
-             * 记一条吞吐样本（修改点：大仓库备份 CPU/耗时优化）
-             *
-             * 只在传输**成功走完**时记：失败那趟的字节数是半截的、耗时却可能很长
-             * （停滞要等满看门狗阈值），拿它算速度会把后续目标全判成「来不及」。
-             * 失败趟的流量仍然计入 budgetBytes（在上面的 finally 里），两者口径不同：
-             * 预算问「花掉了多少」，吞吐问「正常情况下多快」。
-             */
-            const transferMs = Date.now() - transferStartedMs;
-            if (counter.value > 0 && transferMs > 0) {
-              observedBytes += counter.value;
-              observedMs += transferMs;
-              lastArchiveBytes = counter.value;
-            }
-
-            // manifest 是归档旁的便利副本，元信息在数据库记录中已完整保存。
-            // 这里不因它失败而判定该目标失败，但必须把问题暴露给管理员。
-            let manifestPath: string | null = null;
-            let manifestWarning: string | null = null;
-            try {
-              currentStage = "manifest";
-              const manifest = this.buildManifest({
-                provider,
-                repoIdentifier,
-                repoRow,
-                version,
-                backupId,
-                jobId: job.jobId,
-                archive: {
-                  path: uploadResult?.storagePath || paths.archivePath,
-                  fileName: paths.archiveFileName,
-                  contentType: archive.contentType || "application/gzip",
-                  sizeBytes,
-                },
-                mount,
-              });
-              const manifestBytes = new TextEncoder().encode(JSON.stringify(manifest, null, 2));
-              await fileSystem.uploadFile(paths.manifestPath, manifestBytes, job.userId, job.userType, {
-                filename: paths.manifestFileName,
-                contentType: "application/json",
-                contentLength: manifestBytes.byteLength,
-              });
-              manifestPath = paths.manifestPath;
-            } catch (manifestError: any) {
-              manifestWarning = `manifest 写入失败: ${manifestError?.message || String(manifestError)}`;
-              console.warn(`[RepoBackupTaskHandler] ${manifestWarning}`);
-            }
-
-            const storagePath = uploadResult?.storagePath || paths.archivePath;
-
-            // 修改点（多备份目标优化）：每个目标单独记录结果
-            await codeRepo.upsertBackupTarget({
-              id: generateId("bkt"),
-              backup_id: backupId,
-              mount_id: mount.id,
-              mount_path: mount.mount_path,
-              storage_path: storagePath,
-              manifest_path: manifestPath,
-              size_bytes: sizeBytes,
-              status: "success",
-              error_message: manifestWarning,
-            });
-
-            successTargets += 1;
-            if (targetSummary) {
-              targetSummary.status = "success";
-              targetSummary.sizeBytes = sizeBytes;
-              targetSummary.error = manifestWarning;
-            }
-            if (!primaryStoragePath) {
-              primaryStoragePath = storagePath;
-              primaryManifestPath = manifestPath;
-              primarySizeBytes = sizeBytes;
-            }
-            if (manifestWarning) targetErrors.push(`${mount.name || mount.mount_path}: ${manifestWarning}`);
-
-            console.log(`[RepoBackupTaskHandler] 目标写入完成: ${storagePath}`);
-
-            /**
-             * 收掉同分支同 sha 的重复目录（修改点：同分支同 sha 只保留一个目录）
-             *
-             * 为什么放在「这个目标刚写完」而不是统一收尾：
-             * - 分支目录路径带挂载点前缀，本来就得逐挂载点扫一遍；
-             * - 写完就扫，哪怕后面的目标撞上预算用尽、或整个 isolate 被 CPU 限制杀掉，
-             *   已经写完的这个挂载点也已经是干净的了。
-             *
-             * 保护名单（referencedDirs）在 upsertBackupTarget **之后**才查 ——
-             * 这样本次刚写的目录必然在名单里，绝不会被自己的去重删掉。
-             *
-             * 时间上限已过就不扫了：和旧版本清理同一个理由，它是一串网络往返，
-             * 在快撞上步骤超时的时候开这个头很可能半途被打断；而重复目录多留一轮毫无影响，
-             * 下一次该分支备份成功后照样会扫。
+             * 清理要逐个目标删文件删目录，是一串网络往返，在已经快撞上步骤超时的时候
+             * 开这个头很可能半途被打断 —— 而它不是必须现在做的事：
+             * 旧版本多留一轮毫无影响，下一次备份成功后照样会清。
              */
             if (deadlinePassed()) {
-              console.warn("[RepoBackupTaskHandler] 本次运行已达时间上限，跳过重复目录去重（下一轮继续）");
+              console.warn("[RepoBackupTaskHandler] 本次运行已达时间上限，跳过旧版本清理（下一轮继续）");
             } else {
-              try {
-                const referencedDirs = toReferencedDirs(await codeRepo.findReferencedPaths(repoRow.id));
-                await dedupeBackupDirs({
-                  fileSystem,
-                  refDirPath: paths.refDirPath,
-                  referencedDirs,
-                  userId: job.userId,
-                  userType: job.userType,
-                });
-              } catch (dedupeError: any) {
-                // 去重是收拾现场，失败绝不能改变备份结论（本目标已经写成功了）
-                console.warn(
-                  "[RepoBackupTaskHandler] 重复目录去重失败（不影响备份结论）:",
-                  dedupeError?.message || dedupeError,
-                );
+              const pruneSummary = await pruneOldVersions({
+                codeRepo,
+                fileSystem,
+                repositoryRow: repoRow,
+                userId: job.userId,
+                userType: job.userType,
+              });
+              pruneMessage = describePruneResult(pruneSummary);
+              if (pruneSummary.removedCount > 0) {
+                console.log(`[RepoBackupTaskHandler] ${pruneMessage}`);
+              }
+              for (const err of pruneSummary.errors) {
+                console.warn(`[RepoBackupTaskHandler] 版本清理提示: ${err}`);
               }
             }
-
-            await report(processed);
-          } catch (targetError: any) {
-            guard.dispose();
-            // 单个目标失败不影响其他目标；下次运行会自动补写
-            const message = String(targetError?.message || targetError || "未知错误");
-
-            // 修改点（第 2 期 错误分类）：先判断这个目标的失败是不是「限流 / 暂时性」。
-            // 是的话本轮不能以失败收尾——目标行记 deferred（而不是 failed），
-            // 并记下重试时间，由本轮收尾统一把延迟交给调度层。
-            // 修改点（状态显示不一致修复）：这里原先写 skipped，与「无需备份」混为一谈，
-            // 前端两个页面各自解读成「跳过」和「失败」。改用独立的 deferred。
-            const targetDeferral = noteDeferral(targetError);
-            if (targetDeferral && !refDeferral) refDeferral = targetDeferral;
-
-            targetErrors.push(
-              targetDeferral
-                ? `${mount.name || mount.mount_path}: 已延迟重试（${describeErrorKind(targetDeferral.kind)}）${message}`
-                : `${mount.name || mount.mount_path}: ${message}`,
-            );
-
-            if (targetSummary) {
-              targetSummary.status = targetDeferral ? "deferred" : "failed";
-              targetSummary.error = targetDeferral ? `已安排自动重试：${message}` : message;
-            }
-
-            await codeRepo
-              .upsertBackupTarget({
-                id: generateId("bkt"),
-                backup_id: backupId,
-                mount_id: mount.id,
-                mount_path: mount.mount_path,
-                status: targetDeferral ? "deferred" : "failed",
-                error_message: message,
-              })
-              .catch((e: any) =>
-                console.warn("[RepoBackupTaskHandler] 记录目标失败状态出错:", e?.message || e),
-              );
-
-            console.error(
-              `[RepoBackupTaskHandler] 目标写入${targetDeferral ? "被推迟" : "失败"} (${mount.name || mount.mount_path}):`,
-              message,
-            );
-            await report(processed);
+          } catch (pruneError: any) {
+            // 清理失败不影响本次备份结论
+            console.warn("[RepoBackupTaskHandler] 版本清理失败:", pruneError?.message || pruneError);
           }
-        }
 
-        currentTarget = { name: null, mountPath: null };
-        const finishedAt = nowIso();
+          // 修改点（大仓库备份超 CPU 限制）：budgetNote 进备份记录的 error_message
+          // （备份历史里能查到「这个版本还缺哪几个目标、为什么」），但不进 last_error
+          const backupNote = [backupWarning, budgetNote, pruneMessage].filter(Boolean).join("；") || null;
 
-        // 修改点（多备份目标优化）：按「该备份的全部目标行」重算状态，
-        // 而不是只看本次写入结果 —— 这样"上次部分失败、本次补写成功"能正确收敛为 success
-        const allTargets = await codeRepo.findTargetsByBackup(backupId);
-        const okMountIds = new Set(
-          allTargets.filter((t: any) => t.status === "success").map((t: any) => String(t.mount_id)),
-        );
-        const doneCount = mounts.filter((m) => okMountIds.has(String(m.id))).length;
-        const anyDone = doneCount > 0;
-        const allDone = doneCount === mounts.length;
-
-        const backupWarning = targetErrors.length > 0 ? targetErrors.join("；") : null;
-        // 修改点（大仓库备份超 CPU 限制）：「没轮到」的说明单独成句，不进 last_error
-        const budgetNote = budgetNotes.length > 0 ? budgetNotes.join("；") : null;
-
-        if (!anyDone) {
-          // 所有目标都没有副本
-          // 修改点（大仓库备份超 CPU 限制）：可能一个目标都没轮到（预算在本引用之前就见底），
-          // 此时 targetErrors 是空的，不能笼统地说「均写入失败」—— 那是在谎报故障
-          const message = backupWarning || budgetNote || "所有备份目标均写入失败";
-
-          // 修改点（第 2 期 延迟重试）：写入阶段撞上限流/暂时性故障时不算失败。
-          // 记录必须离开 running（否则会挡住下一次定时备份），但绝不能写 failed，
-          // 于是记 deferred，并在 error_message 里带上自动重试时间。
-          // 修改点（状态显示不一致修复）：原先是 skipped —— 与「无需备份」共用一个值，
-          // 前端只能靠猜，任务列表显示「跳过」而仓库管理显示成失败。
           await codeRepo.updateBackup(backupId, {
-            status: refDeferral ? "deferred" : "failed",
-            error_message: refDeferral
-              ? `本次未能完成，已安排在 ${describeRetryAt(refDeferral.retryAtMs as number)} 自动重试：${message}`
-              : message,
+            status,
+            storage_path: primaryStoragePath,
+            manifest_path: primaryManifestPath,
+            size_bytes: primarySizeBytes,
+            error_message: backupNote,
             finished_at: finishedAt,
           });
 
-          itemResult.status = refDeferral ? "skipped" : "failed";
-          if (refDeferral) {
-            itemResult.message = `已延迟重试（${describeErrorKind(refDeferral.kind)}，重试时间 ${describeRetryAt(refDeferral.retryAtMs as number)}）：${message}`;
-          } else {
-            itemResult.error = message;
-          }
-          // 修改点（状态显示不一致修复）：延迟重试不是失败，用统一词汇标出来，
-          // 任务详情才能把它显示成「已延迟重试」而不是笼统的「跳过」
-          itemResult.meta = {
-            ...(itemResult.meta || {}),
-            outcome: refDeferral ? REPO_OUTCOME.DEFERRED : REPO_OUTCOME.FAILED,
-            retryAt: refDeferral ? describeRetryAt(refDeferral.retryAtMs as number) : null,
-          };
-          itemResult.durationMs = Date.now() - refStartedMs;
-          outcomes.push({
-            ref: version.ref ?? trackRef ?? null,
-            status: refDeferral ? "deferred" : "failed",
-            error: refDeferral ? undefined : message,
+          await codeRepo.updateRepository(repoRow.id, {
+            last_backup_at: finishedAt,
+            last_known_commit_sha: resolvedVersion.commitSha,
+            // 修改点（状态显示不一致修复）：last_error 只承载**真正的失败原因**。
+            // partial 仍要带上警告（目标确实没写全），但整体成功时不再往里写东西 ——
+            // 前端只要看到这个字段非空就渲染成红色失败，往里写非失败说明会造成误读。
+            last_error: backupWarning,
           });
-          if (!refDeferral && !firstError) firstError = new Error(message);
-          processed += 1;
-          await report(processed);
-          continue;
-        }
 
-        // 主路径：优先用本次写入的；补写场景下回退到此前已成功的目标
-        if (!primaryStoragePath) {
-          const primaryRow = allTargets.find((t: any) => t.status === "success" && t.storage_path);
-          if (primaryRow) {
-            primaryStoragePath = primaryRow.storage_path;
-            primaryManifestPath = primaryRow.manifest_path ?? null;
-            primarySizeBytes = primaryRow.size_bytes ?? null;
-          }
-        }
-
-        // 修改点（多备份目标优化）：全部目标有副本 -> success；部分 -> partial
-        const status: "success" | "partial" = allDone ? "success" : "partial";
-
-        // 修改点（版本保留优化）：备份成功后清理超出保留数量的最旧版本
-        let pruneMessage = "";
-        try {
-          currentStage = "pruning";
-          await report(processed);
           /**
-           * 修改点（大仓库备份超 CPU 限制）：软截止已过就不清理了
+           * 修改点（第 4 期）：推进该引用的「已备份水位」
            *
-           * 清理要逐个目标删文件删目录，是一串网络往返，在已经快撞上步骤超时的时候
-           * 开这个头很可能半途被打断 —— 而它不是必须现在做的事：
-           * 旧版本多留一轮毫无影响，下一次备份成功后照样会清。
+           * 只在 allDone（全部目标都有副本）时推进，partial 时**故意不推进**：
+           * 水位一推进，下一轮检测就会判「无更新」而不创建备份任务，
+           * 那个写失败的目标就永远补不上了。保持水位落后，下一轮检测照旧判「有更新」，
+           * 备份任务跑起来后 prepare-ref 的去重逻辑会识别出「只缺某几个目标」并只补写它们
+           * —— 这正是既有的自愈路径，第 4 期不改它，只是别把它掐断。
            */
-          if (deadlinePassed()) {
-            console.warn("[RepoBackupTaskHandler] 本次运行已达时间上限，跳过旧版本清理（下一轮继续）");
-          } else {
-            const pruneSummary = await pruneOldVersions({
+          if (allDone) {
+            await advanceBackedUpWatermark(
               codeRepo,
-              fileSystem,
-              repositoryRow: repoRow,
-              userId: job.userId,
-              userType: job.userType,
-            });
-            pruneMessage = describePruneResult(pruneSummary);
-            if (pruneSummary.removedCount > 0) {
-              console.log(`[RepoBackupTaskHandler] ${pruneMessage}`);
-            }
-            for (const err of pruneSummary.errors) {
-              console.warn(`[RepoBackupTaskHandler] 版本清理提示: ${err}`);
-            }
+              repoRow.id,
+              trackingRefType,
+              // 修改点（P0 水位键错位）：这里原先传 `version.ref ?? trackRef ?? null`，
+              // 即 provider 解析出的具体 Tag —— release 模式跟踪「最新」时水位会被写到
+              // 一行新建的 ref='v9.9.9' 状态行上，真正的跟踪行 ref='' 永远拿不到水位，
+              // 于是每轮检测都判「有更新」→ 反复创建备份任务。改用跟踪键，并带上
+              // repoRow 让 advanceBackedUpWatermark 再做一次收敛兜底。
+              trackingRef,
+              resolvedVersion.commitSha,
+              { repoRow },
+            );
           }
-        } catch (pruneError: any) {
-          // 清理失败不影响本次备份结论
-          console.warn("[RepoBackupTaskHandler] 版本清理失败:", pruneError?.message || pruneError);
+
+          return {
+            status,
+            doneCount,
+            totalTargets: mounts.length,
+            primaryStoragePath,
+            primarySizeBytes,
+            note: backupNote,
+            warning: backupWarning,
+            message: null,
+          } as FinalizeRefResult;
+        },
+        (message) => ({
+          status: "failed",
+          doneCount: 0,
+          totalTargets: mounts.length,
+          primaryStoragePath: null,
+          primarySizeBytes: null,
+          note: null,
+          warning: `收尾步骤异常退出：${message}`,
+          message: `收尾步骤异常退出：${message}`,
+        }),
+      );
+
+      if (fin.status === "failed" || fin.status === "deferred") {
+        const message = fin.message || "所有备份目标均写入失败";
+        itemResult.status = fin.status === "deferred" ? "skipped" : "failed";
+        if (fin.status === "deferred" && refDeferral) {
+          itemResult.message = `已延迟重试（${describeErrorKind(refDeferral.kind)}，重试时间 ${describeRetryAt(refDeferral.retryAtMs)}）：${message}`;
+        } else {
+          itemResult.error = message;
         }
-
-        // 修改点（大仓库备份超 CPU 限制）：budgetNote 进备份记录的 error_message
-        // （备份历史里能查到「这个版本还缺哪几个目标、为什么」），但不进 last_error
-        const backupNote = [backupWarning, budgetNote, pruneMessage].filter(Boolean).join("；") || null;
-
-        await codeRepo.updateBackup(backupId, {
-          status,
-          storage_path: primaryStoragePath,
-          manifest_path: primaryManifestPath,
-          size_bytes: primarySizeBytes,
-          error_message: backupNote,
-          finished_at: finishedAt,
-        });
-
-        await codeRepo.updateRepository(repoRow.id, {
-          last_backup_at: finishedAt,
-          last_known_commit_sha: version.commitSha,
-          // 修改点（状态显示不一致修复）：last_error 只承载**真正的失败原因**。
-          // partial 仍要带上警告（目标确实没写全），但整体成功时不再往里写东西 ——
-          // 前端只要看到这个字段非空就渲染成红色失败，往里写非失败说明会造成误读。
-          last_error: backupWarning,
-        });
-
-        /**
-         * 修改点（第 4 期）：推进该引用的「已备份水位」
-         *
-         * 只在 allDone（全部目标都有副本）时推进，partial 时**故意不推进**：
-         * 水位一推进，下一轮检测就会判「无更新」而不创建备份任务，
-         * 那个写失败的目标就永远补不上了。保持水位落后，下一轮检测照旧判「有更新」，
-         * 备份任务跑起来后上面 3.2 的去重逻辑会识别出「只缺某几个目标」并只补写它们
-         * —— 这正是既有的自愈路径，第 4 期不改它，只是别把它掐断。
-         */
-        if (allDone) {
-          await advanceBackedUpWatermark(
-            codeRepo,
-            repoRow.id,
-            trackingRefType,
-            // 修改点（P0 水位键错位）：这里原先传 `version.ref ?? trackRef ?? null`，
-            // 即 provider 解析出的具体 Tag —— release 模式跟踪「最新」时水位会被写到
-            // 一行新建的 ref='v9.9.9' 状态行上，真正的跟踪行 ref='' 永远拿不到水位，
-            // 于是每轮检测都判「有更新」→ 反复创建备份任务。改用跟踪键，并带上
-            // repoRow 让 advanceBackedUpWatermark 再做一次收敛兜底。
-            trackingRef,
-            version.commitSha,
-            { repoRow },
-          );
-        }
-
-        // 部分目标成功时：备份记录记为 partial（历史里能看出哪些目标缺副本），
-        // 但任务条目仍记为 failed —— 用户要求"写入全部目标"，没写全就不算成功
-        //
-        // 修改点（大仓库备份超 CPU 限制）：没写全的原因要分开看 ——
-        // 真有目标写挂了（targetErrors 非空）才是 failed；
-        // 如果只是本次预算用尽、剩下的目标留到下一轮，那是「还没干完」而不是「干坏了」，
-        // 记 skipped。大仓库每轮都会走这条路，记成 failed 会让它永远显示红色。
-        itemResult.status = allDone ? "success" : targetErrors.length > 0 ? "failed" : "skipped";
-        itemResult.targetPath = primaryStoragePath || undefined;
-        itemResult.fileSize = primarySizeBytes ?? undefined;
-        itemResult.durationMs = Date.now() - refStartedMs;
-        if (backupNote) itemResult.message = backupNote;
-        // 同理：只有真失败才填 error（前端据此渲染红字），预算用尽的说明已在 message 里
-        if (!allDone && targetErrors.length > 0) itemResult.error = backupWarning || "部分目标写入失败";
-
-        /**
-         * 修改点（状态显示不一致修复）：统一结果词汇
-         *
-         * status 保持原样（failedCount 的统计口径不变，任务级结论也不变），
-         * 但把「结果」单独标出来给两个页面共用：partial 在仓库管理与备份历史里
-         * 都是「部分成功」（快照可用），任务详情也应该显示同一个词，而不是
-         * 一边说「部分成功」一边说「失败」。下方 error 文本仍会展示缺哪个目标。
-         */
+        // 修改点（状态显示不一致修复）：延迟重试不是失败，用统一词汇标出来，
+        // 任务详情才能把它显示成「已延迟重试」而不是笼统的「跳过」
         itemResult.meta = {
           ...(itemResult.meta || {}),
-          outcome: allDone ? REPO_OUTCOME.SUCCESS : REPO_OUTCOME.PARTIAL,
-          // 修改点（大仓库备份超 CPU 限制）：partial 且已安排续写时，把时间也给出来，
-          // 任务详情才能说清「剩下的目标什么时候补」
-          ...(refDeferral ? { retryAt: describeRetryAt(refDeferral.retryAtMs as number) } : {}),
+          outcome: fin.status === "deferred" ? REPO_OUTCOME.DEFERRED : REPO_OUTCOME.FAILED,
+          retryAt: fin.status === "deferred" && refDeferral ? describeRetryAt(refDeferral.retryAtMs) : null,
         };
-
+        itemResult.durationMs = Date.now() - refStartedMs;
         outcomes.push({
-          ref: version.ref ?? trackRef ?? null,
-          status,
-          error: backupWarning || undefined,
-          sizeBytes: primarySizeBytes,
-          primaryPath: primaryStoragePath,
+          ref: resolvedVersion.ref ?? trackRef ?? null,
+          status: fin.status === "deferred" ? "deferred" : "failed",
+          error: fin.status === "deferred" ? undefined : message,
         });
-
-        console.log(
-          `[RepoBackupTaskHandler] 备份完成: ${repoIdentifier}@${version.ref || ""} ${version.version}` +
-            `（本次写入 ${successTargets}/${missingMounts.length}，目标副本 ${doneCount}/${mounts.length}）`,
-        );
-      } catch (error: any) {
-        // 修改点（第 2 期 错误分类）：先排除「任务被取消」。
-        // 传输停滞看门狗触发的 abort 现在被归类为「暂时性错误」，如果任务其实已经
-        // 被取消，就不能按可重试处理，否则会安排一次没人想要的延迟重试。
-        const cancelled =
-          String(error?.message || "").toLowerCase() === "cancelled" ||
-          (await Promise.resolve(context.isCancelled(job.jobId)).catch(() => false));
-        const message = cancelled ? "备份已取消" : String(error?.message || error || "未知错误");
-
-        // 修改点（第 2 期 限流 = 延迟，不是失败）：
-        // 限流 / 超时 / 5xx 这类错误会自己好，既不该写进失败历史，也不该累计失败数，
-        // 只记下「最早可以重试的时间」，本轮结束后交给调度层安排延迟重试。
-        const deferral = cancelled ? null : noteDeferral(error);
-
-        if (deferral) {
-          const retryAtText = describeRetryAt(deferral.retryAtMs as number);
-
-          if (backupId) {
-            // 已经建好的记录不能留在 running（会永久挡住下一次定时备份），
-            // 但绝不能写 failed —— 记 deferred，表示「本次没备份，已安排重试」
-            // 修改点（状态显示不一致修复）：原先是 skipped，与「无需备份」共用同一个值
-            await codeRepo
-              .updateBackup(backupId, {
-                status: "deferred",
-                error_message: `本次未能完成，已安排在 ${retryAtText} 自动重试：${message}`,
-                finished_at: nowIso(),
-              })
-              .catch((e: any) =>
-                console.warn("[RepoBackupTaskHandler] 更新延迟记录失败:", e?.message || e),
-              );
-          }
-          // 修改点（备份历史缺记录）：解析版本阶段就延迟时，原先**一条记录都不写**
-          // （当时的理由是「写进备份历史只会污染它」—— 那是只有 failed/skipped 两种
-          // 取值时的取舍）。结果是任务列表里明明有「跳过」，点开该仓库的备份历史
-          // 却什么都没有，用户无法核对「这次到底有没有尝试过备份」。
-          // 现在 deferred 是一个独立且明确的非失败状态，补一条留痕才说得通：
-          // 它记录的是「这次尝试没有产生任何快照，已安排在 X 之后重试」。
-          if (!backupId) {
-            await codeRepo
-              .createBackup({
-                id: generateId("bk"),
-                repository_id: repoRow.id,
-                ref_type: trackMode === "branch" ? "branch" : "tag",
-                ref: trackRef ?? null,
-                // 占位 commit_sha：真 sha 要等解析成功才有，DTO 读取时会还原为 null
-                commit_sha: buildUnresolvedCommitSha(),
-                version: null,
-                status: "deferred",
-                job_id: job.jobId,
-                error_message: `本次未能完成，已安排在 ${retryAtText} 自动重试：${message}`,
-                started_at: new Date(refStartedMs).toISOString(),
-                finished_at: nowIso(),
-              })
-              .catch((e: any) =>
-                console.warn("[RepoBackupTaskHandler] 写入延迟留痕记录出错:", e?.message || e),
-              );
-          }
-
-          itemResult.status = "skipped";
-          itemResult.message = `已延迟重试（${describeErrorKind(deferral.kind)}，重试时间 ${retryAtText}）：${message}`;
-          itemResult.durationMs = Date.now() - refStartedMs;
-
-          // 修改点（状态显示不一致修复）：延迟重试不是失败，用统一词汇标出来
-          itemResult.meta = {
-            ...(itemResult.meta || {}),
-            outcome: REPO_OUTCOME.DEFERRED,
-            retryAt: retryAtText,
-          };
-
-          outcomes.push({ ref: trackRef ?? null, status: "deferred", error: undefined });
-
-          // 不写 last_error：限流不是这个仓库的问题，留给收尾统一写「已安排重试」的说明
-          console.warn(
-            `[RepoBackupTaskHandler] 备份被推迟: ${repoIdentifier}@${trackRef || ""} ${itemResult.message}`,
-          );
-        } else {
-          if (backupId) {
-            await codeRepo
-              .updateBackup(backupId, {
-                status: cancelled ? "skipped" : "failed",
-                error_message: message,
-                finished_at: nowIso(),
-              })
-              .catch((e: any) => console.warn("[RepoBackupTaskHandler] 更新备份记录失败:", e?.message || e));
-          } else {
-            // 修改点（历史记录需显示失败记录）：
-            // 解析版本阶段就失败时（限流、网络不通、分支不存在）原本一条记录都不会写，
-            // 备份历史里因此永远只看到成功的版本。这里补一条失败留痕，
-            // commit_sha 用占位值绕过 NOT NULL + 唯一索引，DTO 读取时会还原为 null。
-            await codeRepo
-              .createBackup({
-                id: generateId("bk"),
-                repository_id: repoRow.id,
-                ref_type: trackMode === "branch" ? "branch" : "tag",
-                ref: trackRef ?? null,
-                commit_sha: buildUnresolvedCommitSha(),
-                version: null,
-                status: cancelled ? "skipped" : "failed",
-                job_id: job.jobId,
-                error_message: message,
-                started_at: new Date(refStartedMs).toISOString(),
-                finished_at: nowIso(),
-              })
-              .catch((e: any) => console.warn("[RepoBackupTaskHandler] 写入失败留痕记录出错:", e?.message || e));
-          }
-
-          await codeRepo
-            .updateRepository(repoRow.id, { last_error: message })
-            .catch((e: any) => console.warn("[RepoBackupTaskHandler] 更新仓库状态失败:", e?.message || e));
-
-          itemResult.status = cancelled ? "skipped" : "failed";
-          itemResult.error = message;
-          itemResult.durationMs = Date.now() - refStartedMs;
-
-          // 修改点（状态显示不一致修复）：取消是「被阻止」，真错误才是「失败」
-          itemResult.meta = {
-            ...(itemResult.meta || {}),
-            outcome: cancelled ? REPO_OUTCOME.BLOCKED : REPO_OUTCOME.FAILED,
-          };
-
-          outcomes.push({
-            ref: trackRef ?? null,
-            status: cancelled ? "skipped" : "failed",
-            error: message,
-          });
-
-          if (!cancelled && !firstError) firstError = error;
-
-          console.error(`[RepoBackupTaskHandler] 备份失败: ${repoIdentifier}@${trackRef || ""}`, message);
+        if (fin.status === "failed" && !firstError) firstError = new Error(message);
+        processed += 1;
+        await report(processed);
+        if (runCancelled) {
+          console.log("[RepoBackupTaskHandler] 任务已取消，停止后续引用");
+          break;
         }
+        continue;
       }
+
+      const allDone = fin.status === "success";
+
+      // 部分目标成功时：备份记录记为 partial（历史里能看出哪些目标缺副本），
+      // 但任务条目仍记为 failed —— 用户要求"写入全部目标"，没写全就不算成功
+      //
+      // 修改点（大仓库备份超 CPU 限制）：没写全的原因要分开看 ——
+      // 真有目标写挂了（targetErrors 非空）才是 failed；
+      // 如果只是本次预算用尽、剩下的目标留到下一轮，那是「还没干完」而不是「干坏了」，
+      // 记 skipped。大仓库每轮都会走这条路，记成 failed 会让它永远显示红色。
+      itemResult.status = allDone ? "success" : targetErrors.length > 0 ? "failed" : "skipped";
+      itemResult.targetPath = fin.primaryStoragePath || undefined;
+      itemResult.fileSize = fin.primarySizeBytes ?? undefined;
+      itemResult.durationMs = Date.now() - refStartedMs;
+      if (fin.note) itemResult.message = fin.note;
+      // 同理：只有真失败才填 error（前端据此渲染红字），预算用尽的说明已在 message 里
+      if (!allDone && targetErrors.length > 0) itemResult.error = fin.warning || "部分目标写入失败";
+
+      /**
+       * 修改点（状态显示不一致修复）：统一结果词汇
+       *
+       * status 保持原样（failedCount 的统计口径不变，任务级结论也不变），
+       * 但把「结果」单独标出来给两个页面共用：partial 在仓库管理与备份历史里
+       * 都是「部分成功」（快照可用），任务详情也应该显示同一个词，而不是
+       * 一边说「部分成功」一边说「失败」。下方 error 文本仍会展示缺哪个目标。
+       */
+      itemResult.meta = {
+        ...(itemResult.meta || {}),
+        outcome: allDone ? REPO_OUTCOME.SUCCESS : REPO_OUTCOME.PARTIAL,
+        // 修改点（大仓库备份超 CPU 限制）：partial 且已安排续写时，把时间也给出来，
+        // 任务详情才能说清「剩下的目标什么时候补」
+        ...(refDeferral ? { retryAt: describeRetryAt(refDeferral.retryAtMs) } : {}),
+      };
+
+      outcomes.push({
+        ref: resolvedVersion.ref ?? trackRef ?? null,
+        status: fin.status,
+        error: fin.warning || undefined,
+        sizeBytes: fin.primarySizeBytes,
+        primaryPath: fin.primaryStoragePath,
+      });
+
+      console.log(
+        `[RepoBackupTaskHandler] 备份完成: ${repoIdentifier}@${resolvedVersion.ref || ""} ${resolvedVersion.version}` +
+          `（本次写入 ${successTargets}/${attemptedTargets}，目标副本 ${fin.doneCount}/${fin.totalTargets}）`,
+      );
 
       processed += 1;
       await report(processed);
 
-      if (await context.isCancelled(job.jobId)) {
+      if (runCancelled || (await context.isCancelled(job.jobId))) {
         console.log("[RepoBackupTaskHandler] 任务已取消，停止后续引用");
         break;
       }
     }
 
-    // ---------- 4. 延迟重试收尾（修改点：第 2 期 限流 = 延迟，不是失败）----------
+    // ---------- 5. 延迟重试收尾（修改点：第 2 期 限流 = 延迟，不是失败）----------
     //
     // 走到这里说明本轮至少有一处撞上了限流/暂时性故障，或者（修改点：大仓库备份超
     // CPU 限制）本次作业的预算用尽、还有引用 / 目标没轮到。此时：
     // - 不写任何失败记录（上面已经处理过）
     // - 把该仓库的备份计划提前到「最早可重试时间」，让调度层到点自动重跑，
     //   而不是白等一个完整周期（默认 6 小时）
-    // - 函数正常返回、不抛异常：这样 Workflows 的 execute-task 步骤不会被判定失败，
+    // - 函数正常返回、不抛异常：这样 Workflows 的步骤不会被判定失败，
     //   Node 侧的任务也不会被标 failed —— 下一次执行完全由调度器按 next_run_after 决定
     if (deferredRetryAtMs !== null) {
       const retryAtText = describeRetryAt(deferredRetryAtMs);
@@ -1641,9 +2111,15 @@ export class RepoBackupTaskHandler implements TaskHandler {
       // 往往已经备成了好几个引用 / 目标，那句话会把日志读成「这轮什么都没干」
       const note = `${kindText}，已安排在 ${retryAtText} 继续：${deferredMessage || ""}`;
 
+      // 修改点（阶段 2）：收进步骤 —— 这是一次 D1 写，放在步骤外会被重放重复执行。
       // 只前移、不后移，也不会碰 schedule_type / interval_sec / enabled 等其他字段；
       // 仓库未启用定时备份时返回 false，这种情况下只能由管理员手动重试
-      const moved = await deferRepositoryBackupSchedule(db, repoRow.id, retryAtText);
+      const moved = await runStepSafely<boolean>(
+        "defer-schedule",
+        META_STEP_CONFIG,
+        async () => await deferRepositoryBackupSchedule(db, repoRow.id, retryAtText),
+        () => false,
+      );
 
       /**
        * 修改点（状态显示不一致修复）：**不再**把这句话写进 code_repositories.last_error。

@@ -15,7 +15,7 @@ import { FileSystem } from "../storage/fs/FileSystem.js";
 import { ensureRepositoryFactory } from "../utils/repositories.js";
 import { DbTables } from "../constants/index.js";
 import { taskRegistry } from "../storage/fs/tasks/TaskRegistry.js";
-import type { ExecutionContext, InternalJob } from "../storage/fs/tasks/TaskHandler.js";
+import type { ExecutionContext, InternalJob, TaskStepOptions } from "../storage/fs/tasks/TaskHandler.js";
 import { TaskStatus } from "../storage/fs/tasks/types.js";
 import type { TaskStats } from "../storage/fs/tasks/types.js";
 
@@ -103,6 +103,23 @@ const EXECUTE_STEP_CONFIG_BY_TASK_TYPE: Record<string, typeof DEFAULT_EXECUTE_ST
 function resolveExecuteStepConfig(taskType: string) {
   return EXECUTE_STEP_CONFIG_BY_TASK_TYPE[taskType] ?? DEFAULT_EXECUTE_STEP_CONFIG;
 }
+
+/**
+ * 处理器自拆步骤时的默认步骤配置（修改点：阶段 2 拆分 Workflow 步骤）
+ *
+ * 只在处理器调 context.runStep 时没显式给配置的情况下生效。
+ * 取值刻意比 DEFAULT_EXECUTE_STEP_CONFIG 保守（retries.limit 1 而不是 3）：
+ * 拆出来的步骤粒度更细，「整体重跑一遍」的代价本来就该更低，
+ * 而重试放大正是阶段 1 刚处理掉的问题，不能在这里又放回来。
+ */
+const DEFAULT_SPLIT_STEP_CONFIG: Required<TaskStepOptions> = {
+  retries: {
+    limit: 1,
+    delay: 10000,
+    backoff: "exponential" as const,
+  },
+  timeout: 600000,
+};
 
 /**
  * 单行结构化诊断日志（修改点：阶段 1 补充必要诊断）
@@ -214,167 +231,142 @@ export class JobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams> {
      */
     const executeStepConfig = resolveExecuteStepConfig(taskType);
 
-    try {
-      await step.do(
-        'execute-task',
-        executeStepConfig,
-        async () => {
-        /**
-         * 修改点（阶段 1 补充必要诊断）：每次尝试各自计时
-         *
-         * 这个闭包会被**完整重跑**一遍（每次重试都是一次新的尝试），
-         * 所以计时必须放在闭包内部，放外面量到的是「首次尝试到现在」。
-         */
-        const attemptStartedAtMs = Date.now();
-        logJob("execute-task 尝试开始", {
-          jobId,
-          taskType,
-          invocation,
-          retryLimit: executeStepConfig.retries.limit,
-          attemptTimeoutMs: executeStepConfig.timeout,
-        });
+    const buildJob = (): InternalJob => ({
+      jobId,
+      taskType,
+      payload,
+      userId,
+      userType,
+      stats: {
+        totalItems: 0,
+        processedItems: 0,
+        successCount: 0,
+        failedCount: 0,
+        skippedCount: 0,
+      },
+      createdAt: new Date(),
+    });
 
-        try {
+    /**
+     * 两种驱动方式，按处理器声明二选一（修改点：阶段 2 拆分 Workflow 步骤）
+     *
+     * Workflows **不支持嵌套步骤**（step 只从 run() 的参数拿到，无法在 step.do 内部再开
+     * 一个 step），所以「处理器自己拆步骤」与「被 execute-task 整体包住」必须互斥：
+     * - 声明了 usesExecutionSteps 的处理器（目前只有 repo_backup）由 run() **顶层**驱动，
+     *   它自己用 context.runStep 把每个 ref × 目标登记成独立步骤，于是每个组合都拿到
+     *   一份独立的 CPU 与 subrequest 额度（文档 workflows/reference/limits/ 的
+     *   「Workflows (per step) — Wall time limit: Unlimited ... Individual steps are
+     *   subject to the configured CPU time limit」，以及脚注「A Workflow instance can run
+     *   forever, as long as **each step** does not take more than the CPU time limit」）。
+     * - 其余所有任务类型走下面的 else 分支，与改动前**逐字相同**，不受本次影响。
+     */
+    const usesExecutionSteps = (handler as any)?.usesExecutionSteps === true;
 
-          // 创建执行上下文
-          // 进度更新节流：避免高频写 D1 导致放大
-          // - Handler 积极地上报（例如每 N 个目录/每批 upsert）
-          let lastProgressWriteAtMs = 0;
-          let pendingProgressPatch: Partial<TaskStats> | null = null;
-
-          const context: ExecutionContext = {
-            isCancelled: async (jobId: string) => {
-              const row = await this.env.DB.prepare(`
-                SELECT status FROM ${DbTables.TASKS} WHERE task_id = ?
-              `).bind(jobId).first();
-              return row?.status === 'cancelled';
-            },
-
-            updateProgress: async (jobId: string, stats: Partial<TaskStats>) => {
-              const nowMs = Date.now();
-
-              // 合并到 pending（低成本，避免频繁读写 DB）
-              pendingProgressPatch = { ...(pendingProgressPatch || {}), ...(stats || {}) };
-
-              // 强制写入条件：关键统计变化（mount 级/结果级）
-              const forceWrite =
-                stats?.processedItems !== undefined ||
-                stats?.totalItems !== undefined ||
-                stats?.successCount !== undefined ||
-                stats?.failedCount !== undefined ||
-                stats?.skippedCount !== undefined;
-
-              // 时间节流：默认 2s 写一次（forceWrite 例外）
-              if (!forceWrite && nowMs - lastProgressWriteAtMs < 2000) {
-                return;
-              }
-              lastProgressWriteAtMs = nowMs;
-
-              const currentRow = await this.env.DB.prepare(`
-                SELECT stats FROM ${DbTables.TASKS} WHERE task_id = ?
-              `).bind(jobId).first();
-
-              if (!currentRow) {
-                console.error(`[JobWorkflow] 作业 ${jobId} 未找到,无法更新进度`);
-                return;
-              }
-
-              const currentStats = JSON.parse(currentRow.stats as string);
-              const updatedStats = {
-                ...currentStats,
-                ...(pendingProgressPatch || {}),
-                heartbeatAtMs: nowMs,
-              };
-              pendingProgressPatch = null;
-
-              await this.env.DB.prepare(`
-                UPDATE ${DbTables.TASKS}
-                SET stats = ?, updated_at = ?
-                WHERE task_id = ?
-              `).bind(
-                JSON.stringify(updatedStats),
-                Date.now(),
-                jobId
-              ).run();
-            },
-
-            getFileSystem: () => {
-              const repositoryFactory = ensureRepositoryFactory(this.env.DB);
-              const mountManager = new MountManager(
-                this.env.DB,
-                this.env.ENCRYPTION_SECRET,
-                repositoryFactory,
-                { env: this.env as any },
-              );
-              return new FileSystem(mountManager, this.env);
-            },
-
-            getEnv: () => this.env,
-          };
-
-          const job: InternalJob = {
-            jobId,
-            taskType,
-            payload,
-            userId,
-            userType,
-            stats: {
-              totalItems: 0,
-              processedItems: 0,
-              successCount: 0,
-              failedCount: 0,
-              skippedCount: 0,
-            },
-            createdAt: new Date(),
-          };
-
-          await handler.execute(job, context);
-
-          // 修改点（阶段 1 补充必要诊断）：wallMs 是 wall-clock，不是 CPU 时间
-          logJob("execute-task 尝试成功", {
-            jobId,
-            taskType,
-            invocation,
-            wallMs: Date.now() - attemptStartedAtMs,
-          });
-          return { success: true };
-        } catch (error: any) {
-          taskSuccess = false;
-          taskError = error;
-          logJob("execute-task 尝试失败", {
-            jobId,
-            taskType,
-            invocation,
-            wallMs: Date.now() - attemptStartedAtMs,
-            // handler 自己捕获业务异常并返回，所以走到这里多半是未预期的运行时错误
-            errorName: error?.name,
-            errorMessage: error?.message || String(error),
-          });
-          console.error(`[JobWorkflow] ✗ 任务 ${jobId} 执行失败:`, error);
-
-          return {
-            success: false,
-            error: error.message || String(error),
-          };
-        }
-        }
-      );
-    } catch (stepError: any) {
-      // 步骤超时 / 重试耗尽 / 运行时异常：记下原因，继续走最终化，绝不让任务停在 running
-      taskSuccess = false;
-      taskError = stepError instanceof Error ? stepError : new Error(String(stepError));
-      logJob("execute-task 步骤退出", {
+    if (usesExecutionSteps) {
+      const attemptStartedAtMs = Date.now();
+      logJob("顶层驱动开始", {
         jobId,
         taskType,
         invocation,
-        wallMs: Date.now() - runStartedAtMs,
-        errorName: stepError?.name,
-        errorMessage: stepError?.message || String(stepError),
+        mode: "processor-steps",
       });
-      console.error(
-        `[JobWorkflow] ✗ 任务 ${jobId} 的 execute-task 步骤异常退出（超时或重试耗尽）:`,
-        stepError
-      );
+
+      try {
+        await handler.execute(buildJob(), this.createExecutionContext(jobId, { step, invocation }));
+        logJob("顶层驱动成功", {
+          jobId,
+          taskType,
+          invocation,
+          wallMs: Date.now() - attemptStartedAtMs,
+        });
+      } catch (error: any) {
+        /**
+         * 这里兜住的是「处理器自己没兜住」的异常：某个 runStep 重试耗尽后抛出、
+         * 或处理器步骤之外的代码出错。与 else 分支一样，绝不让任务停在 running ——
+         * 下面的 finalize-task-record 照常执行。
+         */
+        taskSuccess = false;
+        taskError = error instanceof Error ? error : new Error(String(error));
+        logJob("顶层驱动失败", {
+          jobId,
+          taskType,
+          invocation,
+          wallMs: Date.now() - attemptStartedAtMs,
+          errorName: error?.name,
+          errorMessage: error?.message || String(error),
+        });
+        console.error(`[JobWorkflow] ✗ 任务 ${jobId} 顶层驱动异常退出:`, error);
+      }
+    } else {
+      try {
+        await step.do(
+          'execute-task',
+          executeStepConfig,
+          async () => {
+          /**
+           * 修改点（阶段 1 补充必要诊断）：每次尝试各自计时
+           *
+           * 这个闭包会被**完整重跑**一遍（每次重试都是一次新的尝试），
+           * 所以计时必须放在闭包内部，放外面量到的是「首次尝试到现在」。
+           */
+          const attemptStartedAtMs = Date.now();
+          logJob("execute-task 尝试开始", {
+            jobId,
+            taskType,
+            invocation,
+            retryLimit: executeStepConfig.retries.limit,
+            attemptTimeoutMs: executeStepConfig.timeout,
+          });
+
+          try {
+            await handler.execute(buildJob(), this.createExecutionContext(jobId, null));
+
+            // 修改点（阶段 1 补充必要诊断）：wallMs 是 wall-clock，不是 CPU 时间
+            logJob("execute-task 尝试成功", {
+              jobId,
+              taskType,
+              invocation,
+              wallMs: Date.now() - attemptStartedAtMs,
+            });
+            return { success: true };
+          } catch (error: any) {
+            taskSuccess = false;
+            taskError = error;
+            logJob("execute-task 尝试失败", {
+              jobId,
+              taskType,
+              invocation,
+              wallMs: Date.now() - attemptStartedAtMs,
+              // handler 自己捕获业务异常并返回，所以走到这里多半是未预期的运行时错误
+              errorName: error?.name,
+              errorMessage: error?.message || String(error),
+            });
+            console.error(`[JobWorkflow] ✗ 任务 ${jobId} 执行失败:`, error);
+
+            return {
+              success: false,
+              error: error.message || String(error),
+            };
+          }
+          }
+        );
+      } catch (stepError: any) {
+        // 步骤超时 / 重试耗尽 / 运行时异常：记下原因，继续走最终化，绝不让任务停在 running
+        taskSuccess = false;
+        taskError = stepError instanceof Error ? stepError : new Error(String(stepError));
+        logJob("execute-task 步骤退出", {
+          jobId,
+          taskType,
+          invocation,
+          wallMs: Date.now() - runStartedAtMs,
+          errorName: stepError?.name,
+          errorMessage: stepError?.message || String(stepError),
+        });
+        console.error(
+          `[JobWorkflow] ✗ 任务 ${jobId} 的 execute-task 步骤异常退出（超时或重试耗尽）:`,
+          stepError
+        );
+      }
     }
 
     // 最终化状态
@@ -462,5 +454,151 @@ export class JobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams> {
       ...finalStats,
       finishedAt: new Date().toISOString(),
     };
+  }
+
+  /**
+   * 构造任务执行上下文（修改点：阶段 2 拆分 Workflow 步骤）
+   *
+   * 原先这段代码内联在 execute-task 的闭包里。抽成方法是因为现在有两条驱动路径
+   * （见 run() 里的 usesExecutionSteps 分支），两边必须用**同一个**上下文实现，
+   * 否则「Node 与 Workers 行为一致」这件事就只能靠人去比对两份拷贝。
+   *
+   * @param jobId 作业 ID
+   * @param stepCtx 非空时额外挂上 runStep 能力（即允许处理器自己开步骤）；
+   *                传 null 则上下文与改动前**逐字相同**，不含 runStep
+   */
+  private createExecutionContext(
+    jobId: string,
+    stepCtx: { step: WorkflowStep; invocation: string } | null,
+  ): ExecutionContext {
+    // 进度更新节流：避免高频写 D1 导致放大
+    // - Handler 积极地上报（例如每 N 个目录/每批 upsert）
+    let lastProgressWriteAtMs = 0;
+    let pendingProgressPatch: Partial<TaskStats> | null = null;
+
+    const context: ExecutionContext = {
+      isCancelled: async (jobId: string) => {
+        const row = await this.env.DB.prepare(`
+          SELECT status FROM ${DbTables.TASKS} WHERE task_id = ?
+        `).bind(jobId).first();
+        return row?.status === 'cancelled';
+      },
+
+      updateProgress: async (jobId: string, stats: Partial<TaskStats>) => {
+        const nowMs = Date.now();
+
+        // 合并到 pending（低成本，避免频繁读写 DB）
+        pendingProgressPatch = { ...(pendingProgressPatch || {}), ...(stats || {}) };
+
+        // 强制写入条件：关键统计变化（mount 级/结果级）
+        const forceWrite =
+          stats?.processedItems !== undefined ||
+          stats?.totalItems !== undefined ||
+          stats?.successCount !== undefined ||
+          stats?.failedCount !== undefined ||
+          stats?.skippedCount !== undefined;
+
+        // 时间节流：默认 2s 写一次（forceWrite 例外）
+        if (!forceWrite && nowMs - lastProgressWriteAtMs < 2000) {
+          return;
+        }
+        lastProgressWriteAtMs = nowMs;
+
+        const currentRow = await this.env.DB.prepare(`
+          SELECT stats FROM ${DbTables.TASKS} WHERE task_id = ?
+        `).bind(jobId).first();
+
+        if (!currentRow) {
+          console.error(`[JobWorkflow] 作业 ${jobId} 未找到,无法更新进度`);
+          return;
+        }
+
+        const currentStats = JSON.parse(currentRow.stats as string);
+        const updatedStats = {
+          ...currentStats,
+          ...(pendingProgressPatch || {}),
+          heartbeatAtMs: nowMs,
+        };
+        pendingProgressPatch = null;
+
+        await this.env.DB.prepare(`
+          UPDATE ${DbTables.TASKS}
+          SET stats = ?, updated_at = ?
+          WHERE task_id = ?
+        `).bind(
+          JSON.stringify(updatedStats),
+          Date.now(),
+          jobId
+        ).run();
+      },
+
+      getFileSystem: () => {
+        const repositoryFactory = ensureRepositoryFactory(this.env.DB);
+        const mountManager = new MountManager(
+          this.env.DB,
+          this.env.ENCRYPTION_SECRET,
+          repositoryFactory,
+          { env: this.env as any },
+        );
+        return new FileSystem(mountManager, this.env);
+      },
+
+      getEnv: () => this.env,
+    };
+
+    if (stepCtx) {
+      /**
+       * 把处理器的一段工作登记成一个真正的 Workflow 步骤
+       *
+       * 日志刻意放在 step.do **外面**：文档明确说「logic outside of the steps may be
+       * duplicated」「a console.log() outside of workflow steps may cause the logs to
+       * print twice when the engine restarts」。这里正好利用这个性质 ——
+       * 同一个 step= 名字配着不同的 invocation= 重复出现，就说明 run() 发生了重放，
+       * 这是在不写任何 D1 的前提下能观测到重放次数的唯一办法（延续阶段 1 的诊断口径）。
+       */
+      context.runStep = async <T>(
+        name: string,
+        options: TaskStepOptions | undefined,
+        fn: () => Promise<T>,
+      ): Promise<T> => {
+        const config = {
+          retries: options?.retries ?? DEFAULT_SPLIT_STEP_CONFIG.retries,
+          timeout: options?.timeout ?? DEFAULT_SPLIT_STEP_CONFIG.timeout,
+        };
+        const startedAtMs = Date.now();
+
+        logJob("step 进入", {
+          jobId,
+          step: name,
+          invocation: stepCtx.invocation,
+          retryLimit: config.retries.limit,
+          attemptTimeoutMs: config.timeout,
+        });
+
+        try {
+          const result = (await stepCtx.step.do(name, config, fn as any)) as T;
+          logJob("step 完成", {
+            jobId,
+            step: name,
+            invocation: stepCtx.invocation,
+            wallMs: Date.now() - startedAtMs,
+          });
+          return result;
+        } catch (error: any) {
+          // 抛出去由处理器决定「这个组合算失败，其他组合继续」还是整体放弃
+          logJob("step 退出", {
+            jobId,
+            step: name,
+            invocation: stepCtx.invocation,
+            wallMs: Date.now() - startedAtMs,
+            errorName: error?.name,
+            errorMessage: error?.message || String(error),
+          });
+          throw error;
+        }
+      };
+    }
+
+    return context;
   }
 }
