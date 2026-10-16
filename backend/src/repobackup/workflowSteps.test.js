@@ -50,6 +50,8 @@ beforeEach(() => {
 
 const ENV = { ENCRYPTION_SECRET: "test-secret-for-workflow-steps" };
 const sha = (c) => c.repeat(40);
+/** 与下面 fetch 桩返回的归档字节数一致，供 S3 进度回调模拟上报（阶段 3） */
+const BYTES_PER_ARCHIVE = 8;
 
 /** 真实内存库，包成 D1 形状（与同目录其它用例一致） */
 function createTestDb() {
@@ -105,16 +107,16 @@ async function seedRepo(db, { id = "repo-1", refs = ["main"], mountIds = ["mount
 }
 
 /** 造备份目标挂载点 */
-async function seedMounts(db, ids) {
+async function seedMounts(db, ids, { storageType = "S3" } = {}) {
   const now = new Date().toISOString();
   for (const [i, id] of ids.entries()) {
     await db
       .prepare(
         `INSERT INTO storage_mounts
           (id, name, storage_type, mount_path, is_active, created_by, sort_order, created_at, updated_at)
-         VALUES (?, ?, 'S3', ?, 1, 'admin-1', ?, ?, ?)`,
+         VALUES (?, ?, ?, ?, 1, 'admin-1', ?, ?, ?)`,
       )
-      .bind(id, `目标${i + 1}`, `/backup${i + 1}`, i, now, now)
+      .bind(id, `目标${i + 1}`, storageType, `/backup${i + 1}`, i, now, now)
       .run();
   }
 }
@@ -180,7 +182,21 @@ async function runBackup({
       if (failUploadForMount && String(path).startsWith(failUploadForMount)) {
         throw new Error("存储配额不足");
       }
-      uploads.push({ path, kind: isArchive ? "archive" : "manifest", contentType: options?.contentType });
+      uploads.push({
+        path,
+        kind: isArchive ? "archive" : "manifest",
+        contentType: options?.contentType,
+        /**
+         * 修改点（阶段 3 S3 流式传输 CPU 开销）：记录调用方是否用 SDK 进度事件
+         * 替代了逐字节包装。非 S3 驱动收到的是包装过的流（getReader 仍是函数），
+         * S3 驱动收到的则是原始流 —— 两者在桩里长得一样，只能靠这个回调区分。
+         */
+        hasBytesProgress: typeof options?.onBytesProgress === "function",
+      });
+      // 模拟 S3 SDK 上报进度：真实路径下 loaded 是累计已传字节
+      if (typeof options?.onBytesProgress === "function") {
+        options.onBytesProgress(BYTES_PER_ARCHIVE, BYTES_PER_ARCHIVE);
+      }
       return { storagePath: path };
     },
   };
@@ -599,4 +615,42 @@ test("处理器声明了 usesExecutionSteps，编排层据此决定是否顶层�
   // 这个标志是 JobWorkflow 二选一分支的唯一依据：丢了它就会退回「整体包在
   // execute-task 里」，拆分等于没做，而且不会有任何报错 —— 必须锁住
   assert.equal(new RepoBackupTaskHandler().usesExecutionSteps, true);
+});
+
+// ==================== S3 进度事件路径（阶段 3） ====================
+
+test("S3 目标不再套逐字节包装：改由 SDK 进度回调喂护栏", async () => {
+  const db = createTestDb();
+  await setupSchema(db);
+  await seedMounts(db, ["mount-1"], { storageType: "S3" });
+  const repoRow = await seedRepo(db, { refs: ["main"], mountIds: ["mount-1"] });
+
+  const { uploads, thrown } = await runBackup({ db, repoRow, refs: [REFS_TWO[0]] });
+
+  assert.equal(thrown, null, `不应抛出，实际：${thrown && thrown.message}`);
+  const archives = archiveUploads(uploads);
+  assert.equal(archives.length, 1);
+  assert.equal(
+    archives[0].hasBytesProgress,
+    true,
+    "S3 目标必须拿到进度回调，否则护栏在 S3 路径上等于瞎的",
+  );
+});
+
+test("非 S3 驱动保留原有逐字节包装（卸载掉的只是 S3 的额外开销）", async () => {
+  const db = createTestDb();
+  await setupSchema(db);
+  await seedMounts(db, ["mount-1"], { storageType: "WEBDAV" });
+  const repoRow = await seedRepo(db, { refs: ["main"], mountIds: ["mount-1"] });
+
+  const { uploads, thrown } = await runBackup({ db, repoRow, refs: [REFS_TWO[0]] });
+
+  assert.equal(thrown, null, `不应抛出，实际：${thrown && thrown.message}`);
+  const archives = archiveUploads(uploads);
+  assert.equal(archives.length, 1);
+  assert.equal(
+    archives[0].hasBytesProgress,
+    false,
+    "WebDAV 没有可靠的进度事件，必须继续走 wrap()，否则停滞检测会失效",
+  );
 });

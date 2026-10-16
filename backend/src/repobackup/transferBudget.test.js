@@ -318,6 +318,77 @@ test("进度回调按节流上报，且回调抛错不影响传输", async () =>
   assert.ok(calls > 0, "大流量下必须有进度上报，否则前端分不清「在传」和「卡死」");
 });
 
+// ==================== 护栏：S3 SDK 进度事件路径（阶段 3） ====================
+
+test("observe() 按累计字节喂护栏：体积上限必须在没有 wrap() 的情况下照常生效", () => {
+  const maxBytes = 10 * MIB;
+  const guard = createTransferGuard({ stallTimeoutMs: 60 * 1000, maxBytes });
+
+  // S3 路径上根本不调 wrap()，counter 完全由 SDK 进度事件驱动
+  guard.observe(8 * MIB);
+  assert.equal(guard.isOversize(), false, "未越界前不能掐断");
+  assert.equal(guard.signal.aborted, false);
+
+  guard.observe(12 * MIB);
+  assert.equal(guard.isOversize(), true, "越过上限必须当场掐断，否则护栏在 S3 上是摆设");
+  assert.equal(guard.signal.aborted, true, "必须 abort 掉上游响应，不然连接还在吐数据");
+
+  guard.dispose();
+});
+
+test("observe() 对乱序/重复/倒退的事件做单调保护（不能漏掉体积上限判定）", () => {
+  const maxBytes = 10 * MIB;
+  const guard = createTransferGuard({ stallTimeoutMs: 60 * 1000, maxBytes });
+
+  guard.observe(6 * MIB);
+  // 多分片并发下事件可能乱序；倒退的旧值绝不能把计数写小
+  guard.observe(4 * MIB);
+  assert.equal(guard.counter.value, 6 * MIB, "倒退的事件必须被忽略");
+
+  // 重复上报同一个值也不应重复累加
+  guard.observe(6 * MIB);
+  assert.equal(guard.counter.value, 6 * MIB);
+
+  guard.observe(11 * MIB);
+  assert.equal(guard.isOversize(), true, "乱序之后上限判定仍必须触发");
+
+  guard.dispose();
+});
+
+test("observe() 刷新停滞时间戳：有进度就不能判停滞，dispose 后不再接受进度", async () => {
+  const guard = createTransferGuard({ stallTimeoutMs: 300 });
+  // arm() 必须显式调用：S3 分支不经过 wrap()，wrap() 里的自动 arm() 不会执行
+  guard.arm();
+
+  // 持续有进度，越过一个巡检周期也不该判停滞
+  const tick = setInterval(() => guard.observe(guard.counter.value + 1024), 200);
+  await new Promise((resolve) => setTimeout(resolve, 1600));
+  clearInterval(tick);
+
+  assert.equal(guard.isStalled(), false, "有进度却被判停滞，等于把正常传输误杀");
+  assert.equal(guard.isOversize(), false);
+
+  guard.dispose();
+  const frozen = guard.counter.value;
+  guard.observe(frozen + 999);
+  assert.equal(guard.counter.value, frozen, "dispose 之后不应再接受进度上报");
+});
+
+test("observe() 非法字节数不得污染计数（NaN/负数/null 都来不得）", () => {
+  const guard = createTransferGuard({ stallTimeoutMs: 60 * 1000, maxBytes: 10 * MIB });
+  guard.observe(4 * MIB);
+
+  guard.observe(NaN);
+  guard.observe(-1);
+  guard.observe(null);
+  guard.observe(undefined);
+  guard.observe("8");
+
+  assert.equal(guard.counter.value, 4 * MIB, "非法值必须被丢弃，否则上限判定会失效");
+  assert.equal(guard.isOversize(), false);
+  guard.dispose();
+});
+
 // ==================== 文本格式 ====================
 
 test("字节/时长文案可读（它们会直接出现在管理员看到的原因里）", () => {

@@ -465,6 +465,47 @@ export function createTransferGuard({
     }
   };
 
+  /**
+   * 用外部上报的累计字节数喂护栏（修改点：阶段 3 S3 流式传输 CPU 开销）
+   *
+   * 与 wrap() 做的是同一件事（计数 / 刷新停滞时间戳 / 体积上限 / 进度上报），
+   * 区别是不再经过逐字节的 TransformStream —— 由 S3 SDK 自己的进度事件驱动。
+   *
+   * 语义上有两点与 wrap() 不同，调用方必须知情：
+   * - bytes 是**累计已传字节**，不是增量（SDK 的 loaded 就是累计值），所以这里取
+   *   max 做单调保护，避免事件乱序 / 重复时把计数写小，进而漏掉体积上限判定。
+   * - 精度是「一个分片一次」：多分片时最后完成的那几个分片要等上传结束才计入，
+   *   所以体积上限**最多超冲 queueSize × partSize**。对一个 2GB 的默认上限无关紧要，
+   *   但这就是它比 wrap() 粗的地方，别当成等价的逐字节计数。
+   *
+   * 停滞检测的口径也随之改变，这是本次改动最需要知道的一处：
+   * - wrap() 时代：时间戳由**下载分片**刷新 —— 源不吐数据就算停滞。
+   *   shortcut: 现在改由**上传进度事件**刷新，所以「S3 写入很慢」也会被判成停滞。
+   *   在 6MB 分片 + 120s 阈值下，需要持续低于约 50KB/s 才会误杀，实际不会碰到；
+   *   若日后把分片调大或把 REPO_BACKUP_STALL_TIMEOUT_MS 调小，
+   *   应按「分片大小 / 阈值」重新核一遍这个下限，必要时改成双时间戳
+   *   （分别记「最后一次读到数据」和「最后一次传完分片」）。
+   * - 反过来「源断了但分片还在传」这一小段仍会被正确覆盖：在途分片传完时
+   *   事件照发，之后不再有事件，最多滞后 stallTimeoutMs 就会判定停滞。
+   */
+  const observe = (bytes: number): void => {
+    // 显式判类型：字符串等可隐式转成数字的值会在下面的比较里产生意外结果
+    if (disposed || typeof bytes !== "number" || !Number.isFinite(bytes) || bytes <= counter.value) return;
+    const nowMs = Date.now();
+    counter.value = bytes;
+    // 收到进度同样说明链路还活着，与 wrap() 里刷新时间戳的作用一致
+    lastChunkAtMs = nowMs;
+
+    if (maxBytes > 0 && counter.value > maxBytes) {
+      oversize = true;
+      abortQuietly();
+      dispose();
+      return;
+    }
+
+    flushProgress(nowMs);
+  };
+
   /** 套在归档 body 外层：边转发边计数、刷新停滞时间戳、上报进度、拦住超大归档 */
   const wrap = (stream: ReadableStream): ReadableStream => {
     arm();
@@ -516,6 +557,8 @@ export function createTransferGuard({
     arm,
     dispose,
     wrap,
+    /** 修改点（阶段 3 S3 流式传输 CPU 开销）：供 S3 SDK 进度事件直接喂护栏 */
+    observe,
     isStalled: () => stalled,
     /** 是否因为超过体积上限而被掐断（修改点：大仓库备份超 CPU 限制） */
     isOversize: () => oversize,
@@ -1540,8 +1583,40 @@ export class RepoBackupTaskHandler implements TaskHandler {
               // 拿到响应之后才启动停滞看门狗：
               // 「等响应头」那一段由 provider 自己的超时 + 重试负责，两者职责不重叠，
               // 报错信息也才对得上（超时 vs 传输停滞）
+              /**
+               * 修改点（阶段 3 S3 流式传输 CPU 开销）：S3 目标不再套逐字节 TransformStream
+               *
+               * 原先无论哪个驱动都在归档流外面包一层 wrap()，它的 transform 每个 chunk
+               * 都要跑一次 Date.now() + 字节计数 + 上限判定 + enqueue。354MB 的归档在
+               * 64KB 级别分块下是几千次调用，这些 CPU 全部计入会把 isolate 杀掉的那条配额。
+               *
+               * 而 S3 路径上，lib-storage **本来就在发** httpUploadProgress 事件
+               * （已核实 dist-cjs/index.js:395-400 无条件 __notifyProgress，单次 Put
+               * 分支在 index.js:297 补发一次），读它不产生任何额外开销。于是这里改为:
+               * - S3 且拿到进度回调 → 上游驱动直接转发 SDK 事件喂 guard.observe()，
+               *   归档流原样交给 uploadFile，省掉整层包装；
+               * - 其余情况（WebDAV 等其他驱动、或没拿到回调）→ 一律回落到 wrap()，
+               *   行为与改动前完全一致。
+               *
+               * 停滞检测仍然是可靠的：guard.arm() 启动的巡检定时器照常跑，
+               * observe() 会刷新它的时间戳。S3 上「收不到进度」只可能来自真实原因
+               * （分片没传完 / 流没吐数据），不存在静默漏判。
+               */
+              const usesS3Progress = mount.storage_type === "S3";
+              if (usesS3Progress) {
+                console.log(
+                  `[RepoBackupTaskHandler] ${label} 为 S3 目标，改用 SDK 进度事件做护栏（跳过逐字节包装）`,
+                );
+              }
+              /**
+               * 看门狗必须显式启动（修改点：阶段 3 S3 流式传输 CPU 开销）
+               *
+               * wrap() 内部会自己 arm() 一次，但 S3 分支根本不调 wrap() ——
+               * 少这一句巡检定时器就永远不会建起来，停滞检测在这条路径上直接失效。
+               * arm() 是幂等的，两边都调不会多出第二个定时器。
+               */
               guard.arm();
-              const countedStream = guard.wrap(archive.stream);
+              const countedStream = usesS3Progress ? archive.stream : guard.wrap(archive.stream);
               const counter = guard.counter;
 
               let uploadResult: any;
@@ -1579,6 +1654,17 @@ export class RepoBackupTaskHandler implements TaskHandler {
                      */
                     uploadTuning:
                       budget.uploadQueueSize > 0 ? { queueSize: budget.uploadQueueSize } : undefined,
+                    /**
+                     * 修改点（阶段 3 S3 流式传输 CPU 开销）：用 SDK 进度事件替代逐字节包装
+                     *
+                     * 只有 S3 目标才传；其余驱动收到这个多余 option 也会忽略，
+                     * 但它们走的是 wrap() 路径，本来就不依赖它。
+                     * loaded 是累计已传字节（已完成分片之和），observe() 内部做了单调保护，
+                     * 乱序或重复事件不会把计数写小、进而漏掉体积上限判定。
+                     */
+                    onBytesProgress: usesS3Progress
+                      ? (loaded: number) => guard.observe(loaded)
+                      : undefined,
                   },
                 );
               } catch (uploadError: any) {

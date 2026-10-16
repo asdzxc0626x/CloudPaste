@@ -70,10 +70,17 @@ export class S3UploadOperations {
    *        可以把 queueSize 提到 2 让「读下一片」和「传当前片」重叠 ——
    *        queueSize = 1 时 lib-storage 只有一个消费者，下载与上传完全串行。
    *        缺省/非法值一律回落到环境默认值，见 getEnvironmentOptimizedUploadConfig
+   * @param {(loaded: number, total: number) => void} [options.onBytesProgress] 可选进度回调
+   *        （修改点：阶段 3 S3 流式传输 CPU 开销）直接把 lib-storage 已有的
+   *        httpUploadProgress 事件转给调用方，让调用方能靠它做停滞检测与体积上限，
+   *        从而不必在流上再套一层逐字节 TransformStream。
+   *        loaded 是**累计已传字节**（已完成分片之和），不是增量，且**不保证**中间事件
+   *        能反映在途分片 —— 多分片时进度比实际读取滞后最多 queueSize × partSize。
+   *        调用方必须把「进度不动」与「传输停滞」区分清楚。
    * @returns {Promise<Object>} 上传结果
    */
   async uploadStream(s3SubPath, stream, options = {}) {
-    const { mount, db, filename, contentType, contentLength, uploadTuning } = options;
+    const { mount, db, filename, contentType, contentLength, uploadTuning, onBytesProgress } = options;
 
     return handleFsError(
       async () => {
@@ -176,6 +183,23 @@ export class S3UploadOperations {
               `[StorageUpload] type=S3 mode=流式分片 status=进度 已传=${progressMB}MB 总=${totalMB}MB 进度=${percentage}% 已完成分片=${maxPartSeen} 路径=${finalS3Path}`
             );
             lastProgressLog = loaded;
+          }
+
+          /**
+           * 修改点（阶段 3 S3 流式传输 CPU 开销）：把已有事件转给调用方
+           *
+           * 放在这里而不是调用方自己挂：Upload 实例只存在于本方法内部，
+           * 调用方拿不到它；而这里本来就为日志与 UploadProgressTracker 挂了监听，
+           * 多转一次是零额外开销（不多读流、不多发请求）。
+           *
+           * 不做节流：节流是调用方的事（护栏自己按 1.5s / 8MB 控制上报频率），
+           * 这里再截一道只会让调用方拿到更少的信息，反而更难判断「是不是卡住了」。
+           * 回调抛错一律吞掉 —— 上传绝不能被进度消费方的 bug 弄失败。
+           */
+          if (typeof onBytesProgress === "function") {
+            try {
+              onBytesProgress(loaded, total);
+            } catch {}
           }
 
           try {
