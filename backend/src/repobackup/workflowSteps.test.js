@@ -139,6 +139,7 @@ async function runBackup({
   throwOnStep = new Set(),
   retryOnceStep = new Set(),
   splitSteps = true,
+  env = ENV,
   failUploadForMount = null,
   jobId = "backup-job-1",
 }) {
@@ -186,6 +187,7 @@ async function runBackup({
         path,
         kind: isArchive ? "archive" : "manifest",
         contentType: options?.contentType,
+        uploadTuning: options?.uploadTuning,
         /**
          * 修改点（阶段 3 S3 流式传输 CPU 开销）：记录调用方是否用 SDK 进度事件
          * 替代了逐字节包装。非 S3 驱动收到的是包装过的流（getReader 仍是函数），
@@ -205,7 +207,7 @@ async function runBackup({
     isCancelled: async () => false,
     updateProgress: async () => {},
     getFileSystem: () => fileSystem,
-    getEnv: () => ENV,
+    getEnv: () => env,
   };
 
   if (splitSteps) {
@@ -635,6 +637,7 @@ test("S3 目标不再套逐字节包装：改由 SDK 进度回调喂护栏", asy
     true,
     "S3 目标必须拿到进度回调，否则护栏在 S3 路径上等于瞎的",
   );
+  assert.equal(archives[0].uploadTuning, undefined);
 });
 
 test("非 S3 驱动保留原有逐字节包装（卸载掉的只是 S3 的额外开销）", async () => {
@@ -643,14 +646,30 @@ test("非 S3 驱动保留原有逐字节包装（卸载掉的只是 S3 的额外
   await seedMounts(db, ["mount-1"], { storageType: "WEBDAV" });
   const repoRow = await seedRepo(db, { refs: ["main"], mountIds: ["mount-1"] });
 
-  const { uploads, thrown } = await runBackup({ db, repoRow, refs: [REFS_TWO[0]] });
+  const { uploads, thrown } = await runBackup({ db, repoRow, refs: [REFS_TWO[0]], env: { ...ENV, REPO_BACKUP_UPLOAD_PART_MB: "16" } });
 
   assert.equal(thrown, null, `不应抛出，实际：${thrown && thrown.message}`);
   const archives = archiveUploads(uploads);
   assert.equal(archives.length, 1);
+  assert.equal(archives[0].uploadTuning, undefined);
   assert.equal(
     archives[0].hasBytesProgress,
     false,
     "WebDAV 没有可靠的进度事件，必须继续走 wrap()，否则停滞检测会失效",
   );
+});
+
+test("S3 备份配置透传 partSize，保留原有并发与进度回调，manifest 不受影响", async () => {
+  const db = createTestDb();
+  await setupSchema(db);
+  await seedMounts(db, ["mount-1"]);
+  const repoRow = await seedRepo(db);
+  const { uploads, thrown } = await runBackup({
+    db, repoRow, refs: [REFS_TWO[0]], env: { ...ENV, REPO_BACKUP_UPLOAD_PART_MB: "16" },
+  });
+  assert.equal(thrown, null);
+  const archive = archiveUploads(uploads)[0];
+  assert.deepEqual(archive.uploadTuning, { partSize: 16 * 1024 * 1024, queueSize: undefined });
+  assert.equal(archive.hasBytesProgress, true);
+  assert.ok(manifestUploads(uploads).every((upload) => upload.uploadTuning === undefined));
 });

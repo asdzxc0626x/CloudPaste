@@ -9,6 +9,8 @@
  *
  * 而在 Cloudflare Workers 下，这一整串动作跑在**同一个** Workflow 步骤里，
  * 也就是**一次 Worker 调用**，于是同时受三道限制。
+ * 以下为拆步骤前、6MiB 分片时的历史分析；阶段 4 默认 16MiB 只减少 S3 分片请求，
+ * 不能据此判断 CPU/内存是否达标，355MB 备份的真实 Workers 验收仍留待阶段 5。
  *
  * 修改点（阶段 1 核实执行环境）：以下数字已从官方文档核实（2026-10-12 抓取存档于
  * backend/.audit/docs/），**不要再按本文件此前写的「免费计划 30 秒」调参** ——
@@ -67,7 +69,7 @@
  *   它必须能中断，否则一个超大仓库会把整次调用拖死（见 maxArchiveBytes）。
  */
 
-import { isCloudflareWorkerEnvironment } from "../utils/environmentUtils.js";
+import { getEnvironmentOptimizedUploadConfig, isCloudflareWorkerEnvironment } from "../utils/environmentUtils.js";
 
 const MIB = 1024 * 1024;
 
@@ -82,6 +84,7 @@ export const REPO_BACKUP_BUDGET_ENV_KEYS = {
   STALL_TIMEOUT_MS: "REPO_BACKUP_STALL_TIMEOUT_MS",
   // 修改点（大仓库备份 CPU/耗时优化）：分片上传并发度
   UPLOAD_QUEUE_SIZE: "REPO_BACKUP_UPLOAD_QUEUE_SIZE",
+  UPLOAD_PART_MB: "REPO_BACKUP_UPLOAD_PART_MB",
 };
 
 /**
@@ -124,10 +127,10 @@ const WORKER_DEFAULTS = {
    * 这省的是 wall-clock 而不是 CPU，但对本模块的目标同样关键：
    * 软截止是按 wall-clock 算的，一趟省下的时间直接变成「这一轮还能多做一个目标」，
    * 轮次少了，每轮固定开销（解析计划、查目标、建目录、写 manifest）也跟着少。
-   * 代价是峰值内存从 partSize × 2 升到约 partSize × 3（6MB → 约 18MB），
-   * 在 Workers 的 128MB 下仍有大量余量。
+   * 分片大小另外按实际并发限制缓冲预算，不能仅凭并发值判断内存安全。
    */
   uploadQueueSize: 2,
+  uploadPartSize: 16 * MIB,
 };
 
 /**
@@ -143,6 +146,7 @@ const NODE_DEFAULTS = {
   stallTimeoutMs: 120 * 1000,
   // 0 = 不覆盖，沿用 getEnvironmentOptimizedUploadConfig 的 Node 默认值（本就是 4 并发）
   uploadQueueSize: 0,
+  uploadPartSize: 0,
 };
 
 /**
@@ -201,6 +205,7 @@ function resolveOptionalLimit(value, min, max, fallback) {
  *   maxArchiveBytes: number,
  *   stallTimeoutMs: number,
  *   uploadQueueSize: number,
+ *   uploadPartSize: number,
  *   environment: string,
  * }}
  */
@@ -213,6 +218,16 @@ export function resolveTransferBudget(env = null) {
   const rawMaxArchiveMb = readEnvNumber(env, REPO_BACKUP_BUDGET_ENV_KEYS.MAX_ARCHIVE_MB);
   const rawStall = readEnvNumber(env, REPO_BACKUP_BUDGET_ENV_KEYS.STALL_TIMEOUT_MS);
   const rawQueueSize = readEnvNumber(env, REPO_BACKUP_BUDGET_ENV_KEYS.UPLOAD_QUEUE_SIZE);
+  const rawPartMb = readEnvNumber(env, REPO_BACKUP_BUDGET_ENV_KEYS.UPLOAD_PART_MB);
+  const uploadQueueSize = resolveOptionalLimit(rawQueueSize, 1, 4, defaults.uploadQueueSize);
+  const effectiveQueueSize = getEnvironmentOptimizedUploadConfig({ queueSize: uploadQueueSize }).queueSize;
+  const maxPartMb = isWorker ? Math.floor(64 / (effectiveQueueSize + 2)) : 64;
+  const uploadPartMb = clampInt(
+    rawPartMb !== null && rawPartMb > 0 ? rawPartMb : null,
+    5,
+    maxPartMb,
+    Math.min(defaults.uploadPartSize / MIB, maxPartMb),
+  );
 
   // 截止时间下限 30 秒：比这还短等于一开工就收手，什么都备不成
   const softDeadlineMs = resolveOptionalLimit(rawDeadline, 30 * 1000, 60 * 60 * 1000, defaults.softDeadlineMs);
@@ -237,8 +252,8 @@ export function resolveTransferBudget(env = null) {
     // 停滞看门狗不允许关：0 会让「连接挂死」一直挂着，直到步骤超时才被动失败
     stallTimeoutMs: clampInt(rawStall, 5 * 1000, 30 * 60 * 1000, defaults.stallTimeoutMs),
     // 0 表示「不覆盖上传驱动的默认并发」；上限 4 是内存余量的保守取值
-    // （峰值约 partSize × (queueSize + 1)，6MB × 5 = 30MB）
-    uploadQueueSize: resolveOptionalLimit(rawQueueSize, 1, 4, defaults.uploadQueueSize),
+    uploadQueueSize,
+    uploadPartSize: uploadPartMb * MIB,
     environment: isWorker ? "Cloudflare Worker" : "Docker/Server",
   };
 }

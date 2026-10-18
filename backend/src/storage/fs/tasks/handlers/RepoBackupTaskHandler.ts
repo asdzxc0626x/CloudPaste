@@ -481,8 +481,9 @@ export function createTransferGuard({
    * 停滞检测的口径也随之改变，这是本次改动最需要知道的一处：
    * - wrap() 时代：时间戳由**下载分片**刷新 —— 源不吐数据就算停滞。
    *   shortcut: 现在改由**上传进度事件**刷新，所以「S3 写入很慢」也会被判成停滞。
-   *   在 6MB 分片 + 120s 阈值下，需要持续低于约 50KB/s 才会误杀，实际不会碰到；
-   *   若日后把分片调大或把 REPO_BACKUP_STALL_TIMEOUT_MS 调小，
+   *   阶段 4 默认 16MiB 分片 + 120s 阈值，仅单片上传就需约 137KiB/s 才能及时刷新，
+   *   首片还包括下载等待；这不是安全速率保证，慢速目标的误判风险需阶段 5 实测。
+   *   调大 REPO_BACKUP_UPLOAD_PART_MB 或调小 REPO_BACKUP_STALL_TIMEOUT_MS 时，
    *   应按「分片大小 / 阈值」重新核一遍这个下限，必要时改成双时间戳
    *   （分别记「最后一次读到数据」和「最后一次传完分片」）。
    * - 反过来「源断了但分片还在传」这一小段仍会被正确覆盖：在途分片传完时
@@ -1653,7 +1654,12 @@ export class RepoBackupTaskHandler implements TaskHandler {
                      * 0 表示不覆盖，此时行为与改动前完全一致。
                      */
                     uploadTuning:
-                      budget.uploadQueueSize > 0 ? { queueSize: budget.uploadQueueSize } : undefined,
+                      usesS3Progress && (budget.uploadQueueSize > 0 || budget.uploadPartSize > 0)
+                        ? {
+                            queueSize: budget.uploadQueueSize || undefined,
+                            partSize: budget.uploadPartSize || undefined,
+                          }
+                        : undefined,
                     /**
                      * 修改点（阶段 3 S3 流式传输 CPU 开销）：用 SDK 进度事件替代逐字节包装
                      *

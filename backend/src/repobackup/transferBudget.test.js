@@ -39,6 +39,7 @@ import {
   RETRY_DELAY_MS,
 } from "./errors.js";
 import { createTransferGuard } from "../storage/fs/tasks/handlers/RepoBackupTaskHandler.ts";
+import { getEnvironmentOptimizedUploadConfig } from "../utils/environmentUtils.js";
 
 const MIB = 1024 * 1024;
 
@@ -150,6 +151,50 @@ test("Workers 下把上传并发提到 2：queueSize=1 会让下载与上传完�
 
 test("Node 下不覆盖上传并发（那里驱动默认就是 4，没有串行问题）", () => {
   assert.equal(resolveTransferBudget({}).uploadQueueSize, 0);
+});
+
+test("备份分片默认仅覆盖 Workers 为 16MiB，Node 和普通 S3 上传保持原默认值", () => {
+  assert.equal(withWorkerEnv(() => resolveTransferBudget({})).uploadPartSize, 16 * MIB);
+  assert.equal(resolveTransferBudget({}).uploadPartSize, 0);
+  assert.equal(getEnvironmentOptimizedUploadConfig().partSize, 8 * MIB);
+  assert.equal(withWorkerEnv(() => getEnvironmentOptimizedUploadConfig()).partSize, 6 * MIB);
+});
+
+test("备份分片环境变量处理非法值、最小分片、取整及最大分片", () => {
+  for (const raw of ["", " ", "nope", "Infinity", "0", "-1"]) {
+    const env = { REPO_BACKUP_UPLOAD_PART_MB: raw };
+    assert.equal(withWorkerEnv(() => resolveTransferBudget(env)).uploadPartSize, 16 * MIB, raw);
+    assert.equal(resolveTransferBudget(env).uploadPartSize, 0, raw);
+  }
+  for (const [raw, expected] of [["1", 5], ["5", 5], ["12.9", 12], ["64", 64], ["999", 64]]) {
+    assert.equal(resolveTransferBudget({ REPO_BACKUP_UPLOAD_PART_MB: raw }).uploadPartSize, expected * MIB);
+  }
+});
+
+test("Workers 按实际 queueSize 夹取分片缓冲预算，不改变用户并发或其他预算", () => {
+  for (const queue of ["0", "1", "2", "3", "4", "99"]) {
+    withWorkerEnv(() => {
+      const env = { REPO_BACKUP_UPLOAD_QUEUE_SIZE: queue };
+      const original = resolveTransferBudget(env);
+      const budget = resolveTransferBudget({ ...env, REPO_BACKUP_UPLOAD_PART_MB: "64" });
+      const effective = getEnvironmentOptimizedUploadConfig({ queueSize: budget.uploadQueueSize, partSize: budget.uploadPartSize });
+      assert.equal(effective.partSize, budget.uploadPartSize);
+      assert.ok((effective.queueSize + 2) * effective.partSize <= 64 * MIB);
+      assert.deepEqual({ ...budget, uploadPartSize: original.uploadPartSize }, original);
+    });
+  }
+  assert.equal(withWorkerEnv(() => resolveTransferBudget({ REPO_BACKUP_UPLOAD_QUEUE_SIZE: "4" })).uploadPartSize, 10 * MIB);
+});
+
+test("Node 从 process.env 读取分片配置，显式 env 优先", (context) => {
+  const previous = process.env.REPO_BACKUP_UPLOAD_PART_MB;
+  context.after(() => {
+    if (previous === undefined) delete process.env.REPO_BACKUP_UPLOAD_PART_MB;
+    else process.env.REPO_BACKUP_UPLOAD_PART_MB = previous;
+  });
+  process.env.REPO_BACKUP_UPLOAD_PART_MB = "24";
+  assert.equal(resolveTransferBudget().uploadPartSize, 24 * MIB);
+  assert.equal(resolveTransferBudget({ REPO_BACKUP_UPLOAD_PART_MB: "12" }).uploadPartSize, 12 * MIB);
 });
 
 test("上传并发可被环境变量覆盖，且夹在内存吃得住的区间内", () => {

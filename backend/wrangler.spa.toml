@@ -47,12 +47,18 @@ ADMIN_TOKEN_EXPIRY_DAYS = "7"
 # - REPO_BACKUP_UPLOAD_QUEUE_SIZE：分片上传并发度（修改点：大仓库备份 CPU/耗时优化），Workers 默认 2
 #   lib-storage 的并发度同时决定「消费源流的并发度」：为 1 时下载与上传完全串行，
 #   单趟耗时是两者之和；为 2 时两段重叠，一次运行能完成的目标更多。
-#   代价是峰值内存约 分片大小 × (并发 + 1)（6MB × 3 ≈ 18MB）。0 = 用上传驱动的默认值（即改动前行为）
+#   0 = 用上传驱动的默认并发；阶段 4 不改变并发配置。
+# - REPO_BACKUP_UPLOAD_PART_MB：仅 S3 仓库备份，单位 MiB；Workers 默认 16，Node/Docker 保留驱动默认 8。
+#   正数向下取整并夹至 5–64；空值、非数字、非正数回落默认。Workers 额外夹至 floor(64 / (实际并发 + 2))。
+#   按在途分片、拼接缓冲及临时副本预留 64MiB 预算；并发 2 时最大 16，并发 4 时最大 10，不会降低并发。
+#   这不是内存硬保证：Workers 的 128MB 是 isolate 共享额度，大块源数据、SDK 和其他请求仍可能超限。
+#   SDK 进度按完成分片刷新：增大分片会增加体积护栏滞后及慢速上传停滞误判风险，留待阶段 5 实测。
 # REPO_BACKUP_SOFT_DEADLINE_MS = "420000"
 # REPO_BACKUP_JOB_BYTE_BUDGET_MB = "2048"
 # REPO_BACKUP_MAX_ARCHIVE_MB = "2048"
 # REPO_BACKUP_STALL_TIMEOUT_MS = "120000"
 # REPO_BACKUP_UPLOAD_QUEUE_SIZE = "2"
+# REPO_BACKUP_UPLOAD_PART_MB = "16"
 
 # 绑定D1数据库
 # 需要替换为实际的数据库ID

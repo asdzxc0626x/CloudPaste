@@ -261,6 +261,7 @@ export class JobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams> {
      * - 其余所有任务类型走下面的 else 分支，与改动前**逐字相同**，不受本次影响。
      */
     const usesExecutionSteps = (handler as any)?.usesExecutionSteps === true;
+    const executionContext = this.createExecutionContext(jobId, usesExecutionSteps ? { step, invocation } : null);
 
     if (usesExecutionSteps) {
       const attemptStartedAtMs = Date.now();
@@ -272,7 +273,7 @@ export class JobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams> {
       });
 
       try {
-        await handler.execute(buildJob(), this.createExecutionContext(jobId, { step, invocation }));
+        await handler.execute(buildJob(), executionContext);
         logJob("顶层驱动成功", {
           jobId,
           taskType,
@@ -319,7 +320,11 @@ export class JobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams> {
           });
 
           try {
-            await handler.execute(buildJob(), this.createExecutionContext(jobId, null));
+            try {
+              await handler.execute(buildJob(), executionContext);
+            } finally {
+              await executionContext.flushProgress();
+            }
 
             // 修改点（阶段 1 补充必要诊断）：wallMs 是 wall-clock，不是 CPU 时间
             logJob("execute-task 尝试成功", {
@@ -372,6 +377,7 @@ export class JobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams> {
     // 最终化状态
     await step.do('finalize-task-record', async () => {
       console.log(`[JobWorkflow] 最终化作业记录 ${jobId}`);
+      await executionContext.flushProgress();
 
       const finalRow = await this.env.DB.prepare(`
         SELECT status, stats FROM ${DbTables.TASKS} WHERE task_id = ?
@@ -463,6 +469,9 @@ export class JobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams> {
    * （见 run() 里的 usesExecutionSteps 分支），两边必须用**同一个**上下文实现，
    * 否则「Node 与 Workers 行为一致」这件事就只能靠人去比对两份拷贝。
    *
+   * 纯进度按 10 秒节流；结果变化、步骤退出和最终化立即刷新，保留 D1 心跳。
+   * 未满节流窗口的快照只在内存中，异常终止最多丢失该窗口内的展示进度。
+   *
    * @param jobId 作业 ID
    * @param stepCtx 非空时额外挂上 runStep 能力（即允许处理器自己开步骤）；
    *                传 null 则上下文与改动前**逐字相同**，不含 runStep
@@ -470,13 +479,65 @@ export class JobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams> {
   private createExecutionContext(
     jobId: string,
     stepCtx: { step: WorkflowStep; invocation: string } | null,
-  ): ExecutionContext {
+  ): ExecutionContext & { flushProgress(): Promise<void> } {
     // 进度更新节流：避免高频写 D1 导致放大
     // - Handler 积极地上报（例如每 N 个目录/每批 upsert）
-    let lastProgressWriteAtMs = 0;
+    let lastProgressWriteAtMs: number | null = null;
     let pendingProgressPatch: Partial<TaskStats> | null = null;
+    let persistedStats: Partial<TaskStats> = {};
+    let progressWrite = Promise.resolve();
+    const resultSignature = (items: TaskStats['itemResults']) => JSON.stringify(
+      items?.map((item) => [item.sourcePath, item.targetPath, item.status, item.retryCount, item.error, item.message]),
+    );
+    const writeProgress = (force: boolean): Promise<void> => {
+      const write = progressWrite.catch(() => {}).then(async () => {
+        if (!pendingProgressPatch) return;
+        const pending = pendingProgressPatch;
+        const nowMs = Date.now();
+        const forceWrite = force || [
+          'totalItems', 'successCount', 'failedCount', 'skippedCount', 'deferredCount',
+          'stage', 'currentRef', 'currentTargetPath', 'currentMountId', 'deferRetryAt', 'durationMs',
+        ].some((key) => pending[key] !== undefined && pending[key] !== persistedStats[key]) || (
+          pending.itemResults !== undefined &&
+          resultSignature(pending.itemResults) !== resultSignature(persistedStats.itemResults)
+        );
+        if (!forceWrite && lastProgressWriteAtMs !== null && nowMs - lastProgressWriteAtMs < 10000) return;
 
-    const context: ExecutionContext = {
+        const patch = structuredClone(pendingProgressPatch);
+        pendingProgressPatch = null;
+        try {
+          const currentRow = await this.env.DB.prepare(`
+            SELECT stats FROM ${DbTables.TASKS} WHERE task_id = ?
+          `).bind(jobId).first();
+          if (!currentRow) {
+            pendingProgressPatch = { ...patch, ...(pendingProgressPatch || {}) };
+            console.error(`[JobWorkflow] 作业 ${jobId} 未找到,无法更新进度`);
+            return;
+          }
+
+          const updatedStats = {
+            ...JSON.parse(currentRow.stats as string),
+            ...patch,
+            heartbeatAtMs: nowMs,
+          };
+          await this.env.DB.prepare(`
+            UPDATE ${DbTables.TASKS}
+            SET stats = ?, updated_at = ?
+            WHERE task_id = ?
+          `).bind(JSON.stringify(updatedStats), nowMs, jobId).run();
+          persistedStats = updatedStats;
+          lastProgressWriteAtMs = nowMs;
+        } catch (error) {
+          pendingProgressPatch = { ...patch, ...(pendingProgressPatch || {}) };
+          throw error;
+        }
+      });
+      progressWrite = write;
+      return write;
+    };
+
+    const context: ExecutionContext & { flushProgress(): Promise<void> } = {
+      flushProgress: () => writeProgress(true),
       isCancelled: async (jobId: string) => {
         const row = await this.env.DB.prepare(`
           SELECT status FROM ${DbTables.TASKS} WHERE task_id = ?
@@ -484,52 +545,11 @@ export class JobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams> {
         return row?.status === 'cancelled';
       },
 
-      updateProgress: async (jobId: string, stats: Partial<TaskStats>) => {
-        const nowMs = Date.now();
-
+      updateProgress: async (_jobId: string, stats: Partial<TaskStats>) => {
         // 合并到 pending（低成本，避免频繁读写 DB）
         pendingProgressPatch = { ...(pendingProgressPatch || {}), ...(stats || {}) };
 
-        // 强制写入条件：关键统计变化（mount 级/结果级）
-        const forceWrite =
-          stats?.processedItems !== undefined ||
-          stats?.totalItems !== undefined ||
-          stats?.successCount !== undefined ||
-          stats?.failedCount !== undefined ||
-          stats?.skippedCount !== undefined;
-
-        // 时间节流：默认 2s 写一次（forceWrite 例外）
-        if (!forceWrite && nowMs - lastProgressWriteAtMs < 2000) {
-          return;
-        }
-        lastProgressWriteAtMs = nowMs;
-
-        const currentRow = await this.env.DB.prepare(`
-          SELECT stats FROM ${DbTables.TASKS} WHERE task_id = ?
-        `).bind(jobId).first();
-
-        if (!currentRow) {
-          console.error(`[JobWorkflow] 作业 ${jobId} 未找到,无法更新进度`);
-          return;
-        }
-
-        const currentStats = JSON.parse(currentRow.stats as string);
-        const updatedStats = {
-          ...currentStats,
-          ...(pendingProgressPatch || {}),
-          heartbeatAtMs: nowMs,
-        };
-        pendingProgressPatch = null;
-
-        await this.env.DB.prepare(`
-          UPDATE ${DbTables.TASKS}
-          SET stats = ?, updated_at = ?
-          WHERE task_id = ?
-        `).bind(
-          JSON.stringify(updatedStats),
-          Date.now(),
-          jobId
-        ).run();
+        await writeProgress(false);
       },
 
       getFileSystem: () => {
@@ -576,7 +596,13 @@ export class JobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams> {
         });
 
         try {
-          const result = (await stepCtx.step.do(name, config, fn as any)) as T;
+          const result = (await stepCtx.step.do(name, config, (async () => {
+            try {
+              return await fn();
+            } finally {
+              await context.flushProgress();
+            }
+          }) as any)) as T;
           logJob("step 完成", {
             jobId,
             step: name,
