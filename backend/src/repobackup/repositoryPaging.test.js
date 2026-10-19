@@ -27,6 +27,7 @@ import {
   createScheduledJobRunsTables,
 } from "../db/migrations/sqlite/engine/schema.js";
 import { listRepositories, batchDeleteRepositories } from "../services/codeRepositoryService.js";
+import { CodeRepositoryRepository } from "../repositories/CodeRepositoryRepository.js";
 import { ValidationError } from "../http/errors.js";
 
 const ENV = { ENCRYPTION_SECRET: "test-secret-test-secret-test-secret" };
@@ -35,8 +36,10 @@ const ENV = { ENCRYPTION_SECRET: "test-secret-test-secret-test-secret" };
 function createTestDb() {
   const raw = new DatabaseSync(":memory:");
   const normalize = (row) => (row ? { ...row } : null);
+  const reads = [];
   return {
     _raw: raw,
+    _reads: reads,
     prepare(sql) {
       const stmt = raw.prepare(String(sql));
       const args = [];
@@ -46,9 +49,11 @@ function createTestDb() {
           return api;
         },
         async first() {
+          reads.push({ sql, params: [...args] });
           return normalize(stmt.get(...args) ?? null);
         },
         async all() {
+          reads.push({ sql, params: [...args] });
           return { results: stmt.all(...args).map(normalize) };
         },
         async run() {
@@ -105,6 +110,75 @@ async function seedMany(db, n, createdAt = "2026-01-01T00:00:00.000Z") {
 }
 
 const list = (db, options) => listRepositories(db, null, ENV.ENCRYPTION_SECRET, ENV, options);
+
+// 修改点（列表刷新提速）：约束真实 SQL 次数，防止重新引入逐仓库查询。
+async function seedBackup(db, repositoryId, id, createdAt, status = "success") {
+  await db.prepare(`INSERT INTO code_repository_backups
+    (id, repository_id, commit_sha, status, created_at) VALUES (?, ?, ?, ?, ?)`)
+    .bind(id, repositoryId, id, status, createdAt).run();
+  await db.prepare(`INSERT INTO code_repository_backup_targets
+    (id, backup_id, mount_id, status) VALUES (?, ?, 'mount-1', ?)`)
+    .bind(`target-${id}`, id, status).run();
+}
+
+test("20 个有备份的仓库最多 8 次查询，不随每行增加往返", async (t) => {
+  const db = createTestDb();
+  t.after(() => db._raw.close());
+  await setupSchema(db);
+  await seedMany(db, 20);
+  for (let i = 1; i <= 20; i++) {
+    const id = `repo-${String(i).padStart(2, "0")}`;
+    await seedBackup(db, id, `backup-${id}`, "2026-01-01T00:00:00Z");
+  }
+
+  db._reads.length = 0;
+  const result = await list(db, { limit: 20 });
+  assert.equal(result.items.length, 20);
+  for (const item of result.items) {
+    assert.equal(item.latestBackup.id, `backup-${item.id}`);
+    assert.equal(item.latestBackup.targets[0].id, `target-backup-${item.id}`);
+  }
+  assert.ok(db._reads.length <= 8, `列表执行了 ${db._reads.length} 次查询，应批量读取备份和目标`);
+});
+
+test("批量最近备份不串仓库、不漏无备份行，同时间记录与详情选择一致", async (t) => {
+  const db = createTestDb();
+  t.after(() => db._raw.close());
+  await setupSchema(db);
+  await seedMany(db, 4);
+  await seedBackup(db, "repo-01", "old", "2026-01-01T00:00:00Z");
+  await seedBackup(db, "repo-01", "new", "2026-02-01T00:00:00Z", "failed");
+  await seedBackup(db, "repo-02", "tie-a", "2026-02-01T00:00:00Z");
+  await seedBackup(db, "repo-02", "tie-z", "2026-02-01T00:00:00Z", "partial");
+  await seedBackup(db, "repo-04", "off-page", "2026-03-01T00:00:00Z");
+
+  const result = await list(db, { limit: 3, offset: 1 });
+  assert.deepEqual(result.items.map((item) => item.id), ["repo-03", "repo-02", "repo-01"]);
+  assert.equal(result.items[0].latestBackup, null);
+  assert.equal(result.items[1].latestBackup.id, "tie-z");
+  assert.equal(result.items[1].latestBackup.targets[0].id, "target-tie-z");
+  assert.equal(result.items[2].latestBackup.id, "new");
+  assert.equal(result.items[2].latestBackup.status, "failed");
+  assert.equal((await new CodeRepositoryRepository(db).findLatestBackup("repo-02")).id, "tie-z");
+});
+
+test("大页和内部全量列表不超 D1 单条 SQL 的 100 个绑定参数", async (t) => {
+  const db = createTestDb();
+  t.after(() => db._raw.close());
+  await setupSchema(db);
+  await seedMany(db, 120);
+  for (let i = 1; i <= 120; i++) {
+    const id = `repo-${String(i).padStart(2, "0")}`;
+    await seedBackup(db, id, `backup-${id}`, "2026-01-01T00:00:00Z");
+  }
+  for (const options of [{ limit: 100 }, { limit: 200 }, {}]) {
+    db._reads.length = 0;
+    const result = await list(db, options);
+    assert.equal(result.items.length, options.limit === 100 ? 100 : 120);
+    assert.ok(result.items.every((item) => item.latestBackup?.targets.length === 1));
+    assert.ok(db._reads.every(({ params }) => params.length <= 100), "批量查询不能为每个仓库各占一个绑定参数");
+  }
+});
 
 // ==================== 分页 ====================
 

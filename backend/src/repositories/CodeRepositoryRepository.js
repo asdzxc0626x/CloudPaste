@@ -349,10 +349,29 @@ export class CodeRepositoryRepository extends BaseRepository {
     const sql = `
       SELECT * FROM ${DbTables.CODE_REPOSITORY_BACKUPS}
       WHERE repository_id = ?
-      ORDER BY created_at DESC
+      ORDER BY created_at DESC, id DESC
       LIMIT 1
     `;
     return await this.queryFirst(sql, [repositoryId]);
+  }
+
+  /** 修改点（列表刷新提速）：沿用仓库/时间索引，每仓库只取一条，不拉取全部历史。 */
+  async findLatestBackupsByRepositories(repositoryIds) {
+    const ids = [...new Set((repositoryIds || []).filter(Boolean).map(String))];
+    if (ids.length === 0) return new Map();
+
+    // JSON 数组只占一个绑定参数，兼容 D1 大页与内部不分页调用。
+    const result = await this.query(`
+      SELECT backup.*
+      FROM json_each(?) AS requested
+      JOIN ${DbTables.CODE_REPOSITORY_BACKUPS} AS backup ON backup.id = (
+        SELECT id FROM ${DbTables.CODE_REPOSITORY_BACKUPS}
+        WHERE repository_id = requested.value
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+      )
+    `, [JSON.stringify(ids)]);
+    return new Map((result.results || []).map((row) => [String(row.repository_id), row]));
   }
 
   /**
@@ -601,9 +620,9 @@ export class CodeRepositoryRepository extends BaseRepository {
     const ids = (backupIds || []).filter(Boolean);
     if (ids.length === 0) return map;
 
-    const placeholders = ids.map(() => "?").join(", ");
-    const sql = `SELECT * FROM ${DbTables.CODE_REPOSITORY_BACKUP_TARGETS} WHERE backup_id IN (${placeholders})`;
-    const result = await this.query(sql, ids);
+    // 修改点（列表刷新提速）：批量 ID 使用一个 JSON 参数，避免大页超出 D1 绑定上限。
+    const sql = `SELECT * FROM ${DbTables.CODE_REPOSITORY_BACKUP_TARGETS} WHERE backup_id IN (SELECT value FROM json_each(?))`;
+    const result = await this.query(sql, [JSON.stringify(ids)]);
     for (const row of result.results || []) {
       const key = String(row.backup_id);
       if (!map.has(key)) map.set(key, []);
@@ -690,13 +709,13 @@ export class CodeRepositoryRepository extends BaseRepository {
     const ids = (repositoryIds || []).filter(Boolean);
     if (ids.length === 0) return map;
 
-    const placeholders = ids.map(() => "?").join(", ");
+    // 修改点（列表刷新提速）：与备份批量查询保持相同的 D1 参数上限处理。
     const sql = `
       SELECT * FROM ${DbTables.REPO_DETECT_STATES}
-      WHERE repository_id IN (${placeholders})
+      WHERE repository_id IN (SELECT value FROM json_each(?))
       ORDER BY ref_type ASC, ref ASC
     `;
-    const result = await this.query(sql, ids);
+    const result = await this.query(sql, [JSON.stringify(ids)]);
     for (const row of result.results || []) {
       const key = String(row.repository_id);
       if (!map.has(key)) map.set(key, []);
@@ -902,7 +921,7 @@ export class CodeRepositoryRepository extends BaseRepository {
     if (ids.length === 0 || types.length === 0) return [];
 
     const typePlaceholders = types.map(() => "?").join(", ");
-    const idPlaceholders = ids.map(() => "?").join(", ");
+    // 修改点（列表刷新提速）：100 条/页时还要给作业类型与时间留出绑定参数。
     const sql = `
       SELECT
         json_extract(payload, '$.repositoryId') AS repository_id,
@@ -913,10 +932,10 @@ export class CodeRepositoryRepository extends BaseRepository {
         AND status IN ('pending', 'running')
         AND created_at >= ?
         AND json_valid(payload)
-        AND json_extract(payload, '$.repositoryId') IN (${idPlaceholders})
+        AND json_extract(payload, '$.repositoryId') IN (SELECT value FROM json_each(?))
       GROUP BY repository_id, task_type
     `;
-    const result = await this.query(sql, [...types, Number(staleBeforeMs) || 0, ...ids]);
+    const result = await this.query(sql, [...types, Number(staleBeforeMs) || 0, JSON.stringify(ids)]);
     const rows = result?.results || [];
     return rows.map((row) => ({
       repositoryId: row.repository_id === null || row.repository_id === undefined ? null : String(row.repository_id),

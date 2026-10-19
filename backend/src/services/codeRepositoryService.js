@@ -457,33 +457,33 @@ export async function listRepositories(db, repositoryFactory, encryptionSecret, 
   const rawOffset = Number(options?.offset);
   const offset = Number.isFinite(rawOffset) && rawOffset > 0 ? Math.trunc(rawOffset) : 0;
 
-  // 先取总数：当前页为空（例如删到最后一页空了）时前端要靠它把页码退回去
-  const total = await codeRepo.countRepositories({ search });
-  const rows = await codeRepo.findAllRepositories({ search, limit, offset });
+  // 修改点（列表刷新提速）：无依赖的读取并发进行，总数仍用于空页回退。
+  const [total, rows] = await Promise.all([
+    codeRepo.countRepositories({ search }),
+    codeRepo.findAllRepositories({ search, limit, offset }),
+  ]);
   const paging = { total, limit, offset, search };
   if (rows.length === 0) return { items: [], ...paging };
 
-  // 一次性取出挂载点，避免 N+1 查询
-  const mounts = await mountRepository.findAll(true);
+  // 修改点（列表刷新提速）：最近备份也按当前页批量取，消除每行两次串行往返。
+  const repositoryIds = rows.map((row) => row.id);
+  const [mounts, scheduleMap, detectStateMap, activeJobMap, latestBackupMap] = await Promise.all([
+    mountRepository.findAll(true),
+    loadAllRepositorySchedules(db),
+    codeRepo.findDetectStatesByRepositories(repositoryIds),
+    countActiveJobsByRepositories(codeRepo, repositoryIds),
+    codeRepo.findLatestBackupsByRepositories(repositoryIds),
+  ]);
   const mountMap = new Map(mounts.map((m) => [String(m.id), m]));
-
-  // 修改点（独立备份计划优化）：一次性取出全部备份计划，避免逐仓库查 scheduled_jobs
-  const scheduleMap = await loadAllRepositorySchedules(db);
-
-  // 修改点（第 4 期）：一次性取出全部检测状态，避免逐仓库查 repo_detect_states
-  const detectStateMap = await codeRepo.findDetectStatesByRepositories(rows.map((row) => row.id));
-
-  // 修改点（第 5 期 数据库查询优化）：一次性取出全部「进行中的作业」并按类型分组，
-  // 不再逐仓库查询（原先是 N+1），同时把检测作业与备份作业区分开
-  const activeJobMap = await countActiveJobsByRepositories(codeRepo, rows.map((row) => row.id));
+  const latestTargetMap = await codeRepo.findTargetsByBackups([...latestBackupMap.values()].map((backup) => backup.id));
 
   const result = [];
   for (const row of rows) {
     const targetMountIds = resolveTargetMountIds(row);
     const targetMounts = targetMountIds.map((id) => toMountBrief(mountMap.get(String(id)) || null));
 
-    const latestBackup = await codeRepo.findLatestBackup(row.id);
-    const latestBackupTargets = latestBackup ? await codeRepo.findTargetsByBackup(latestBackup.id) : [];
+    const latestBackup = latestBackupMap.get(String(row.id)) || null;
+    const latestBackupTargets = latestBackup ? latestTargetMap.get(String(latestBackup.id)) || [] : [];
 
     const activeCheckCount = activeJobMap.check.get(String(row.id)) || 0;
     const activeBackupCount = activeJobMap.backup.get(String(row.id)) || 0;

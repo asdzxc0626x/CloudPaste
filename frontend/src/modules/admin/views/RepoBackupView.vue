@@ -163,7 +163,7 @@ onMounted(() => {
             :disabled="loading || searchLoading"
             @click="refreshRepositories"
           >
-            <IconRefresh class="h-4 w-4 mr-1 shrink-0" :class="loading || searchLoading ? 'animate-spin' : ''" />
+            <IconRefresh class="h-4 w-4 mr-1 shrink-0" :class="loading || searchLoading ? 'motion-safe:animate-spin' : ''" />
             <span>{{ loading || searchLoading ? $t("admin.repoBackup.toolbar.refreshing") : $t("admin.repoBackup.toolbar.refresh") }}</span>
           </button>
         </div>

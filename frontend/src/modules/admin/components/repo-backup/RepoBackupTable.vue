@@ -15,6 +15,7 @@
  */
 import { computed } from "vue";
 import { useI18n } from "vue-i18n";
+import { IconRefresh } from "@/components/icons";
 import RepoBackupRowActions from "./RepoBackupRowActions.vue";
 // 修改点（站点时区一期）：改用统一的 timeUtils。
 // 原来的 new Date(value).toLocaleString() 会把后端下发的
@@ -368,18 +369,58 @@ const dimensionRows = (repo) => [
 </script>
 
 <template>
+  <!-- 修改点（加载显示优化）：首次加载用响应式骨架占位，不把加载态误当空列表。 -->
+  <div
+    v-if="showLoading"
+    role="status"
+    aria-live="polite"
+    aria-busy="true"
+    class="overflow-hidden rounded-lg border"
+    :class="darkMode ? 'border-gray-700 bg-gray-800' : 'border-gray-200 bg-white'"
+  >
+    <p class="px-4 py-3 text-sm" :class="darkMode ? 'text-gray-400' : 'text-gray-500'">
+      {{ $t("admin.repoBackup.table.loading") }}
+    </p>
+    <div aria-hidden="true" class="motion-safe:animate-pulse divide-y" :class="darkMode ? 'divide-gray-700 text-gray-700' : 'divide-gray-100 text-gray-200'">
+      <div v-for="row in 5" :key="row" class="grid grid-cols-2 md:grid-cols-5 gap-4 px-4 py-5">
+        <div class="space-y-2 col-span-2 md:col-span-1">
+          <div class="h-4 w-2/3 rounded bg-current"></div>
+          <div class="h-3 w-1/2 rounded bg-current opacity-60"></div>
+        </div>
+        <div v-for="column in 3" :key="column" class="space-y-2" :class="column === 3 ? 'hidden md:block' : ''">
+          <div class="h-3 w-3/4 rounded bg-current"></div>
+          <div class="h-3 w-1/2 rounded bg-current opacity-60"></div>
+        </div>
+        <div class="hidden md:flex justify-end gap-2">
+          <div v-for="action in 3" :key="action" class="h-6 w-7 rounded bg-current"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- 空状态 -->
   <div
-    v-if="showEmpty || showLoading"
+    v-else-if="showEmpty"
     class="rounded-lg border px-4 py-10 text-center text-sm"
     :class="[darkMode ? 'border-gray-700 text-gray-400' : 'border-gray-200 text-gray-500']"
   >
-    {{ showLoading ? $t("admin.repoBackup.table.loading") : (searchMode ? $t("admin.repoBackup.table.emptyFiltered") : $t("admin.repoBackup.table.empty")) }}
+    {{ searchMode ? $t("admin.repoBackup.table.emptyFiltered") : $t("admin.repoBackup.table.empty") }}
   </div>
 
   <template v-else>
+    <!-- 修改点（加载显示优化）：刷新时保留可见行，在列表附近明确提示更新中。 -->
+    <div
+      v-if="loading"
+      role="status"
+      aria-live="polite"
+      class="mb-2 flex items-center gap-2 rounded-md px-3 py-2 text-xs"
+      :class="darkMode ? 'bg-gray-800 text-primary-300' : 'bg-primary-50 text-primary-700'"
+    >
+      <IconRefresh class="h-3.5 w-3.5 motion-safe:animate-spin" aria-hidden="true" />
+      {{ $t("admin.repoBackup.toolbar.refreshing") }}
+    </div>
     <!-- ==================== 桌面端：表格 ==================== -->
-    <div class="hidden md:block overflow-x-auto rounded-lg border" :class="darkMode ? 'border-gray-700' : 'border-gray-200'">
+    <div :aria-busy="loading" class="hidden md:block overflow-x-auto rounded-lg border" :class="darkMode ? 'border-gray-700' : 'border-gray-200'">
       <table class="min-w-full divide-y" :class="darkMode ? 'divide-gray-700' : 'divide-gray-200'">
         <thead :class="darkMode ? 'bg-gray-800' : 'bg-gray-50'">
           <tr>
@@ -641,7 +682,7 @@ const dimensionRows = (repo) => [
     </div>
 
     <!-- ==================== 移动端：卡片列表 ==================== -->
-    <div class="md:hidden space-y-3">
+    <div :aria-busy="loading" class="md:hidden space-y-3">
       <div
         v-for="repo in repositories"
         :key="repo.id"

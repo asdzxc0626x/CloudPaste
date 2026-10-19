@@ -10,8 +10,7 @@
  * 修改点（仓库管理分页 / 搜索 / 批量 / 手动刷新）：
  * 分页、选择、刷新时间这三件事复用 useAdminBase，与文件管理、文本管理同一套实现
  * （页大小也按页面键持久化）。仓库列表改为服务端分页：
- * 列表接口里逐仓库的查询（最近备份、各目标结果）原本要对全部仓库各跑一遍，
- * 分页之后只对当前这一页跑。
+ * 列表接口按当前页批量读取最近备份与目标结果。
  */
 
 import { ref, reactive, computed } from "vue";
@@ -63,7 +62,9 @@ export function useRepoBackup() {
   // ==================== 搜索（修改点：仓库管理搜索）====================
   const searchQuery = ref("");
   const isSearchMode = ref(false);
-  const searchLoading = ref(false);
+  // 修改点（刷新乱序保护）：搜索与普通列表共用同一个请求状态。
+  const searchLoading = computed(() => loading.value && isSearchMode.value);
+  let listRequestId = 0;
 
   // ==================== 表单状态 ====================
   const showForm = ref(false);
@@ -183,6 +184,7 @@ export function useRepoBackup() {
    * 看到的会是一片空白，而用户并不知道该点哪里才能回去。
    */
   const loadRepositories = async (options = {}) => {
+    const requestId = ++listRequestId;
     loading.value = true;
     if (!options.keepMessages) clearMessages();
     try {
@@ -191,6 +193,8 @@ export function useRepoBackup() {
         offset: pagination.offset,
         search: isSearchMode.value ? searchQuery.value.trim() : "",
       });
+      // 修改点（刷新乱序保护）：旧请求不能覆盖新列表、分页或触发空页回退。
+      if (requestId !== listRequestId) return;
       if (resp?.success) {
         applyListResponse(resp.data);
 
@@ -206,9 +210,9 @@ export function useRepoBackup() {
         base.updateLastRefreshTime();
       }
     } catch (e) {
-      notifyError(e, "admin.repoBackup.messages.loadFailed");
+      if (requestId === listRequestId) notifyError(e, "admin.repoBackup.messages.loadFailed");
     } finally {
-      loading.value = false;
+      if (requestId === listRequestId) loading.value = false;
     }
   };
 
@@ -222,15 +226,6 @@ export function useRepoBackup() {
    * - 保持当前页码与搜索条件：刷新不该把人甩回第一页
    */
   const refreshRepositories = async () => {
-    if (isSearchMode.value) {
-      searchLoading.value = true;
-      try {
-        await loadRepositories();
-      } finally {
-        searchLoading.value = false;
-      }
-      return;
-    }
     await loadRepositories();
   };
 
@@ -267,16 +262,11 @@ export function useRepoBackup() {
       return;
     }
 
-    searchLoading.value = true;
     isSearchMode.value = true;
     base.clearSelection();
     // 筛选条件变了必须把页码归零，否则会停在超出范围的页上看到空列表
     base.resetPagination();
-    try {
-      await loadRepositories();
-    } finally {
-      searchLoading.value = false;
-    }
+    await loadRepositories();
   };
 
   /** 清除搜索，回到正常分页列表 */
