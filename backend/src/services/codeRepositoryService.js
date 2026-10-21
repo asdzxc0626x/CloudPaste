@@ -24,6 +24,7 @@ import { ensureRepositoryFactory } from "../utils/repositories.js";
 import { StorageFactory } from "../storage/factory/StorageFactory.js";
 import { CAPABILITIES } from "../storage/interfaces/capabilities/index.js";
 import { RepoProviderFactory } from "../repobackup/providers/index.js";
+import { sealOneOffConfig } from "../repobackup/oneOff.js";
 import {
   parseProviderConfig,
   serializeProviderConfig,
@@ -715,6 +716,55 @@ function resolveRetentionInput(body, existing = null) {
  * @param {object} body
  * @param {object} [env]
  */
+export async function buildOneOffBackupPayload(db, repositoryFactory, encryptionSecret, body, env = {}) {
+  const factory = ensureRepositoryFactory(db, repositoryFactory, env);
+  const codeRepo = factory.getCodeRepositoryRepository();
+  const commitSha = String(body?.commitSha || "").trim().toLowerCase();
+  if (!/^[0-9a-f]{40}$/.test(commitSha)) {
+    throw new ValidationError("Commit SHA 必须是完整的 40 位十六进制值");
+  }
+  const branch = String(body?.branch || "").trim();
+  if (!branch || branch.length > 255 || /[\s\x00-\x1f]/.test(branch)) {
+    throw new ValidationError("请填写有效的分支名称");
+  }
+  let existing = null;
+  if (body?.repositoryId) {
+    existing = await codeRepo.findRepositoryById(body.repositoryId);
+    if (!existing) throw new NotFoundError("代码仓库不存在");
+  }
+  const provider = String(body?.provider ?? existing?.provider ?? "github").trim().toLowerCase();
+  if (!RepoProviderFactory.isTypeSupported(provider)) throw new ValidationError(`不支持的代码仓库类型: ${provider}`);
+  const repoIdentifier = normalizeRepoIdentifier(body?.repoIdentifier ?? existing?.repo_identifier);
+  // A top-level submission may also reuse the location of an already registered repository.
+  if (!existing) {
+    const matches = await codeRepo.findRepositoriesByIdentity({ provider, repoIdentifier, trackMode: "branch" });
+    existing = matches[0] ?? (await codeRepo.findRepositoriesByIdentity({ provider, repoIdentifier, trackMode: "release" }))[0] ?? null;
+  }
+  const sameSource = existing?.provider === provider && existing?.repo_identifier === repoIdentifier;
+  const config = mergeProviderConfig(provider,
+    sameSource ? await parseProviderConfig(provider, existing.config_json, encryptionSecret) : {},
+    body?.config && typeof body.config === "object" && !Array.isArray(body.config) ? body.config : {},
+  );
+  const validation = RepoProviderFactory.validateConfig(provider, { repoIdentifier, trackMode: "branch", trackRef: branch, config });
+  if (!validation.valid) throw new ValidationError(validation.errors.join("；"));
+  const targetMountIds = resolveTargetMountInput(body, existing);
+  await assertWritableMounts(factory.getMountRepository(), targetMountIds);
+  const targetPathPrefix = normalizePathPrefix(body?.targetPathPrefix ?? existing?.target_path_prefix ?? RepoProviderFactory.getDefaultPathPrefix(provider)) || "/";
+  const id = `oneoff-${crypto.randomUUID()}`;
+  const row = {
+    id, provider, name: body?.name ? String(body.name).trim() : repoIdentifier,
+    repo_identifier: repoIdentifier, track_mode: "branch", track_ref: branch,
+    track_refs_json: JSON.stringify([branch]), target_mount_id: targetMountIds[0],
+    target_mount_ids_json: JSON.stringify(targetMountIds), target_path_prefix: targetPathPrefix,
+    config_json: await serializeProviderConfig(provider, config, encryptionSecret),
+  };
+  return {
+    repositoryId: id, repoIdentifier, force: true,
+    oneOff: await sealOneOffConfig(row, encryptionSecret),
+    refs: [{ refType: "branch", ref: branch, commitSha, version: `${branch}@${commitSha.slice(0, 7)}`, publishedAt: null }],
+  };
+}
+
 export async function createRepository(db, repositoryFactory, encryptionSecret, body, env = {}) {
   const factory = ensureRepositoryFactory(db, repositoryFactory, env);
   const codeRepo = factory.getCodeRepositoryRepository();

@@ -207,6 +207,7 @@ export function buildTimestamp(date = new Date()) {
  *   commitSha: string,
  *   ref?: string|null,
  *   at?: Date,
+ *   oneOffId?: string|null,
  * }} params
  * @returns {{
  *   repoDirPath: string,
@@ -221,7 +222,7 @@ export function buildTimestamp(date = new Date()) {
  *   refSegment: string,
  * }}
  */
-export function planBackupPaths({ mountPath, pathPrefix, provider, repoIdentifier, commitSha, ref = null, at = new Date() }) {
+export function planBackupPaths({ mountPath, pathPrefix, provider, repoIdentifier, commitSha, ref = null, at = new Date(), oneOffId = null }) {
   const normalizedMount = normalizeMountPath(mountPath);
   if (!normalizedMount) {
     throw new ValidationError("挂载点路径无效，无法规划备份路径");
@@ -240,7 +241,10 @@ export function planBackupPaths({ mountPath, pathPrefix, provider, repoIdentifie
   // 修改点（快照按仓库名命名）：目录名与文件名各司其职 ——
   // 目录名 时间_分支_sha 回答「这是哪一次备份」，文件名 owner__repo__分支__sha
   // 回答「这是哪个仓库的哪个分支」，文件单独拿出去也知道自己是谁的
-  const backupDirName = `${buildTimestamp(at)}__${refSegment}__${shortSha}`;
+  // Manual snapshots are deliberately outside the automatic cleanup naming grammar.
+  const backupDirName = oneOffId
+    ? `manual__${buildTimestamp(at)}__${refSegment}__${shortSha}__${sanitizeSegment(oneOffId)}`
+    : `${buildTimestamp(at)}__${refSegment}__${shortSha}`;
   const fileBaseName = `${owner}__${repo}__${refSegment}__${shortSha}`;
 
   const archiveFileName = `${fileBaseName}.tar.gz`;

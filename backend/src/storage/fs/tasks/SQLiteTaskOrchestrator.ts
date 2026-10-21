@@ -7,6 +7,7 @@
 import Database from 'better-sqlite3';
 import { DbTables } from '../../../constants/index.js';
 import { taskRegistry } from './TaskRegistry.js';
+import { ONE_OFF_TASK_PAYLOAD_SQL } from '../../../repobackup/oneOff.js';
 import type { TaskHandler, InternalJob, ExecutionContext } from './TaskHandler.js';
 import type {
   TaskOrchestratorAdapter,
@@ -164,7 +165,7 @@ export class SQLiteTaskOrchestrator implements TaskOrchestratorAdapter {
   async cancelJob(jobId: string): Promise<void> {
     const result = this.db.prepare(`
       UPDATE ${DbTables.TASKS}
-      SET status = ?, updated_at = ?
+      SET status = ?, updated_at = ?, payload = ${ONE_OFF_TASK_PAYLOAD_SQL}
       WHERE task_id = ? AND status IN ('pending', 'running')
     `).run(
       TaskStatus.CANCELLED,
@@ -494,7 +495,7 @@ export class SQLiteTaskOrchestrator implements TaskOrchestratorAdapter {
     // 更新最终状态
     this.db.prepare(`
       UPDATE ${DbTables.TASKS}
-      SET status = ?, finished_at = ?, updated_at = ?, error_message = ?
+      SET status = ?, finished_at = ?, updated_at = ?, error_message = ?, payload = ${ONE_OFF_TASK_PAYLOAD_SQL}
       WHERE task_id = ?
     `).run(
       finalStatus,

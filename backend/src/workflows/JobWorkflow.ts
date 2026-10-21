@@ -15,6 +15,7 @@ import { FileSystem } from "../storage/fs/FileSystem.js";
 import { ensureRepositoryFactory } from "../utils/repositories.js";
 import { DbTables } from "../constants/index.js";
 import { taskRegistry } from "../storage/fs/tasks/TaskRegistry.js";
+import { ONE_OFF_TASK_PAYLOAD_SQL } from "../repobackup/oneOff.js";
 import type { ExecutionContext, InternalJob, TaskStepOptions } from "../storage/fs/tasks/TaskHandler.js";
 import { TaskStatus } from "../storage/fs/tasks/types.js";
 import type { TaskStats } from "../storage/fs/tasks/types.js";
@@ -186,7 +187,7 @@ export class JobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams> {
       await step.do('record-invalid-task-type', async () => {
         await this.env.DB.prepare(`
           UPDATE ${DbTables.TASKS}
-          SET status = ?, error_message = ?, updated_at = ?, finished_at = ?
+          SET status = ?, error_message = ?, updated_at = ?, finished_at = ?, payload = ${ONE_OFF_TASK_PAYLOAD_SQL}
           WHERE task_id = ?
         `).bind(
           'failed',
@@ -378,12 +379,14 @@ export class JobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams> {
     await step.do('finalize-task-record', async () => {
       console.log(`[JobWorkflow] 最终化作业记录 ${jobId}`);
       await executionContext.flushProgress();
+      const db = this.env.DB;
 
-      const finalRow = await this.env.DB.prepare(`
+      const finalRow = await db.prepare(`
         SELECT status, stats FROM ${DbTables.TASKS} WHERE task_id = ?
       `).bind(jobId).first();
 
       if (finalRow?.status === 'cancelled') {
+        await db.prepare(`UPDATE ${DbTables.TASKS} SET payload = ${ONE_OFF_TASK_PAYLOAD_SQL} WHERE task_id = ?`).bind(jobId).run();
         console.log(`[JobWorkflow] 作业 ${jobId} 已被用户取消,保持 cancelled 状态`);
         return { cancelled: true };
       }
@@ -406,9 +409,9 @@ export class JobWorkflow extends WorkflowEntrypoint<Env, JobWorkflowParams> {
         finalStats.failedCount > 0 ? `部分项目失败 (${finalStats.failedCount}/${finalStats.totalItems})` :
         null;
 
-      await this.env.DB.prepare(`
+      await db.prepare(`
         UPDATE ${DbTables.TASKS}
-        SET status = ?, stats = ?, finished_at = ?, updated_at = ?, error_message = ?
+        SET status = ?, stats = ?, finished_at = ?, updated_at = ?, error_message = ?, payload = ${ONE_OFF_TASK_PAYLOAD_SQL}
         WHERE task_id = ?
       `).bind(
         finalStatus,

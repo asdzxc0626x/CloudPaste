@@ -1,6 +1,16 @@
 // Repositories (new feature)
 export default {
   repoBackup: {
+    oneOff: {
+      title: "Back Up Commit",
+      hint: "Runs once without saving repository settings or creating a schedule. Uses the registered repository's location by default. Manual snapshots do not count toward retention and are deleted only manually (remove the manual__ folder in Files). View results in Tasks.",
+      revision: "Source Revision",
+      branch: "Branch",
+      shaHint: "Enter the full 40-character commit SHA. Only this commit is downloaded, not the latest branch revision.",
+      invalidSha: "Enter a full 40-character hexadecimal commit SHA",
+      submit: "Back Up Once",
+      created: "One-off backup task created; view the result in Tasks",
+    },
     title: "Repositories",
     subtitle:
       "Register external code repositories, check branches or releases on each repository's own schedule, and back up source snapshots to one or more storage mounts",

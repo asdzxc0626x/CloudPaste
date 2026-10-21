@@ -4,7 +4,7 @@ import { fileURLToPath } from "node:url";
 import { createServer } from "vite";
 import vue from "@vitejs/plugin-vue";
 import Icons from "unplugin-icons/vite";
-import { createSSRApp, h } from "vue";
+import { createSSRApp, createRenderer, h, reactive, ssrContextKey } from "vue";
 import { renderToString } from "vue/server-renderer";
 import { createI18n } from "vue-i18n";
 import messages from "../src/i18n/locales/zh-CN/admin/repoBackup.js";
@@ -13,12 +13,16 @@ import messages from "../src/i18n/locales/zh-CN/admin/repoBackup.js";
 const root = fileURLToPath(new URL("..", import.meta.url));
 const requestKey = Symbol.for("cloudpaste.repo-backup.test-request");
 const hadNavigator = "navigator" in globalThis;
+const hadDocument = "document" in globalThis;
+const formApps = [];
 let server;
 let useRepoBackup;
 let RepoBackupTable;
+let RepoBackupForm;
 before(async () => {
   // Node 20 没有 navigator，真实时间格式化函数需要浏览器语言信息。
   if (!hadNavigator) globalThis.navigator = { language: "zh-CN", languages: ["zh-CN"] };
+  if (!hadDocument) globalThis.document = { addEventListener() {}, removeEventListener() {} };
   server = await createServer({
     root,
     configFile: false,
@@ -43,11 +47,14 @@ before(async () => {
   });
   ({ useRepoBackup } = await server.ssrLoadModule("/src/modules/admin/composables/useRepoBackup.js"));
   ({ default: RepoBackupTable } = await server.ssrLoadModule("/src/modules/admin/components/repo-backup/RepoBackupTable.vue"));
+  ({ default: RepoBackupForm } = await server.ssrLoadModule("/src/modules/admin/components/repo-backup/RepoBackupForm.vue"));
 });
 after(async () => {
+  for (const app of formApps) app.unmount();
   delete globalThis[requestKey];
   await server?.close();
   if (!hadNavigator) delete globalThis.navigator;
+  if (!hadDocument) delete globalThis.document;
 });
 
 const withI18n = (app) => app.use(createI18n({ legacy: false, locale: "zh-CN", messages: { "zh-CN": { admin: messages } } }));
@@ -146,6 +153,83 @@ test("deleting the last page retries once at the last valid offset", async () =>
 async function renderTable(props) {
   return renderToString(withI18n(createSSRApp({ render: () => h(RepoBackupTable, { isRepoBusy: () => false, ...props }) })));
 }
+
+async function setupForm(overrides = {}) {
+  let state;
+  const submissions = [];
+  const props = reactive({ oneOff: true, repo: null, providers: [], writableMounts: [], ...overrides });
+  // Keep the setup scope mounted: SSR disposes watchers after renderToString.
+  const renderer = createRenderer({ insert() {}, remove() {}, createComment: () => ({}), parentNode: () => null, nextSibling: () => null });
+  const app = withI18n(renderer.createApp({ setup() {
+    state = RepoBackupForm.setup(props, { expose() {}, emit: (_event, payload) => submissions.push(payload) });
+    return () => null;
+  } }));
+  app.provide(ssrContextKey, {});
+  app.mount({});
+  formApps.push(app);
+  return { state, submissions };
+}
+
+const existingRepo = { id: "existing", provider: "github", repoIdentifier: "owner/repo", trackMode: "branch", trackRefs: ["dev"], targetMountIds: ["mount-1"], targetPathPrefix: "/custom", config: { token: "********tail" } };
+
+test("returning to the original repository while defaults load does not leave submit disabled", async () => {
+  let resolveDefaults;
+  const { state, submissions } = await setupForm({ repo: existingRepo, loadDefaults: () => new Promise((resolve) => { resolveDefaults = resolve; }) });
+  state.formData.repoIdentifier = "owner/other";
+  const lookup = state.applyOneOffDefaults();
+  state.formData.repoIdentifier = "owner/repo";
+  await state.applyOneOffDefaults();
+  resolveDefaults({ ...existingRepo, repoIdentifier: "owner/other" });
+  await lookup;
+  state.formData.commitSha = "a".repeat(40);
+  state.handleSubmit();
+  assert.equal(submissions.length, 1);
+  assert.equal(submissions[0].repoIdentifier, "owner/repo");
+});
+
+test("editing repository identity cannot reuse or reveal the previous repository credentials", async () => {
+  const { state, submissions } = await setupForm({ repo: existingRepo });
+  state.formData.repoIdentifier = "owner/other";
+  state.formData.commitSha = "a".repeat(40);
+  state.handleSubmit();
+  assert.equal(submissions.length, 1);
+  assert.equal(submissions[0].repositoryId, undefined);
+  assert.deepEqual(submissions[0].config, {});
+  assert.deepEqual(await state.revealRepoPool("tokens"), []);
+});
+
+test("one-off form shows commit inputs and hides scheduling and retention controls", async () => {
+  const app = withI18n(createSSRApp({ render: () => h(RepoBackupForm, {
+    oneOff: true,
+    repo: { id: "existing", provider: "github", repoIdentifier: "owner/repo", trackMode: "branch", trackRefs: ["dev"], targetMountIds: ["mount-1"], targetPathPrefix: "/custom" },
+    providers: [{ provider: "github", displayName: "GitHub", defaultPathPrefix: "/Github" }],
+    writableMounts: [{ id: "mount-1", mount_path: "/backup" }],
+  }) }));
+  const context = {};
+  await renderToString(app, context);
+  const html = context.teleports.body;
+  assert.match(html, /Commit SHA/);
+  assert.match(html, /value="dev"/);
+  assert.match(html, /value="\/custom"/);
+  assert.match(html, /仅手动删除/);
+  assert.doesNotMatch(html, /type="number"|type="checkbox"|<label[^>]*>保留版本数|启用定时备份/);
+});
+
+test("one-off submission calls the separate endpoint, never creates or updates a repository", async () => {
+  const { state } = await setup();
+  assert.equal(typeof state.openOneOffForm, "function");
+  state.openOneOffForm();
+  let submitted;
+  globalThis[requestKey] = async (endpoint, payload) => {
+    assert.equal(endpoint, "/admin/repo-backup/one-off");
+    submitted = payload;
+    return { success: true, message: "one-shot created", data: { jobId: "job-1" } };
+  };
+  const payload = { branch: "main", commitSha: "a".repeat(40) };
+  assert.equal(await state.submitForm(payload), true);
+  assert.deepEqual(submitted, payload);
+  assert.equal(state.showForm.value, false);
+});
 
 test("initial loading exposes a status and skeleton rather than the empty state", async () => {
   const html = await renderTable({ loading: true });

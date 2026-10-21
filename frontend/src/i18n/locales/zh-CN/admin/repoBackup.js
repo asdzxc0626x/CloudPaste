@@ -1,6 +1,16 @@
 // 仓库管理（修改点：新增功能）
 export default {
   repoBackup: {
+    oneOff: {
+      title: "备份指定 Commit",
+      hint: "仅执行一次，不保存仓库配置、不创建定时计划。默认沿用已添加仓库的存储位置；手动快照不计入保留版本数，仅手动删除（在文件管理中删除 manual__ 目录）。结果在任务管理中查看。",
+      revision: "指定源码版本",
+      branch: "分支",
+      shaHint: "填写完整的 40 位 Commit SHA；只下载该提交，不替换为分支最新版本。",
+      invalidSha: "请输入完整的 40 位十六进制 Commit SHA",
+      submit: "备份一次",
+      created: "一次性备份任务已创建，可在任务管理查看结果",
+    },
     title: "仓库管理",
     subtitle: "登记外部代码仓库，按各自的备份计划定时检查分支或 Release 更新，并将源码快照备份到一个或多个存储挂载点",
 

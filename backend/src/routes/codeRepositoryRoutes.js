@@ -18,6 +18,7 @@ import {
   listRepositories,
   getRepository,
   createRepository,
+  buildOneOffBackupPayload,
   updateRepository,
   setRepositoryEnabled,
   deleteRepository,
@@ -216,6 +217,17 @@ codeRepositoryRoutes.post("/api/admin/repo-backup/repositories/:id/enable", requ
 });
 
 // ==================== 检查更新 / 手动备份 ====================
+
+codeRepositoryRoutes.post("/api/admin/repo-backup/one-off", requireAdmin, async (c) => {
+  const { db, repositoryFactory, encryptionSecret, env } = resolveContext(c);
+  const { userId: adminId } = resolvePrincipal(c, { allowedTypes: [UserType.ADMIN] });
+  const payload = await buildOneOffBackupPayload(db, repositoryFactory, encryptionSecret, await c.req.json().catch(() => ({})), env);
+  const fileSystem = new FileSystem(new MountManager(db, encryptionSecret, repositoryFactory, { env }), env);
+  const job = await fileSystem.createJob("repo_backup", payload, adminId, UserType.ADMIN, {
+    triggerType: "manual", triggerRef: "admin/repo-backup/one-off",
+  });
+  return jsonCreated(c, { jobId: job.jobId, taskType: job.taskType }, "指定 Commit 备份任务已创建，可在任务管理查看结果；快照仅由手动删除");
+});
 
 /**
  * 检查仓库是否有更新（同步执行，只查版本不下载）

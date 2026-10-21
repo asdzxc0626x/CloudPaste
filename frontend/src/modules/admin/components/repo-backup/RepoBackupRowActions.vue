@@ -16,7 +16,7 @@ const props = defineProps({
   iconOnly: { type: Boolean, default: false },
 });
 
-const emit = defineEmits(["check", "backup", "history", "edit", "toggle", "delete"]);
+const emit = defineEmits(["check", "backup", "one-off", "history", "edit", "toggle", "delete"]);
 
 const neutralBtnClass = () =>
   props.darkMode
@@ -61,6 +61,17 @@ const btnLayoutClass = computed(() => (props.iconOnly ? "" : "w-full justify-cen
     >
       <IconArchive class="h-3 w-3 shrink-0" :class="iconOnly ? '' : 'mr-1'" />
       <span v-if="!iconOnly" class="truncate">{{ $t("admin.repoBackup.actions.backup") }}</span>
+    </button>
+
+    <!-- 指定 Commit 的一次性备份 -->
+    <button
+      class="inline-flex items-center px-2 py-1 text-xs rounded border transition-colors"
+      :class="[neutralBtnClass(), btnLayoutClass]"
+      :title="$t('admin.repoBackup.oneOff.title')"
+      @click="emit('one-off', repo)"
+    >
+      <IconArchive class="h-3 w-3 shrink-0" :class="iconOnly ? '' : 'mr-1'" />
+      <span v-if="!iconOnly" class="truncate">{{ $t("admin.repoBackup.oneOff.title") }}</span>
     </button>
 
     <!-- 备份历史 -->

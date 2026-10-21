@@ -8,6 +8,8 @@
 
 import { get, post, put, del } from "../client";
 
+export const triggerOneOffBackup = (payload) => post("/admin/repo-backup/one-off", payload);
+
 /******************************************************************************
  * 类型定义 (JSDoc)
  ******************************************************************************/

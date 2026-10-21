@@ -4,6 +4,7 @@ import { registerHooks } from "node:module";
 import { DatabaseSync } from "node:sqlite";
 import { createTasksTables } from "../db/migrations/sqlite/engine/schema.js";
 import { taskRegistry } from "../storage/fs/tasks/TaskRegistry.ts";
+import { WorkflowsTaskOrchestrator } from "../storage/fs/tasks/WorkflowsTaskOrchestrator.ts";
 import { CodeRepositoryRepository } from "../repositories/CodeRepositoryRepository.js";
 import { ZOMBIE_RUNNING_BACKUP_SEC } from "../repobackup/schedule.js";
 
@@ -65,6 +66,32 @@ async function setup(context) {
     row: () => raw.prepare("SELECT * FROM tasks WHERE task_id = 'job-1'").get(),
     stats: () => JSON.parse(raw.prepare("SELECT stats FROM tasks WHERE task_id = 'job-1'").get().stats),
   };
+}
+
+test("invalid workflow task type discards temporary one-off configuration on failure", async (context) => {
+  const { raw, workflow, row } = await setup(context);
+  raw.prepare("UPDATE tasks SET payload = ? WHERE task_id = 'job-1'").run(JSON.stringify({ repositoryId: "oneoff-1", oneOff: { ciphertext: [1] } }));
+  context.mock.method(taskRegistry, "getHandler", () => { throw new Error("unknown handler"); });
+  const step = { do: async (_name, body) => body() };
+  await assert.rejects(() => workflow.run({ payload: { jobId: "job-1", taskType: "missing", payload: {} } }, step), /unknown handler/);
+  assert.equal(row().status, "failed");
+  assert.deepEqual(JSON.parse(row().payload), { repositoryId: "oneoff-1" });
+});
+
+for (const status of ["complete", "errored", "terminated", "cancel"]) {
+  test(`workflow ${status} removes temporary settings but preserves task results`, async (context) => {
+    const { db, raw, row } = await setup(context);
+    raw.exec("CREATE TABLE api_keys(id TEXT PRIMARY KEY, name TEXT)");
+    const payload = { repositoryId: "oneoff-1", refs: [{ commitSha: "a".repeat(40) }], oneOff: { ciphertext: [1] } };
+    raw.prepare("UPDATE tasks SET payload = ? WHERE task_id = 'job-1'").run(JSON.stringify(payload));
+    const orchestrator = new WorkflowsTaskOrchestrator({ DB: db, JOB_WORKFLOW: { get: async () => ({
+      status: async () => ({ status }), terminate: async () => {},
+    }) } }, null);
+    if (status === "cancel") await orchestrator.cancelJob("job-1");
+    else assert.equal((await orchestrator.getJobStatus("job-1")).payload.oneOff, undefined);
+    assert.deepEqual(JSON.parse(row().payload), { repositoryId: payload.repositoryId, refs: payload.refs });
+    assert.equal(row().status, { complete: "completed", errored: "failed", terminated: "cancelled", cancel: "cancelled" }[status]);
+  });
 }
 
 test("完整 report 快照与 processedItems/字节变化不会绕过 10 秒 D1 节流", async (context) => {
@@ -168,6 +195,7 @@ for (const splitSteps of [false, true]) {
   for (const outcome of ["completed", "failed", "cancelled", "partial"]) {
     test(`${splitSteps ? "拆分步骤" : "单步骤"}任务 ${outcome}：开始与最终状态及时持久化，收尾刷新最后不足 10 秒的进度`, async (context) => {
       const { db, raw, workflow, advance, stats, row } = await setup(context);
+      raw.prepare("UPDATE tasks SET payload = ? WHERE task_id = 'job-1'").run(JSON.stringify({ repositoryId: "oneoff-1", oneOff: { ciphertext: [1] } }));
       const handler = {
         usesExecutionSteps: splitSteps,
         async execute(job, execution) {
@@ -197,6 +225,7 @@ for (const splitSteps of [false, true]) {
       };
       const result = await workflow.run({ payload: { jobId: "job-1", taskType: "repo_backup", payload: {}, userId: "admin", userType: "admin" } }, step);
       assert.equal(row().status, outcome);
+      assert.deepEqual(JSON.parse(row().payload), { repositoryId: "oneoff-1" });
       assert.equal(stats().bytesTransferred, 355);
       assert.equal(result.processedItems, 1);
       assert.ok(steps.includes("finalize-task-record"));

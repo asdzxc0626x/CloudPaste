@@ -27,6 +27,7 @@ import {
   setRepositoryEnabled,
   checkRepository,
   triggerBackup,
+  triggerOneOffBackup,
   listBackups,
   getBackupDownloadLink,
 } from "@/api/services/repoBackupService.js";
@@ -71,6 +72,7 @@ export function useRepoBackup() {
   const formSubmitting = ref(false);
   /** 正在编辑的仓库；null 表示新建 */
   const editingRepo = ref(null);
+  const oneOffForm = ref(false);
 
   // ==================== 删除确认 ====================
   const showDeleteConfirm = ref(false);
@@ -295,12 +297,14 @@ export function useRepoBackup() {
 
   const openCreateForm = () => {
     clearMessages();
+    oneOffForm.value = false;
     editingRepo.value = null;
     showForm.value = true;
   };
 
   const openEditForm = (repo) => {
     clearMessages();
+    oneOffForm.value = false;
     editingRepo.value = repo;
     showForm.value = true;
   };
@@ -308,6 +312,20 @@ export function useRepoBackup() {
   const closeForm = () => {
     showForm.value = false;
     editingRepo.value = null;
+    oneOffForm.value = false;
+  };
+
+  const openOneOffForm = (repo = null) => {
+    clearMessages();
+    oneOffForm.value = true;
+    editingRepo.value = repo;
+    showForm.value = true;
+  };
+
+  const loadOneOffDefaults = async (identifier) => {
+    const resp = await listRepositories({ search: identifier, limit: 20, offset: 0 });
+    const items = Array.isArray(resp?.data) ? resp.data : resp?.data?.items || [];
+    return items.find((repo) => repo.repoIdentifier?.toLowerCase() === identifier.toLowerCase()) || null;
   };
 
   /**
@@ -319,6 +337,13 @@ export function useRepoBackup() {
     clearMessages();
     formSubmitting.value = true;
     try {
+      if (oneOffForm.value) {
+        const resp = await triggerOneOffBackup(payload);
+        if (!resp?.success) return false;
+        successMessage.value = resp.message || t("admin.repoBackup.oneOff.created");
+        closeForm();
+        return true;
+      }
       const { id, ...data } = payload || {};
       const resp = id ? await updateRepository(id, data) : await createRepository(data);
 
@@ -628,6 +653,9 @@ export function useRepoBackup() {
     editingRepo,
     formSubmitting,
     openCreateForm,
+    oneOffForm,
+    openOneOffForm,
+    loadOneOffDefaults,
     openEditForm,
     closeForm,
     submitForm,

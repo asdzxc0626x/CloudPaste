@@ -39,6 +39,10 @@ import { RepoBackupTaskHandler } from "../storage/fs/tasks/handlers/RepoBackupTa
 import { buildTimestamp } from "./paths.js";
 import { githubRequestScheduler, clearCoalescedCache } from "./GithubRequestScheduler.js";
 import { resetCredentialRotation } from "./providers/GithubRepoProvider.js";
+import * as repositoryService from "../services/codeRepositoryService.js";
+import * as oneOffConfig from "./oneOff.js";
+import { pruneOldVersions } from "./retention.js";
+import { planDirDedupe } from "./dedupeDirs.js";
 
 beforeEach(() => {
   // 与同目录其它用例同样的隔离：模块级状态必须逐用例复位
@@ -142,6 +146,8 @@ async function runBackup({
   env = ENV,
   failUploadForMount = null,
   jobId = "backup-job-1",
+  payloadOverrides = {},
+  archiveStatus = 200,
 }) {
   const repositoryFactory = new RepositoryFactory(db, { env: ENV });
   const codeRepo = repositoryFactory.getCodeRepositoryRepository();
@@ -154,14 +160,16 @@ async function runBackup({
   const stepResults = new Map();
   /** 实际发生的上传（归档 + manifest） */
   const uploads = [];
+  const requests = [];
 
   globalThis.fetch = async (url) => {
+    requests.push(String(url));
     if (new URL(String(url)).host === "api.github.com") {
       throw new Error("用例使用预解析 refs，不应发起版本解析请求");
     }
     // codeload 的归档：给一点字节，让护栏的计数生效
     return new Response(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]), {
-      status: 200,
+      status: archiveStatus,
       headers: { "content-type": "application/gzip" },
     });
   };
@@ -235,7 +243,7 @@ async function runBackup({
   }
 
   const handler = new RepoBackupTaskHandler();
-  const payload = { repositoryId: repoRow.id, repoIdentifier: repoRow.repo_identifier, refs };
+  const payload = { repositoryId: repoRow.id, repoIdentifier: repoRow.repo_identifier, refs, ...payloadOverrides };
   await handler.validate(payload);
 
   let thrown = null;
@@ -245,7 +253,7 @@ async function runBackup({
     thrown = error;
   }
 
-  return { codeRepo, stepCalls, stepBodyRuns, stepResults, uploads, thrown };
+  return { codeRepo, stepCalls, stepBodyRuns, stepResults, uploads, thrown, requests };
 }
 
 const readBackups = (db, repositoryId) =>
@@ -263,6 +271,126 @@ const REFS_TWO = [
   { refType: "branch", ref: "main", commitSha: sha("a"), version: "main@aaaaaaa", publishedAt: null },
   { refType: "branch", ref: "dev", commitSha: sha("b"), version: "dev@bbbbbbb", publishedAt: null },
 ];
+
+test("one-off backup uses exactly the requested SHA without saving config or moving scheduled watermarks", async () => {
+  assert.equal(typeof repositoryService.buildOneOffBackupPayload, "function");
+  const db = createTestDb();
+  await setupSchema(db);
+  await seedMounts(db, ["mount-1"]);
+  const repoRow = await seedRepo(db);
+  db._raw.exec("UPDATE code_repositories SET target_path_prefix = '/custom', enabled = 0, retention_count = 1");
+  const before = db._raw.prepare("SELECT * FROM code_repositories").get();
+  const factory = new RepositoryFactory(db, { env: ENV });
+  const payload = await repositoryService.buildOneOffBackupPayload(db, factory, ENV.ENCRYPTION_SECRET, {
+    repositoryId: repoRow.id, branch: "old-branch", commitSha: sha("c"),
+  }, ENV);
+  assert.notEqual(payload.repositoryId, repoRow.id);
+  assert.equal(payload.refs[0].commitSha, sha("c"));
+  assert.equal(payload.refs[0].ref, "old-branch");
+  assert.doesNotMatch(JSON.stringify(payload), /\/custom|config_json/);
+  const run = await runBackup({ db, repoRow, payloadOverrides: payload });
+  assert.equal(run.thrown, null);
+  assert.match(archiveUploads(run.uploads)[0].path, /\/custom\/octocat__Hello-World\/old-branch\/manual__/);
+  assert.equal(readBackups(db, repoRow.id).length, 0);
+  const manual = readBackups(db, payload.repositoryId);
+  assert.equal(manual.length, 1);
+  assert.equal(manual[0].commit_sha, sha("c"));
+  assert.equal(manual[0].status, "success");
+  assert.ok(run.requests.every((url) => url.endsWith(sha("c"))));
+  assert.deepEqual(db._raw.prepare("SELECT * FROM code_repositories").get(), before);
+  assert.equal(db._raw.prepare("SELECT count(*) AS n FROM repo_detect_states").get().n, 0);
+  assert.equal((await run.codeRepo.findSuccessBackupsBeyondLimit(repoRow.id, 0)).length, 0);
+});
+
+test("one-off encrypted task settings are removed on completion/cancellation without modifying other payloads", async () => {
+  assert.equal(typeof oneOffConfig.ONE_OFF_TASK_PAYLOAD_SQL, "string");
+  const db = createTestDb();
+  await createTasksTables(db);
+  const envelope = await oneOffConfig.sealOneOffConfig({ config: { token: "private-token" } }, ENV.ENCRYPTION_SECRET);
+  assert.doesNotMatch(JSON.stringify(envelope), /private-token/);
+  assert.deepEqual(await oneOffConfig.openOneOffConfig(envelope, ENV.ENCRYPTION_SECRET), { config: { token: "private-token" } });
+  await assert.rejects(() => oneOffConfig.openOneOffConfig(envelope, "wrong-key"), /解密/);
+  const payload = { repositoryId: "oneoff-1", refs: REFS_TWO.slice(0, 1), oneOff: envelope };
+  for (const status of ["completed", "failed", "partial", "cancelled"]) {
+    db._raw.prepare("INSERT INTO tasks(task_id, task_type, status, payload, stats, user_id, user_type, created_at, updated_at) VALUES (?, 'repo_backup', ?, ?, '{}', 'a', 'admin', 1, 1)").run(status, status, JSON.stringify(payload));
+  }
+  db._raw.exec(`UPDATE tasks SET payload = ${oneOffConfig.ONE_OFF_TASK_PAYLOAD_SQL}`);
+  for (const row of db._raw.prepare("SELECT payload FROM tasks").all()) {
+    const stored = JSON.parse(row.payload);
+    assert.equal(stored.oneOff, undefined);
+    assert.deepEqual(stored.refs, payload.refs);
+    assert.equal(stored.repositoryId, payload.repositoryId);
+  }
+});
+
+test("regular retention and deduplication do not remove one-off snapshots, even at the same SHA", async () => {
+  const db = createTestDb();
+  await setupSchema(db);
+  await seedMounts(db, ["mount-1"]);
+  const repoRow = await seedRepo(db);
+  const factory = new RepositoryFactory(db, { env: ENV });
+  const body = { repositoryId: repoRow.id, branch: "main", commitSha: sha("a") };
+  const first = await repositoryService.buildOneOffBackupPayload(db, factory, ENV.ENCRYPTION_SECRET, body, ENV);
+  const second = await repositoryService.buildOneOffBackupPayload(db, factory, ENV.ENCRYPTION_SECRET, body, ENV);
+  assert.notEqual(first.repositoryId, second.repositoryId);
+  for (const payload of [first, second]) {
+    const run = await runBackup({ db, repoRow, payloadOverrides: payload });
+    assert.equal(run.thrown, null);
+    const cache = new Map();
+    const replay = await runBackup({ db, repoRow, payloadOverrides: payload, stepCache: cache });
+    assert.equal(replay.thrown, null);
+    assert.equal(archiveUploads(replay.uploads).length, 0);
+    assert.equal(db._raw.prepare("SELECT count(*) AS n FROM repo_detect_states").get().n, 0);
+  }
+  const regular = await runBackup({ db, repoRow, refs: REFS_TWO.slice(0, 1) });
+  assert.equal(archiveUploads(regular.uploads).length, 1);
+  const regularBackup = readBackups(db, repoRow.id)[0];
+  await regular.codeRepo.createBackup({ id: "newest", repository_id: repoRow.id, commit_sha: sha("b"), status: "success" });
+  db._raw.exec("UPDATE code_repository_backups SET created_at = '2000-01-01' WHERE id != 'newest'");
+  const removed = [];
+  await pruneOldVersions({ codeRepo: regular.codeRepo, repositoryRow: { ...repoRow, retention_count: 1 },
+    fileSystem: { batchRemoveItems: async (paths) => { removed.push(...paths); return { success: paths.length }; } }, userId: "a", userType: "admin" });
+  assert.equal(await regular.codeRepo.findBackupById(regularBackup.id), null);
+  assert.equal(readBackups(db, first.repositoryId).length, 1);
+  assert.equal(readBackups(db, second.repositoryId).length, 1);
+  assert.ok(removed.every((path) => !path.includes("manual__")));
+  const manualNames = [first, second].map((p) => `manual__20261021-000000__main__aaaaaaa__${p.repositoryId}`);
+  const dedupe = planDirDedupe({ refDirPath: "/backup/main/", dirNames: [...manualNames, "20261021-000000__main__aaaaaaa", "20261020-000000__main__aaaaaaa"] });
+  assert.equal(dedupe.removeDirPaths.length, 1);
+  assert.ok(!dedupe.removeDirPaths[0].includes("manual__"));
+});
+
+test("missing commit fails once rather than resolving the branch or scheduling a later backup", async () => {
+  const db = createTestDb();
+  await setupSchema(db);
+  await seedMounts(db, ["mount-1"]);
+  const repoRow = await seedRepo(db);
+  const payload = await repositoryService.buildOneOffBackupPayload(db, new RepositoryFactory(db, { env: ENV }), ENV.ENCRYPTION_SECRET,
+    { repositoryId: repoRow.id, branch: "main", commitSha: sha("f") }, ENV);
+  const run = await runBackup({ db, repoRow, payloadOverrides: payload, archiveStatus: 404 });
+  assert.ok(run.thrown);
+  assert.equal(run.requests.length, 1);
+  assert.equal(readBackups(db, payload.repositoryId)[0].status, "failed");
+  assert.equal(db._raw.prepare("SELECT count(*) AS n FROM repo_detect_states").get().n, 0);
+  assert.ok(!run.stepCalls.includes("defer-schedule"));
+});
+
+test("one-off backup rejects missing or ambiguous SHA and unsafe paths before creating a task", async () => {
+  assert.equal(typeof repositoryService.buildOneOffBackupPayload, "function");
+  const db = createTestDb();
+  await setupSchema(db);
+  await seedMounts(db, ["mount-1"]);
+  const factory = new RepositoryFactory(db, { env: ENV });
+  const body = { repoIdentifier: "owner/repo", branch: "main", commitSha: sha("d"), targetMountIds: ["mount-1"] };
+  for (const commitSha of ["", "main", "abcdef1", "g".repeat(40)]) {
+    await assert.rejects(() => repositoryService.buildOneOffBackupPayload(db, factory, ENV.ENCRYPTION_SECRET, { ...body, commitSha }, ENV), /SHA/);
+  }
+  await assert.rejects(() => repositoryService.buildOneOffBackupPayload(db, factory, ENV.ENCRYPTION_SECRET, { ...body, targetPathPrefix: "/../oops" }, ENV), /前缀/);
+  const payload = await repositoryService.buildOneOffBackupPayload(db, factory, ENV.ENCRYPTION_SECRET, body, ENV);
+  const run = await runBackup({ db, repoRow: { id: "unused" }, payloadOverrides: payload });
+  assert.equal(run.thrown, null);
+  assert.equal(db._raw.prepare("SELECT count(*) AS n FROM code_repositories").get().n, 0);
+});
 
 // ==================== 步骤划分 ====================
 

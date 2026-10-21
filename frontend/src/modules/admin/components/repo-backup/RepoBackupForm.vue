@@ -31,6 +31,8 @@ import { getRepository } from "@/api/services/repoBackupService";
 const props = defineProps({
   /** 编辑的仓库对象；为 null 表示新建 */
   repo: { type: Object, default: null },
+  oneOff: { type: Boolean, default: false },
+  loadDefaults: { type: Function, default: null },
   providers: { type: Array, default: () => [] },
   writableMounts: { type: Array, default: () => [] },
   submitting: { type: Boolean, default: false },
@@ -43,6 +45,14 @@ const emit = defineEmits(["submit", "cancel"]);
 const { t, te } = useI18n();
 
 const isEditMode = computed(() => Boolean(props.repo?.id));
+const defaultsRepo = ref(null);
+const normalizeIdentifier = (value) => String(value || "").trim().replace(/^https?:\/\/[^/]+\//i, "").replace(/\.git$/i, "").split("/").filter(Boolean).slice(0, 2).join("/").toLowerCase();
+const sourceRepo = computed(() => {
+  const repo = defaultsRepo.value || props.repo;
+  return repo?.provider === formData.provider && normalizeIdentifier(repo.repoIdentifier) === normalizeIdentifier(formData.repoIdentifier) ? repo : null;
+});
+const defaultsLoading = ref(false);
+let defaultsRequest = 0;
 
 /** 保留版本数上下限（与后端 config.js 的常量保持一致） */
 const MIN_RETENTION = 1;
@@ -82,6 +92,8 @@ const formData = reactive({
   trackRefs: ["main"],
   /** release 模式：单个 tag，空串表示最新 Release */
   trackRef: "",
+  branch: "main",
+  commitSha: "",
   /** 备份目标挂载点 ID 数组（修改点：多备份目标） */
   targetMountIds: [],
   targetPathPrefix: "/",
@@ -187,6 +199,9 @@ const onPathPrefixInput = (value) => {
 
 /** 用传入的 repo 初始化表单 */
 const resetForm = () => {
+  defaultsRepo.value = null;
+  defaultsRequest++;
+  defaultsLoading.value = false;
   localError.value = "";
   branchDraft.value = "";
   advancedOpen.value = false;
@@ -208,6 +223,8 @@ const resetForm = () => {
       provider: props.repo.provider,
       name: props.repo.name || "",
       repoIdentifier: props.repo.repoIdentifier || "",
+      branch: refs[0] || "main",
+      commitSha: "",
       trackMode: props.repo.trackMode || "branch",
       trackRefs: props.repo.trackMode === "branch" ? (refs.length > 0 ? refs : ["main"]) : ["main"],
       trackRef: props.repo.trackMode === "branch" ? "" : (refs[0] || ""),
@@ -233,6 +250,8 @@ const resetForm = () => {
     provider: props.providers[0]?.provider || "github",
     name: "",
     repoIdentifier: "",
+    branch: "main",
+    commitSha: "",
     trackMode: "branch",
     trackRefs: ["main"],
     trackRef: "",
@@ -253,6 +272,38 @@ const resetForm = () => {
 
 watch(() => props.repo, resetForm, { immediate: true });
 
+watch(() => [formData.provider, normalizeIdentifier(formData.repoIdentifier)], () => {
+  if (!props.oneOff) return;
+  // Never carry a masked credential from one repository into another submission.
+  defaultsRepo.value = null;
+  formData.config = {};
+  defaultsRequest++;
+  defaultsLoading.value = false;
+}, { flush: "sync" });
+
+const applyOneOffDefaults = async () => {
+  if (!props.oneOff || !props.loadDefaults || props.submitting) return;
+  const identifier = normalizeIdentifier(formData.repoIdentifier);
+  const request = ++defaultsRequest;
+  defaultsLoading.value = false;
+  if (!identifier || normalizeIdentifier(sourceRepo.value?.repoIdentifier) === identifier) return;
+  const rawIdentifier = formData.repoIdentifier;
+  defaultsLoading.value = true;
+  try {
+    const repo = await props.loadDefaults(identifier);
+    if (request !== defaultsRequest || rawIdentifier !== formData.repoIdentifier || !repo || repo.provider !== formData.provider) return;
+    defaultsRepo.value = repo;
+    formData.branch = repo.trackRefs?.[0] || "main";
+    formData.targetMountIds = [...(repo.targetMountIds || [])];
+    formData.targetPathPrefix = repo.targetPathPrefix || defaultPathPrefixFor(repo.provider);
+    formData.config = { ...(repo.config || {}) };
+  } catch (e) {
+    if (request === defaultsRequest) localError.value = e?.message || t("admin.repoBackup.messages.loadFailed");
+  } finally {
+    if (request === defaultsRequest) defaultsLoading.value = false;
+  }
+};
+
 /** 当前 provider 的元数据 */
 const providerMeta = computed(() => props.providers.find((p) => p.provider === formData.provider) || null);
 
@@ -265,6 +316,12 @@ const providerMeta = computed(() => props.providers.find((p) => p.provider === f
  * 注意：编辑模式下仓库源是锁定的（select 为 disabled），不会触发这里。
  */
 const onProviderChange = (providerType) => {
+  if (props.oneOff) {
+    defaultsRepo.value = null;
+    formData.config = {};
+    defaultsRequest++;
+    defaultsLoading.value = false;
+  }
   formData.provider = providerType;
   if (!pathPrefixTouched.value) {
     formData.targetPathPrefix = defaultPathPrefixFor(providerType);
@@ -340,7 +397,7 @@ const getPoolValue = (name) => {
  * 后端会记录一条不含明文的审计日志（与存储配置的 reveal 同一套做法）。
  */
 const revealRepoPool = async (name) => {
-  const id = props.repo?.id;
+  const id = sourceRepo.value?.id;
   if (!id) return [];
   const resp = await getRepository(id, { reveal: "plain" });
   const entries = resp?.data?.config?.[name];
@@ -432,6 +489,35 @@ const targetSummary = computed(() => {
 /** 提交前的本地校验 */
 const handleSubmit = () => {
   localError.value = "";
+  if (props.submitting || defaultsLoading.value) return;
+  if (props.oneOff) {
+    if (!formData.repoIdentifier.trim()) {
+      localError.value = t("admin.repoBackup.validation.repoRequired");
+      return;
+    }
+    if (!formData.branch.trim()) {
+      localError.value = t("admin.repoBackup.validation.branchRequired");
+      return;
+    }
+    if (!/^[0-9a-f]{40}$/i.test(formData.commitSha.trim())) {
+      localError.value = t("admin.repoBackup.oneOff.invalidSha");
+      return;
+    }
+    if (!formData.targetMountIds.length) {
+      localError.value = t("admin.repoBackup.validation.mountRequired");
+      return;
+    }
+    emit("submit", {
+      repositoryId: sourceRepo.value?.id || undefined,
+      provider: formData.provider,
+      name: formData.name.trim() || undefined,
+      repoIdentifier: formData.repoIdentifier.trim(),
+      branch: formData.branch.trim(), commitSha: formData.commitSha.trim(),
+      targetMountIds: [...formData.targetMountIds], targetPathPrefix: formData.targetPathPrefix.trim() || "/",
+      config: { ...formData.config },
+    });
+    return;
+  }
   commitBranchDraft();
 
   if (!formData.repoIdentifier?.trim()) {
@@ -585,7 +671,7 @@ onBeforeUnmount(() => document.removeEventListener("keydown", onEscClose));
         :class="darkMode ? 'border-gray-700' : 'border-gray-200'"
       >
         <h3 class="text-sm sm:text-base font-medium truncate" :class="darkMode ? 'text-white' : 'text-gray-900'">
-          {{ isEditMode ? $t("admin.repoBackup.form.editTitle") : $t("admin.repoBackup.form.createTitle") }}
+          {{ oneOff ? $t("admin.repoBackup.oneOff.title") : isEditMode ? $t("admin.repoBackup.form.editTitle") : $t("admin.repoBackup.form.createTitle") }}
         </h3>
         <button type="button" class="p-1 rounded hover:bg-gray-100 dark:hover:bg-gray-700 shrink-0" @click="emit('cancel')">
           <IconClose class="h-4 w-4" :class="darkMode ? 'text-gray-400' : 'text-gray-500'" />
@@ -594,6 +680,8 @@ onBeforeUnmount(() => document.removeEventListener("keydown", onEscClose));
 
       <!-- 正文：独立滚动区 -->
       <form class="flex-1 min-h-0 overflow-y-auto px-4 sm:px-5 py-3" @submit.prevent="handleSubmit">
+        <p v-if="oneOff" :class="[hintClass, 'mb-3']">{{ $t("admin.repoBackup.oneOff.hint") }}</p>
+        <p v-if="defaultsLoading" role="status" :class="hintClass">{{ $t("admin.repoBackup.table.loading") }}</p>
         <!-- 错误提示 -->
         <div v-if="displayError" class="mb-3 px-3 py-2 rounded text-xs bg-red-50 text-red-700 dark:bg-red-900/30 dark:text-red-300">
           {{ displayError }}
@@ -610,7 +698,7 @@ onBeforeUnmount(() => document.removeEventListener("keydown", onEscClose));
                 <label :class="labelClass">{{ $t("admin.repoBackup.form.provider") }}</label>
                 <!-- 修改点（备份默认目录按仓库源区分）：改走 change 事件，
                      切换仓库源时同步刷新「路径前缀」的默认目录 -->
-                <select :value="formData.provider" :class="inputClass" :disabled="isEditMode" @change="onProviderChange($event.target.value)">
+                <select :value="formData.provider" :class="inputClass" :disabled="isEditMode && !oneOff" @change="onProviderChange($event.target.value)">
                   <option v-for="p in providers" :key="p.provider" :value="p.provider">{{ p.displayName }}</option>
                 </select>
               </div>
@@ -631,13 +719,26 @@ onBeforeUnmount(() => document.removeEventListener("keydown", onEscClose));
                 type="text"
                 :class="inputClass"
                 :placeholder="$t('admin.repoBackup.form.repoIdentifierPlaceholder')"
+                @blur="applyOneOffDefaults"
               />
               <p :class="hintClass">{{ $t("admin.repoBackup.form.repoIdentifierHint") }}</p>
             </div>
           </section>
 
           <!-- 跟踪设置：卡片内单列，分支 chip 输入需要完整宽度 -->
-          <section :class="cardClass">
+          <section v-if="oneOff" :class="cardClass">
+            <h4 :class="sectionTitleClass">{{ $t("admin.repoBackup.oneOff.revision") }}</h4>
+            <div>
+              <label for="oneoff-branch" :class="labelClass">{{ $t("admin.repoBackup.oneOff.branch") }} <span class="text-red-500">*</span></label>
+              <input id="oneoff-branch" v-model="formData.branch" type="text" :class="inputClass" placeholder="main" required />
+            </div>
+            <div>
+              <label for="oneoff-sha" :class="labelClass">Commit SHA <span class="text-red-500">*</span></label>
+              <input id="oneoff-sha" v-model="formData.commitSha" type="text" :class="[inputClass, 'font-mono']" maxlength="40" spellcheck="false" autocomplete="off" required />
+              <p :class="hintClass">{{ $t("admin.repoBackup.oneOff.shaHint") }}</p>
+            </div>
+          </section>
+          <section v-else :class="cardClass">
             <h4 :class="sectionTitleClass">{{ $t("admin.repoBackup.form.trackSection") }}</h4>
 
             <div>
@@ -772,7 +873,7 @@ onBeforeUnmount(() => document.removeEventListener("keydown", onEscClose));
               </div>
 
               <!-- 修改点（版本保留优化） -->
-              <div>
+              <div v-if="!oneOff">
                 <label :class="labelClass">{{ $t("admin.repoBackup.form.retentionCount") }}</label>
                 <input
                   v-model.number="formData.retentionCount"
@@ -788,7 +889,7 @@ onBeforeUnmount(() => document.removeEventListener("keydown", onEscClose));
           </section>
 
           <!-- 备份计划（修改点：独立备份计划优化） -->
-          <section :class="cardClass">
+          <section v-if="!oneOff" :class="cardClass">
             <div class="flex items-center justify-between gap-2 flex-wrap">
               <h4 :class="sectionTitleClass">{{ $t("admin.repoBackup.form.scheduleSection") }}</h4>
               <label class="inline-flex items-center gap-1.5 shrink-0">
@@ -970,7 +1071,7 @@ onBeforeUnmount(() => document.removeEventListener("keydown", onEscClose));
         </div>
 
         <!-- 启用开关（与分区同级，不占一整张卡片） -->
-        <div class="mt-3 flex items-center justify-between gap-3 flex-wrap">
+        <div v-if="!oneOff" class="mt-3 flex items-center justify-between gap-3 flex-wrap">
           <label class="inline-flex items-center gap-2">
             <input v-model="formData.enabled" type="checkbox" class="rounded border-gray-300" />
             <span class="text-xs" :class="darkMode ? 'text-gray-300' : 'text-gray-700'">
@@ -999,10 +1100,10 @@ onBeforeUnmount(() => document.removeEventListener("keydown", onEscClose));
         <button
           type="button"
           class="w-full sm:w-auto px-4 py-2 text-sm rounded-md text-white bg-blue-600 hover:bg-blue-700 disabled:opacity-50"
-          :disabled="submitting"
+          :disabled="submitting || defaultsLoading"
           @click="handleSubmit"
         >
-          {{ submitting ? $t("admin.repoBackup.form.saving") : $t("admin.repoBackup.buttons.save") }}
+          {{ submitting ? $t("admin.repoBackup.form.saving") : oneOff ? $t("admin.repoBackup.oneOff.submit") : $t("admin.repoBackup.buttons.save") }}
         </button>
       </div>
     </div>

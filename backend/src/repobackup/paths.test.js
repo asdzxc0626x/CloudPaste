@@ -28,7 +28,19 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { planBackupPaths, resolveBackupDirFromFilePath, buildTimestamp, buildRepoFolderName } from "./paths.js";
+import { planBackupPaths, resolveBackupDirFromFilePath, buildTimestamp, buildRepoFolderName, parseBackupDirName } from "./paths.js";
+
+test("one-off snapshots stay in the same branch but cannot be parsed by automatic directory cleanup", () => {
+  const paths = planBackupPaths({
+    mountPath: "/backup", pathPrefix: "/Github", repoIdentifier: "owner/repo",
+    ref: "main", commitSha: "a".repeat(40), at: new Date("2026-10-21T00:00:00Z"),
+    oneOffId: "oneoff-123",
+  });
+  assert.equal(paths.refDirPath, "/backup/Github/owner__repo/main/");
+  assert.match(paths.backupDirName, /^manual__.*__oneoff-123$/);
+  assert.equal(parseBackupDirName(paths.backupDirName), null);
+  assert.equal(resolveBackupDirFromFilePath(paths.archivePath), null);
+});
 
 /** 造一个固定的时间点，避免用例受运行时刻影响 */
 const AT = new Date(Date.UTC(2026, 9, 5, 15, 50, 36)); // 2026-10-05 15:50:36 UTC -> 20261005-155036

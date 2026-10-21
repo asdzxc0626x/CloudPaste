@@ -12,7 +12,7 @@
 import { onMounted, ref } from "vue";
 import { useThemeMode } from "@/composables/core/useThemeMode.js";
 import { useRepoBackup } from "@/modules/admin/composables/useRepoBackup.js";
-import { IconPlus, IconRefresh, IconKey, IconDelete, IconClock } from "@/components/icons";
+import { IconPlus, IconRefresh, IconKey, IconDelete, IconClock, IconArchive } from "@/components/icons";
 
 import RepoBackupTable from "@/modules/admin/components/repo-backup/RepoBackupTable.vue";
 import RepoBackupForm from "@/modules/admin/components/repo-backup/RepoBackupForm.vue";
@@ -65,6 +65,9 @@ const {
   editingRepo,
   formSubmitting,
   openCreateForm,
+  oneOffForm,
+  openOneOffForm,
+  loadOneOffDefaults,
   openEditForm,
   closeForm,
   submitForm,
@@ -135,7 +138,15 @@ onMounted(() => {
           </p>
         </div>
 
-        <div class="flex items-center gap-2 shrink-0">
+        <div class="flex flex-wrap items-center gap-2">
+          <button
+            class="inline-flex items-center whitespace-nowrap px-2.5 py-1.5 md:px-4 md:py-2 border text-sm font-medium rounded-md shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+            :class="darkMode ? 'border-gray-600 text-gray-200 bg-gray-800 hover:bg-gray-700' : 'border-gray-300 text-gray-700 bg-white hover:bg-gray-50'"
+            @click="openOneOffForm()"
+          >
+            <IconArchive class="h-4 w-4 mr-1 shrink-0" />
+            <span>{{ $t("admin.repoBackup.oneOff.title") }}</span>
+          </button>
           <!-- 修改点（第 3 期 3-B）：全局 Token / 代理池 -->
           <button
             class="inline-flex items-center whitespace-nowrap px-2.5 py-1.5 md:px-4 md:py-2 border text-sm font-medium rounded-md shadow-sm focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500"
@@ -249,6 +260,7 @@ onMounted(() => {
       :search-mode="isSearchMode"
       @check="handleCheck"
       @backup="onBackup"
+      @one-off="openOneOffForm"
       @history="openHistory"
       @edit="openEditForm"
       @toggle="toggleEnabled"
@@ -275,6 +287,8 @@ onMounted(() => {
     <RepoBackupForm
       v-if="showForm"
       :repo="editingRepo"
+      :one-off="oneOffForm"
+      :load-defaults="loadOneOffDefaults"
       :providers="providers"
       :writable-mounts="writableMounts"
       :submitting="formSubmitting"

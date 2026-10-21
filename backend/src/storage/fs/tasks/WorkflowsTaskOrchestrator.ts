@@ -7,6 +7,7 @@
 
 import { DbTables } from '../../../constants/index.js';
 import { taskRegistry } from './TaskRegistry.js';
+import { ONE_OFF_TASK_PAYLOAD_SQL } from '../../../repobackup/oneOff.js';
 import type { TaskHandler } from './TaskHandler.js';
 import type {
   TaskOrchestratorAdapter,
@@ -185,13 +186,14 @@ export class WorkflowsTaskOrchestrator implements TaskOrchestratorAdapter {
 
           await this.env.DB.prepare(`
             UPDATE ${DbTables.TASKS}
-            SET status = ?, finished_at = ?, updated_at = ?
+            SET status = ?, finished_at = ?, updated_at = ?, payload = ${ONE_OFF_TASK_PAYLOAD_SQL}
             WHERE task_id = ?
           `)
             .bind(mappedStatus, finishedAtMs, updatedAtMs, jobId)
             .run();
 
           dbStatus = mappedStatus;
+          delete payload.oneOff;
         } catch (error) {
           console.warn(
             `[WorkflowsTaskOrchestrator] 同步作业 ${jobId} 状态到 D1 失败，将继续使用内存状态:`,
@@ -261,7 +263,7 @@ export class WorkflowsTaskOrchestrator implements TaskOrchestratorAdapter {
 
     await this.env.DB.prepare(`
       UPDATE ${DbTables.TASKS}
-      SET status = ?, updated_at = ?
+      SET status = ?, updated_at = ?, payload = ${ONE_OFF_TASK_PAYLOAD_SQL}
       WHERE task_id = ?
     `).bind(
       'cancelled',

@@ -35,7 +35,7 @@ const props = defineProps({
   searchMode: { type: Boolean, default: false },
 });
 
-const emit = defineEmits(["check", "backup", "history", "edit", "toggle", "delete", "toggle-select", "toggle-select-all"]);
+const emit = defineEmits(["check", "backup", "one-off", "history", "edit", "toggle", "delete", "toggle-select", "toggle-select-all"]);
 
 const { t } = useI18n();
 
@@ -670,6 +670,7 @@ const dimensionRows = (repo) => [
                 icon-only
                 @check="emit('check', $event)"
                 @backup="emit('backup', $event)"
+                @one-off="emit('one-off', $event)"
                 @history="emit('history', $event)"
                 @edit="emit('edit', $event)"
                 @toggle="emit('toggle', $event)"
@@ -817,6 +818,7 @@ const dimensionRows = (repo) => [
             :dark-mode="darkMode"
             @check="emit('check', $event)"
             @backup="emit('backup', $event)"
+            @one-off="emit('one-off', $event)"
             @history="emit('history', $event)"
             @edit="emit('edit', $event)"
             @toggle="emit('toggle', $event)"

@@ -56,6 +56,7 @@ import {
  * （up_to_date / deferred / partial / failed …），任务列表与仓库管理页共用同一套取值。
  */
 import { REPO_OUTCOME } from "../../../../repobackup/status.js";
+import { openOneOffConfig } from "../../../../repobackup/oneOff.js";
 
 /**
  * 代码仓库备份任务（修改点：新增功能）
@@ -161,6 +162,7 @@ type RepoBackupPayload = {
    * 由 repo_backup_check 解析并落库后传入；有值时本任务不再请求 GitHub 版本 API
    */
   refs?: RepoBackupResolvedRef[];
+  oneOff?: { iv: number[]; ciphertext: number[] };
 };
 
 // 修改点（状态显示不一致修复）：条目状态与「结果」分开表达，
@@ -579,6 +581,10 @@ export class RepoBackupTaskHandler implements TaskHandler {
     if (payload.force !== undefined && typeof payload.force !== "boolean") {
       throw new ValidationError("force 必须是布尔值");
     }
+    if (payload.oneOff && (!payload.repositoryId.startsWith("oneoff-") || !Array.isArray(payload.refs) ||
+      payload.refs.length !== 1 || !/^[0-9a-f]{40}$/.test(payload.refs[0]?.commitSha))) {
+      throw new ValidationError("一次性备份必须提供一个完整 Commit SHA");
+    }
   }
 
   createStatsTemplate(_payload: any): TaskStats {
@@ -607,7 +613,8 @@ export class RepoBackupTaskHandler implements TaskHandler {
 
   async execute(job: InternalJob, context: ExecutionContext): Promise<void> {
     const payload = (job.payload || {}) as RepoBackupPayload;
-    const force = payload.force === true;
+    const oneOff = Boolean(payload.oneOff);
+    const force = payload.force === true && !oneOff;
 
     const fileSystem = context.getFileSystem();
     const env = typeof context.getEnv === "function" ? context.getEnv() : null;
@@ -703,10 +710,13 @@ export class RepoBackupTaskHandler implements TaskHandler {
     // 修改点（阶段 2）：这一段是纯只读查询，文档明确允许放在步骤之外
     //（原文：「calls that have no side effects can be done outside of steps」）。
     // 代价是每次重放多几次 D1 读；收益是凭据与仓库行完全不进步骤返回值。
-    const repoRow = await codeRepo.findRepositoryById(payload.repositoryId);
+    const repoRow = oneOff
+      ? await openOneOffConfig(payload.oneOff!, encryptionSecret)
+      : await codeRepo.findRepositoryById(payload.repositoryId);
     if (!repoRow) {
       throw new NotFoundError(`代码仓库不存在: ${payload.repositoryId}`);
     }
+    if (oneOff && repoRow.id !== payload.repositoryId) throw new ValidationError("一次性备份配置不匹配");
 
     const provider = String(repoRow.provider || "");
     const repoIdentifier = String(repoRow.repo_identifier || "");
@@ -825,6 +835,8 @@ export class RepoBackupTaskHandler implements TaskHandler {
      * 重放时拿回的才是同一个时刻，否则日志与前端显示的重试时间会每次都漂。
      */
     const toDeferral = (error: unknown): SerializableDeferral | null => {
+      // A one-shot task must never schedule a later run of the repository's latest revision.
+      if (oneOff) return null;
       const plan = planRetryForError(error);
       if (!plan.deferrable || plan.retryAtMs === null) return null;
       return { kind: plan.kind, retryAtMs: plan.retryAtMs, message: plan.message };
@@ -1046,7 +1058,8 @@ export class RepoBackupTaskHandler implements TaskHandler {
            */
           const refBudgetReason = budgetExhausted();
           if (refBudgetReason) {
-            result.decision = "deferred";
+            result.decision = oneOff ? "failed" : "deferred";
+            if (oneOff) result.error = `一次性备份未完成，请手动重试：${refBudgetReason}`;
             result.budgetReason = refBudgetReason;
             // BudgetExhaustedError 一定可延迟，这里的 ! 只是类型收窄
             result.deferral = toDeferral(new BudgetExhaustedError(refBudgetReason))!;
@@ -1129,7 +1142,7 @@ export class RepoBackupTaskHandler implements TaskHandler {
                    * 不在这里把水位补上，下一轮检测还会判「有更新」，于是永远在这条
                    * 「创建任务 → 发现已存在 → 跳过」的空转上打转。
                    */
-                  await advanceBackedUpWatermark(
+                  if (!oneOff) await advanceBackedUpWatermark(
                     codeRepo,
                     repoRow.id,
                     // 修改点（P0 水位键错位）：用跟踪键，不用 provider 解析出的具体 Tag。
@@ -1289,7 +1302,7 @@ export class RepoBackupTaskHandler implements TaskHandler {
                 .catch((e: any) => console.warn("[RepoBackupTaskHandler] 写入失败留痕记录出错:", e?.message || e));
             }
 
-            await codeRepo
+            if (!oneOff) await codeRepo
               .updateRepository(repoRow.id, { last_error: message })
               .catch((e: any) => console.warn("[RepoBackupTaskHandler] 更新仓库状态失败:", e?.message || e));
 
@@ -1496,7 +1509,8 @@ export class RepoBackupTaskHandler implements TaskHandler {
              */
             const targetBudgetReason = budgetExhausted();
             if (targetBudgetReason) {
-              outcome.status = "deferred";
+              outcome.status = oneOff ? "failed" : "deferred";
+              if (oneOff) outcome.error = `一次性备份未完成，请手动重试：${targetBudgetReason}`;
               outcome.budgetReason = targetBudgetReason;
               outcome.deferral = toDeferral(new BudgetExhaustedError(targetBudgetReason))!;
 
@@ -1506,7 +1520,7 @@ export class RepoBackupTaskHandler implements TaskHandler {
                   backup_id: backupId,
                   mount_id: mount.id,
                   mount_path: mount.mount_path,
-                  status: "deferred",
+                  status: oneOff ? "failed" : "deferred",
                   error_message: targetBudgetReason,
                 })
                 .catch((e: any) =>
@@ -1535,6 +1549,7 @@ export class RepoBackupTaskHandler implements TaskHandler {
               commitSha: resolvedVersion.commitSha,
               ref: resolvedVersion.ref,
               at: new Date(prep.pathAtMs),
+              oneOffId: oneOff ? repoRow.id : null,
             });
 
             // 修改点（任务卡住排查）：传输护栏必须在发起请求前创建，
@@ -1795,9 +1810,9 @@ export class RepoBackupTaskHandler implements TaskHandler {
                * 在快撞上步骤超时的时候开这个头很可能半途被打断；而重复目录多留一轮毫无影响，
                * 下一次该分支备份成功后照样会扫。
                */
-              if (deadlinePassed()) {
+              if (!oneOff && deadlinePassed()) {
                 console.warn("[RepoBackupTaskHandler] 本次运行已达时间上限，跳过重复目录去重（下一轮继续）");
-              } else {
+              } else if (!oneOff) {
                 try {
                   const referencedDirs = toReferencedDirs(await codeRepo.findReferencedPaths(repoRow.id));
                   await dedupeBackupDirs({
@@ -1895,6 +1910,8 @@ export class RepoBackupTaskHandler implements TaskHandler {
           if (transfer.manifestWarning) {
             targetErrors.push(`${transfer.label}: ${transfer.manifestWarning}`);
           }
+        } else if (oneOff) {
+          targetErrors.push(`${transfer.label}: ${transfer.error || "一次性备份未完成，请手动重试"}`);
         } else if (transfer.budgetReason) {
           budgetNotes.push(`${transfer.label}: ${transfer.budgetReason}，已安排下一轮补写`);
         } else if (transfer.deferral) {
@@ -1998,7 +2015,7 @@ export class RepoBackupTaskHandler implements TaskHandler {
 
           // 修改点（版本保留优化）：备份成功后清理超出保留数量的最旧版本
           let pruneMessage = "";
-          try {
+          if (!oneOff) try {
             currentStage = "pruning";
             await report(processed);
             /**
@@ -2044,7 +2061,7 @@ export class RepoBackupTaskHandler implements TaskHandler {
             finished_at: finishedAt,
           });
 
-          await codeRepo.updateRepository(repoRow.id, {
+          if (!oneOff) await codeRepo.updateRepository(repoRow.id, {
             last_backup_at: finishedAt,
             last_known_commit_sha: resolvedVersion.commitSha,
             // 修改点（状态显示不一致修复）：last_error 只承载**真正的失败原因**。
@@ -2062,7 +2079,7 @@ export class RepoBackupTaskHandler implements TaskHandler {
            * 备份任务跑起来后 prepare-ref 的去重逻辑会识别出「只缺某几个目标」并只补写它们
            * —— 这正是既有的自愈路径，第 4 期不改它，只是别把它掐断。
            */
-          if (allDone) {
+          if (allDone && !oneOff) {
             await advanceBackedUpWatermark(
               codeRepo,
               repoRow.id,
@@ -2259,6 +2276,7 @@ export class RepoBackupTaskHandler implements TaskHandler {
   }: any) {
     return {
       schemaVersion: 1,
+      backupMode: repoRow.id.startsWith("oneoff-") ? "manual_commit" : "tracked",
       provider,
       repoIdentifier,
       repositoryId: repoRow.id,
