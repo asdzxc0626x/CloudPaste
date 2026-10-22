@@ -90,6 +90,49 @@ test("disabled S3 usage retains the existing index fallback without listing the 
   assert.equal(result.computed.usedBytes, 77);
 });
 
+for (const enableDiskUsage of [undefined, 0]) {
+  test(`B2 without scan opt-in (${enableDiskUsage}) explains how to enable it when no index exists`, async (t) => {
+    const { cfg, metrics, usage } = await setup(t, { provider_type: "Backblaze B2", enable_disk_usage: enableDiskUsage });
+    await metrics.upsertEntry({ scopeType: "storage_config", scopeId: cfg.id, metricKey: "computed_usage", valueNum: 123, valueText: "provider", snapshotAtMs: 1000 });
+    t.mock.method(usage, "getVfsNodesUsedBytes", async () => null);
+    t.mock.method(usage, "getFsIndexUsedBytes", async () => ({ usedBytes: null, staleMountIds: [] }));
+    const result = await usage.computeAndPersistSnapshot(cfg.id);
+    const row = await metrics.getEntry("storage_config", cfg.id, "computed_usage");
+    assert.equal(result.ok, false);
+    assert.match(result.message, /S3.*高级.*启用真实对象占用统计/);
+    assert.match(row.error_message, /S3.*高级.*启用真实对象占用统计/);
+    assert.equal(row.value_num, 123);
+    assert.equal(row.snapshot_at_ms, 1000);
+    assert.equal(cfg.enable_disk_usage, enableDiskUsage);
+  });
+}
+
+test("enabled B2 usage refresh measures objects instead of relying on a browse index", async (t) => {
+  const { cfg, metrics, usage } = await setup(t, { provider_type: "Backblaze B2" });
+  const pages = [
+    { IsTruncated: true, NextContinuationToken: "next", Contents: [{ Key: "repo/archive", Size: 40 }] },
+    { IsTruncated: false, Contents: [{ Key: "external/file", Size: 80 }] },
+  ];
+  t.mock.method(S3StorageDriver.prototype, "initialize", async function () {
+    this.initialized = true;
+    this.s3Client = { send: async () => pages.shift() };
+  });
+  const result = await usage.computeAndPersistSnapshot(cfg.id);
+  assert.equal(result.ok, true);
+  assert.equal(result.computed.usedBytes, 120);
+  assert.equal(result.computed.source, "provider");
+  assert.equal((await metrics.getEntry("storage_config", cfg.id, "computed_usage")).value_num, 120);
+});
+
+for (const allowProvider of [false, "cached"]) {
+  test(`disabled B2 remains unknown without throwing in the ${allowProvider} usage path`, async (t) => {
+    const { cfg, usage } = await setup(t, { provider_type: "Backblaze B2", enable_disk_usage: 0 });
+    t.mock.method(usage, "getVfsNodesUsedBytes", async () => null);
+    t.mock.method(usage, "getFsIndexUsedBytes", async () => ({ usedBytes: null, staleMountIds: [] }));
+    assert.equal(await usage.computeUsage(cfg.id, { allowProvider }), null);
+  });
+}
+
 test("a report does not coerce a missing saved usage value to zero", async (t) => {
   const { cfg, db, metrics, factory } = await setup(t);
   await metrics.upsertEntry({ scopeType: "storage_config", scopeId: cfg.id, metricKey: "computed_usage", valueNum: null, valueText: "provider", errorMessage: "scan failed" });

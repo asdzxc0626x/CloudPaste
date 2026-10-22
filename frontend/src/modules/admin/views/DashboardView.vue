@@ -630,7 +630,7 @@ const handleRefreshStorageSnapshots = async () => {
     await fetchStorageUsageReport();
   } catch (err) {
     log.error("刷新存储用量快照失败:", err);
-    storageRefreshError.value = t("admin.dashboard.usageRefreshFailed", { count: "" });
+    storageRefreshError.value = t("admin.dashboard.usageRefreshError");
   } finally {
     isRefreshingStorage.value = false;
   }
@@ -984,7 +984,7 @@ useEventListener(window, "languageChanged", handleLanguageChange);
 
           <!-- 快照时间 -->
           <p v-if="currentBucketData.usageError" role="alert" class="text-xs text-red-500 mb-2">
-            {{ t("admin.dashboard.usageRefreshFailed", { count: "" }) }}: {{ currentBucketData.usageError }}
+            {{ t("admin.dashboard.usageRefreshError") }}: {{ currentBucketData.usageError }}
           </p>
           <div v-if="currentBucketData.snapshotAt" class="text-xs" :class="darkMode ? 'text-gray-500' : 'text-gray-400'">
             {{ t("admin.dashboard.snapshotTime") }}: {{ formatSnapshotTime(currentBucketData.snapshotAt) }}

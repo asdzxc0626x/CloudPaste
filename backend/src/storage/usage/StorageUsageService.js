@@ -592,6 +592,10 @@ export class StorageUsageService {
       return value;
     }
 
+    if (storageType === "S3" && !enableDiskUsage && (options?.allowProvider ?? true) === true) {
+      throw new ValidationError("S3 真实对象占用统计未启用，且没有可用的文件索引；请在存储配置 > S3 > 高级中开启「启用真实对象占用统计」，保存后刷新存储用量");
+    }
+
     computedUsageCache.set(cacheKey, { value: null, expiresAtMs: nowMs() + COMPUTED_USAGE_CACHE_TTL_MS });
     return null;
   }

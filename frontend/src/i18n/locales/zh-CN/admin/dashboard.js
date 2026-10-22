@@ -39,6 +39,7 @@ export default {
     usageUnknown: "尚未统计",
     usageIncomplete: "部分存储尚未统计，当前为已知用量合计",
     usageRefreshFailed: "用量刷新失败（{count}），保留上次快照",
+    usageRefreshError: "用量刷新失败，保留上次快照",
     remaining: "剩余",
     total: "总容量",
     used: "已使用",

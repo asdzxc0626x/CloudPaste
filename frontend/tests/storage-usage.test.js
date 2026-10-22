@@ -28,7 +28,11 @@ before(async () => {
       load(id) {
         if (id === "\0test-system") return `export const useAdminSystemService = () => ({});`;
         if (id === "\0test-dashboard-service") return `export const useDashboardService = () => ({
-          refreshStorageUsageSnapshots: async () => globalThis[Symbol.for("cloudpaste.storage-usage.fixture")].refreshResult,
+          refreshStorageUsageSnapshots: async () => {
+            const result = globalThis[Symbol.for("cloudpaste.storage-usage.fixture")].refreshResult;
+            if (result instanceof Error) throw result;
+            return result;
+          },
           getStorageUsageReport: async () => globalThis[Symbol.for("cloudpaste.storage-usage.fixture")].report,
         });`;
         if (id === "\0test-theme") return `export const useThemeMode = () => ({isDarkMode: false});`;
@@ -87,4 +91,17 @@ test("aggregate usage is labeled incomplete when a storage snapshot is missing",
 test("manual refresh shows failures even when the HTTP request succeeds", async () => {
   const html = await render([{ id: "s3", name: "S3", computedUsage: { usedBytes: 0 } }], "s3", { failCount: 1 });
   assert.match(html, /用量刷新失败（1）/);
+});
+
+test("a B2 snapshot error shows the cause without an empty failure count", async () => {
+  const html = await render([{ id: "b2", name: "B2", storageType: "S3", computedUsage: null, usageError: "enable_disk_usage = false" }], "b2");
+  assert.match(html, /用量刷新失败/);
+  assert.match(html, /enable_disk_usage = false/);
+  assert.doesNotMatch(html, /用量刷新失败（\s*）/);
+});
+
+test("a failed refresh request shows a count-free error", async () => {
+  const html = await render([{ id: "b2", name: "B2", computedUsage: null }], "b2", new Error("request timed out"));
+  assert.match(html, /用量刷新失败/);
+  assert.doesNotMatch(html, /用量刷新失败（\s*）/);
 });

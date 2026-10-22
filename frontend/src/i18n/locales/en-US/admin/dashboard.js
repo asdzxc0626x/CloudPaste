@@ -39,6 +39,7 @@ export default {
     usageUnknown: "Not measured",
     usageIncomplete: "Some storages have not been measured; this is the known usage subtotal",
     usageRefreshFailed: "Usage refresh failed ({count}); previous snapshot retained",
+    usageRefreshError: "Usage refresh failed; previous snapshot retained",
     remaining: "Remaining",
     total: "Total",
     used: "Used",
