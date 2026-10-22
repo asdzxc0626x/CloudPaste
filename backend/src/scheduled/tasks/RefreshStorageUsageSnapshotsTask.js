@@ -119,7 +119,8 @@ export class RefreshStorageUsageSnapshotsTask {
 
     await runWithConcurrency(ids, maxConcurrency, async (id) => {
       try {
-        await usage.computeAndPersistSnapshot(String(id));
+        const result = await usage.computeAndPersistSnapshot(String(id));
+        if (!result.ok) throw new Error(result.message);
         okCount += 1;
       } catch (e) {
         failCount += 1;

@@ -11,6 +11,7 @@ function clampPositiveInt(value) {
 }
 
 function clampNonNegativeInt(value) {
+  if (value == null) return null;
   const n = Number(value);
   if (!Number.isFinite(n)) return null;
   const i = Math.floor(n);
@@ -113,6 +114,7 @@ export async function getStorageUsageReport(db, adminId, encryptionSecret, repos
       enableDiskUsage,
       configuredLimitBytes,
       computedUsage,
+      usageError: computedRow?.error_message || null,
       limitStatus,
     });
   }

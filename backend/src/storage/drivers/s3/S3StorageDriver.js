@@ -7,8 +7,8 @@ import { BaseDriver } from "../../interfaces/capabilities/BaseDriver.js";
 import { CAPABILITIES } from "../../interfaces/capabilities/index.js";
 import { ApiStatus } from "../../../constants/index.js";
 import { createS3Client, generateCustomHostDirectUrl } from "./utils/s3Utils.js";
-import { DeleteObjectCommand } from "@aws-sdk/client-s3";
-import { normalizeS3SubPath, isCompleteFilePath } from "./utils/S3PathUtils.js";
+import { DeleteObjectCommand, ListObjectsV2Command } from "@aws-sdk/client-s3";
+import { normalizeS3SubPath, normalizeS3RootPrefix, isCompleteFilePath } from "./utils/S3PathUtils.js";
 import { updateMountLastUsed } from "../../fs/utils/MountResolver.js";
 import { buildFullProxyUrl } from "../../../constants/proxy.js";
 import { S3DriverError, AppError } from "../../../http/errors.js";
@@ -622,10 +622,10 @@ export class S3StorageDriver extends BaseDriver {
    * 获取存储统计信息
    * @returns {Promise<Object>} 统计信息
    */
-  async getStats() {
+  async getStats({ abortSignal = AbortSignal.timeout(30_000) } = {}) {
     this._ensureInitialized();
 
-    return {
+    const stats = {
       type: this.type,
       provider: this.config.provider_type,
       bucket: this.config.bucket_name,
@@ -633,6 +633,48 @@ export class S3StorageDriver extends BaseDriver {
       region: this.config.region || "auto",
       initialized: this.initialized,
     };
+
+    if (this.config.enable_disk_usage !== 1) {
+      return { ...stats, supported: false, message: "S3 对象占用统计未启用" };
+    }
+
+    const prefix = normalizeS3RootPrefix(this.config.root_prefix);
+    let usedBytes = 0;
+    let continuationToken;
+    const seenTokens = new Set();
+
+    // Bound refresh work; never publish a partial scan as the bucket's usage.
+    for (let page = 0; page < 500; page += 1) {
+      abortSignal.throwIfAborted();
+      const result = await this.s3Client.send(new ListObjectsV2Command({
+        Bucket: this.config.bucket_name,
+        Prefix: prefix || undefined,
+        MaxKeys: 1000,
+        ContinuationToken: continuationToken,
+      }), { abortSignal });
+      abortSignal.throwIfAborted();
+
+      if (typeof result.IsTruncated !== "boolean") {
+        throw new S3DriverError("S3 分页状态无效，无法完成占用统计");
+      }
+
+      for (const object of result.Contents || []) {
+        if (!Number.isSafeInteger(object.Size) || object.Size < 0 || !Number.isSafeInteger(usedBytes + object.Size)) {
+          throw new S3DriverError("S3 对象大小无效，无法完成占用统计");
+        }
+        usedBytes += object.Size;
+      }
+      if (result.IsTruncated === false) {
+        return { ...stats, supported: true, quota: { usedBytes } };
+      }
+      const next = result.NextContinuationToken;
+      if (typeof next !== "string" || !next || seenTokens.has(next)) {
+        throw new S3DriverError("S3 分页标记缺失或重复，无法完成占用统计");
+      }
+      seenTokens.add(next);
+      continuationToken = next;
+    }
+    throw new S3DriverError("S3 占用统计超过 500 页，请缩小 root_prefix 范围");
   }
 
   /**

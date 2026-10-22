@@ -11,7 +11,7 @@
     "preview": "vite preview",
     "clean": "node clean-deps.js",
     "lint": "eslint src --ext .js,.vue",
-    "test": "node --test tests/repo-backup.test.js"
+    "test": "node --test --test-concurrency=1 tests/*.test.js"
   },
   "dependencies": {
     "@imengyu/vue3-context-menu": "^1.5.1",

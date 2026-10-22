@@ -36,6 +36,9 @@ export default {
     usagePercent: "Usage",
     availableStorage: "Available Storage",
     usedStorage: "Used Storage",
+    usageUnknown: "Not measured",
+    usageIncomplete: "Some storages have not been measured; this is the known usage subtotal",
+    usageRefreshFailed: "Usage refresh failed ({count}); previous snapshot retained",
     remaining: "Remaining",
     total: "Total",
     used: "Used",
@@ -66,7 +69,7 @@ export default {
 
     // Source descriptions
     sourceDescriptions: {
-      provider: "Data from storage driver's native quota API",
+      provider: "Data from the provider quota API or S3 current object-size totals",
       localFs: "Calculated by scanning local disk directory",
       vfsNodes: "Based on virtual file system node statistics",
       fsIndex: "Based on file index records",

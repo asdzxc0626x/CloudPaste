@@ -30,6 +30,7 @@ const COMPUTED_USAGE_CACHE_TTL_MS = 10 * 1000;
 
 // 防止 provider 配额接口卡死：默认最多等 6 秒（超时视为“不支持/不可用”，继续走后续层兜底）
 const PROVIDER_QUOTA_MAX_MS = 6 * 1000;
+const S3_USAGE_MAX_MS = 30 * 1000;
 
 // 防止 LOCAL 扫目录卡死：默认 10 秒、最多 50 万个条目
 const LOCAL_DU_MAX_MS = 10 * 1000;
@@ -49,6 +50,7 @@ function nowMs() {
 }
 
 function clampNonNegativeInt(value) {
+  if (value == null) return null;
   const n = Number(value);
   if (!Number.isFinite(n)) return null;
   const i = Math.floor(n);
@@ -99,7 +101,7 @@ function buildProviderQuotaSummary(quota) {
   return hasAny ? summary : null;
 }
 
-async function withTimeout(promise, timeoutMs, timeoutMessage) {
+async function withTimeout(promise, timeoutMs, timeoutMessage, onTimeout) {
   const ms = Number(timeoutMs) || 0;
   if (!ms || ms <= 0) {
     return await promise;
@@ -108,6 +110,7 @@ async function withTimeout(promise, timeoutMs, timeoutMessage) {
   let timer;
   const timeoutPromise = new Promise((_, reject) => {
     timer = setTimeout(() => {
+      onTimeout?.();
       reject(new Error(timeoutMessage || "操作超时"));
     }, ms);
   });
@@ -173,7 +176,11 @@ export class StorageUsageService {
 
     const now = nowMs();
 
-    const computed = await this.computeUsage(id, { allowProvider: allowProviderInUsage }).catch(() => null);
+    let computeError = null;
+    const computed = await this.computeUsage(id, { allowProvider: allowProviderInUsage, forceRefresh: true }).catch((error) => {
+      computeError = error;
+      return null;
+    });
     if (computed && clampNonNegativeInt(computed.usedBytes) != null && safeString(computed.source).trim()) {
       const detailsJsonText =
         computed.details && typeof computed.details === "object" ? JSON.stringify(computed.details) : null;
@@ -205,10 +212,10 @@ export class StorageUsageService {
       valueJsonText: existing?.value_json_text ?? null,
       snapshotAtMs: existing?.snapshot_at_ms ?? null,
       updatedAtMs: now,
-      errorMessage: "无法计算用量（所有来源均不可用）",
+      errorMessage: computeError?.message || "无法计算用量（所有来源均不可用）",
     });
 
-    return { ok: true, message: "快照已刷新，但未能计算用量", computed: null };
+    return { ok: false, message: computeError?.message || "未能计算用量，保留原有快照", computed: null };
   }
 
   /**
@@ -230,7 +237,7 @@ export class StorageUsageService {
   /**
    * ProviderQuota：从 driver.getStats().quota 抽取（best-effort）
    * @param {string} storageConfigId
-   * @param {{ ignoreEnableDiskUsage?: boolean }} [options]
+   * @param {{ ignoreEnableDiskUsage?: boolean, cacheOnly?: boolean, forceRefresh?: boolean }} [options]
    * @returns {Promise<{supported:boolean, quota?:any, message?:string, snapshotAt?:string}>}
    */
   async getProviderQuota(storageConfigId, options = {}) {
@@ -241,7 +248,7 @@ export class StorageUsageService {
 
     const cacheKey = id;
     const cached = providerQuotaCache.get(cacheKey);
-    if (cached && cached.expiresAtMs > nowMs()) {
+    if (options?.forceRefresh !== true && cached && cached.expiresAtMs > nowMs()) {
       return cached.value;
     }
 
@@ -276,13 +283,20 @@ export class StorageUsageService {
         return value;
       }
 
+      const controller = new AbortController();
+      const maxMs = cfg.storage_type === "S3" ? S3_USAGE_MAX_MS : PROVIDER_QUOTA_MAX_MS;
       const stats = await withTimeout(
-        driver.getStats(),
-        PROVIDER_QUOTA_MAX_MS,
-        `读取上游配额超时（>${Math.round(PROVIDER_QUOTA_MAX_MS / 1000)}s）`,
+        driver.getStats({ abortSignal: controller.signal }),
+        maxMs,
+        `读取上游用量超时（>${Math.round(maxMs / 1000)}s）`,
+        () => controller.abort(),
       );
       const quota = stats?.quota || null;
       const supported = stats?.supported === true;
+
+      if (cfg.storage_type === "S3" && (!supported || clampNonNegativeInt(quota?.usedBytes) == null)) {
+        throw new ValidationError(stats?.message || "S3 对象占用统计不可用");
+      }
 
       const value = supported
         ? {
@@ -298,6 +312,7 @@ export class StorageUsageService {
       providerQuotaCache.set(cacheKey, { value, expiresAtMs: nowMs() + PROVIDER_QUOTA_CACHE_TTL_MS });
       return value;
     } catch (error) {
+      if (cfg.storage_type === "S3" && enableDiskUsage) throw error;
       const value = buildQuotaSupportedFalse(
         { type: cfg.storage_type, error: error?.message ? String(error.message) : String(error) },
         error?.message ? `读取上游配额失败：${error.message}` : "读取上游配额失败",
@@ -511,13 +526,13 @@ export class StorageUsageService {
    * - 其它：provider.used -> vfs_nodes -> fs_index
    *
    * @param {string} storageConfigId
-   * @param {{ allowProvider?: boolean }} [options]
+   * @param {{ allowProvider?: boolean | "cached", forceRefresh?: boolean }} [options]
    * @returns {Promise<{usedBytes:number, source:"provider"|"vfs_nodes"|"local_fs"|"fs_index", details?:any}|null>}
    */
   async computeUsage(storageConfigId, options = {}) {
     const cacheKey = `${safeString(storageConfigId).trim()}|${String(options?.allowProvider ?? true)}`;
     const cached = computedUsageCache.get(cacheKey);
-    if (cached && cached.expiresAtMs > nowMs()) {
+    if (options?.forceRefresh !== true && cached && cached.expiresAtMs > nowMs()) {
       return cached.value;
     }
 
@@ -541,7 +556,10 @@ export class StorageUsageService {
     if (!isLocal) {
       const allowProviderMode = options?.allowProvider ?? true; // true | false | "cached"
       if (allowProviderMode !== false) {
-        const provider = await this.getProviderQuota(storageConfigId, { cacheOnly: allowProviderMode === "cached" }).catch(() => null);
+        const provider = await this.getProviderQuota(storageConfigId, {
+          cacheOnly: allowProviderMode === "cached",
+          forceRefresh: options?.forceRefresh,
+        });
         const providerQuota = buildProviderQuotaSummary(provider?.quota);
         const providerUsed = clampNonNegativeInt(providerQuota?.usedBytes);
         if (provider && provider.supported === true && providerUsed != null) {
@@ -553,6 +571,7 @@ export class StorageUsageService {
           computedUsageCache.set(cacheKey, { value, expiresAtMs: nowMs() + COMPUTED_USAGE_CACHE_TTL_MS });
           return value;
         }
+        if (storageType === "S3" && enableDiskUsage) return null;
       }
     }
 

@@ -86,6 +86,7 @@ const storageUsageReport = ref({
 
 // 刷新存储快照状态
 const isRefreshingStorage = ref(false);
+const storageRefreshError = ref(null);
 
 // 汇总标签的悬浮列表展开状态（记录当前展开的标签类型）
 const expandedSourceTag = ref(null); // 'provider' | 'local_fs' | 'vfs_nodes' | 'fs_index' | 'unlimited' | 'exceeded' | null
@@ -286,7 +287,7 @@ const currentBucketData = computed(() => {
   // 返回选中的存储配置详细数据
   const storage = storages.find((s) => s.id === selectedStorageId.value);
   if (storage) {
-    const usedBytes = storage.computedUsage?.usedBytes || 0;
+    const usedBytes = storage.computedUsage?.usedBytes ?? null;
     const limitBytes = storage.limitStatus?.limitBytes || storage.configuredLimitBytes || 0;
     const usagePercent = storage.limitStatus?.percentUsed || (limitBytes > 0 ? Math.min(100, Math.round((usedBytes / limitBytes) * 100)) : 0);
 
@@ -306,6 +307,7 @@ const currentBucketData = computed(() => {
       enableDiskUsage: storage.enableDiskUsage ?? null,
       exceeded: storage.limitStatus?.exceeded || false,
       configuredLimitBytes: storage.configuredLimitBytes,
+      usageError: storage.usageError || null,
     };
   }
 
@@ -329,6 +331,10 @@ const currentBucketData = computed(() => {
 });
 
 // 获取数据来源的显示名称和样式
+const hasIncompleteStorageUsage = computed(() =>
+  (storageUsageReport.value.storages || []).some((storage) => storage.computedUsage?.usedBytes == null),
+);
+
 const getSourceInfo = (source) => {
   const sourceMap = {
     provider: {
@@ -484,6 +490,7 @@ const getStorageTypeName = (type) => {
 
 // 格式化存储大小
 const formatBytes = (bytes, decimals = 2) => {
+  if (bytes == null) return t("admin.dashboard.usageUnknown");
   if (bytes === 0) return `0 ${t("admin.dashboard.storageUnits.bytes")}`;
 
   const k = 1024;
@@ -613,12 +620,17 @@ const handleRefreshStorageSnapshots = async () => {
   if (isRefreshingStorage.value) return;
 
   isRefreshingStorage.value = true;
+  storageRefreshError.value = null;
   try {
-    await refreshStorageUsageSnapshots({ maxItems: 50 });
+    const response = await refreshStorageUsageSnapshots({ maxItems: 50 });
+    if (response.failCount > 0) {
+      storageRefreshError.value = t("admin.dashboard.usageRefreshFailed", { count: response.failCount });
+    }
     // 刷新完成后重新获取存储用量报告
     await fetchStorageUsageReport();
   } catch (err) {
     log.error("刷新存储用量快照失败:", err);
+    storageRefreshError.value = t("admin.dashboard.usageRefreshFailed", { count: "" });
   } finally {
     isRefreshingStorage.value = false;
   }
@@ -871,13 +883,17 @@ useEventListener(window, "languageChanged", handleLanguageChange);
         </div>
 
         <!-- 使用量显示 -->
+        <p v-if="storageRefreshError" role="alert" class="text-xs text-red-500 mb-2">{{ storageRefreshError }}</p>
+        <p v-if="currentBucketData.isAggregate && hasIncompleteStorageUsage" class="text-xs text-amber-600 mb-2">
+          {{ t("admin.dashboard.usageIncomplete") }}
+        </p>
         <div class="flex justify-between items-center mb-1.5">
           <span class="text-sm" :class="darkMode ? 'text-gray-300' : 'text-gray-500'">
             {{ formatBytes(currentBucketData.usedStorage) }} /
             {{ currentBucketData.totalStorage > 0 ? formatBytes(currentBucketData.totalStorage) : t("admin.dashboard.unlimited") }}
           </span>
           <span
-            v-if="currentBucketData.totalStorage > 0"
+            v-if="currentBucketData.totalStorage > 0 && currentBucketData.usedStorage != null"
             class="text-sm font-medium"
             :class="[
               currentBucketData.exceeded
@@ -889,14 +905,14 @@ useEventListener(window, "languageChanged", handleLanguageChange);
           >
             {{ currentBucketData.usagePercent }}%
           </span>
-          <span v-else class="text-sm font-medium" :class="darkMode ? 'text-gray-300' : 'text-gray-600'">
+          <span v-else-if="currentBucketData.totalStorage === 0" class="text-sm font-medium" :class="darkMode ? 'text-gray-300' : 'text-gray-600'">
             {{ t("admin.dashboard.unlimited") }}
           </span>
         </div>
 
         <!-- 进度条 -->
         <div
-          v-if="currentBucketData.totalStorage > 0"
+          v-if="currentBucketData.totalStorage > 0 && currentBucketData.usedStorage != null"
           class="w-full bg-gray-200 rounded-full h-2.5"
           :class="darkMode ? 'bg-gray-600' : 'bg-gray-200'"
         >
@@ -954,7 +970,7 @@ useEventListener(window, "languageChanged", handleLanguageChange);
               {{ t("admin.dashboard.providerQuota") }}
             </p>
             <div class="flex items-center gap-3 text-xs" :class="darkMode ? 'text-gray-300' : 'text-gray-600'">
-              <span>
+              <span v-if="currentBucketData.providerQuota.totalBytes != null">
                 {{ t("admin.dashboard.total") }}: {{ formatBytes(currentBucketData.providerQuota.totalBytes) }}
               </span>
               <span>
@@ -967,6 +983,9 @@ useEventListener(window, "languageChanged", handleLanguageChange);
           </div>
 
           <!-- 快照时间 -->
+          <p v-if="currentBucketData.usageError" role="alert" class="text-xs text-red-500 mb-2">
+            {{ t("admin.dashboard.usageRefreshFailed", { count: "" }) }}: {{ currentBucketData.usageError }}
+          </p>
           <div v-if="currentBucketData.snapshotAt" class="text-xs" :class="darkMode ? 'text-gray-500' : 'text-gray-400'">
             {{ t("admin.dashboard.snapshotTime") }}: {{ formatSnapshotTime(currentBucketData.snapshotAt) }}
           </div>

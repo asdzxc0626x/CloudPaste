@@ -51,6 +51,7 @@ export default {
 
       // S3 specific
       s3: {
+        enable_disk_usage: "Measure actual object usage",
         multipart_part_size_mb: "Multipart part size (MB)",
         multipart_concurrency: "Multipart concurrency",
       },
@@ -278,6 +279,7 @@ export default {
       custom_host: "Custom domain for public access links (e.g., CDN acceleration)",
       url_proxy: "Access storage through a proxy server for relay scenarios",
       s3: {
+        enable_disk_usage: "Sum current object sizes during snapshot refresh (restricted to root_prefix when configured), including backups and external uploads, excluding old versions and unfinished multipart uploads. Requires list permission and may incur request charges; off by default. Set the frequency in the Refresh storage usage snapshots scheduled job (default: 6 hours; daily or longer recommended). Scans are limited to 30 seconds / 500 pages; failures retain the previous snapshot.",
         multipart_part_size_mb: "Multipart part size (MB) for browser direct-upload. Default 5MB; larger parts mean fewer parts but higher cost to retry a failed part.",
         multipart_concurrency: "How many parts to upload at the same time for browser direct-upload. Default 3; higher can be faster but less stable on weak networks.",
       },

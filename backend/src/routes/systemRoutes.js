@@ -130,7 +130,8 @@ systemRoutes.post("/api/admin/storage-usage/refresh", requireAdmin, async (c) =>
   // 串行
   for (const id of ids) {
     try {
-      await usage.computeAndPersistSnapshot(String(id));
+      const result = await usage.computeAndPersistSnapshot(String(id));
+      if (!result.ok) throw new Error(result.message);
       okCount += 1;
     } catch (e) {
       failCount += 1;

@@ -51,6 +51,7 @@ export default {
 
       // S3 特有字段
       s3: {
+        enable_disk_usage: "启用真实对象占用统计",
         multipart_part_size_mb: "分片大小（MB）",
         multipart_concurrency: "分片上传并发数",
       },
@@ -282,6 +283,7 @@ export default {
       custom_host: "用于生成公开访问链接的自定义域名（CDN 加速等场景）",
       url_proxy: "通过代理服务器访问存储，适用于需要中转的场景",
       s3: {
+        enable_disk_usage: "刷新快照时分页汇总桶内当前对象大小（配置 root_prefix 时仅统计该前缀），包含仓库备份和外部上传文件，不含历史版本及未完成分片。需要列举权限，可能产生请求费用；默认关闭。刷新频率在定时任务「刷新存储用量快照」中设置，默认每 6 小时，建议每天或更长。单次最多 30 秒、500 页，超限保留旧快照。",
         multipart_part_size_mb: "前端直传分片上传的分片大小（MB）。默认 5MB；分片越大分片数量越少，但单片失败重传成本更高。",
         multipart_concurrency: "前端直传分片上传并发数（同时上传多少片）。默认 3；越大速度可能越快，但更吃网络也更容易失败。",
       },

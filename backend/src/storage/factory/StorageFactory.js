@@ -770,6 +770,7 @@ StorageFactory.registerDriver(StorageFactory.SUPPORTED_TYPES.S3, {
       provider_type: cfg?.provider_type,
       endpoint_url: cfg?.endpoint_url,
       bucket_name: cfg?.bucket_name,
+      root_prefix: cfg?.root_prefix,
       region: cfg?.region,
       path_style: cfg?.path_style,
       // S3 分片上传（前端直传）
@@ -888,6 +889,14 @@ StorageFactory.registerDriver(StorageFactory.SUPPORTED_TYPES.S3, {
         validation: { min: 1 },
       },
       {
+        name: "enable_disk_usage",
+        type: "boolean",
+        required: false,
+        defaultValue: false,
+        labelKey: "admin.storage.fields.s3.enable_disk_usage",
+        ui: { descriptionKey: "admin.storage.description.s3.enable_disk_usage" },
+      },
+      {
         name: "multipart_concurrency",
         type: "number",
         required: false,
@@ -945,7 +954,7 @@ StorageFactory.registerDriver(StorageFactory.SUPPORTED_TYPES.S3, {
         {
           name: "advanced",
           titleKey: "admin.storage.groups.advanced",
-          fields: ["custom_host", "url_proxy", ["signature_expires_in", "path_style"], ["multipart_part_size_mb", "multipart_concurrency"]],
+          fields: ["custom_host", "url_proxy", ["signature_expires_in", "path_style"], ["multipart_part_size_mb", "multipart_concurrency"], "enable_disk_usage"],
         },
       ],
       summaryFields: ["bucket_name", "region", "default_folder", "path_style"],

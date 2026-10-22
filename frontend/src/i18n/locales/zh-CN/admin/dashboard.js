@@ -36,6 +36,9 @@ export default {
     usagePercent: "使用率",
     availableStorage: "可用存储",
     usedStorage: "已用存储",
+    usageUnknown: "尚未统计",
+    usageIncomplete: "部分存储尚未统计，当前为已知用量合计",
+    usageRefreshFailed: "用量刷新失败（{count}），保留上次快照",
     remaining: "剩余",
     total: "总容量",
     used: "已使用",
@@ -66,7 +69,7 @@ export default {
 
     // 数据来源描述
     sourceDescriptions: {
-      provider: "数据来自存储驱动的原生配额接口",
+      provider: "数据来自存储上游配额接口或 S3 当前对象大小汇总",
       localFs: "通过扫描本地磁盘目录计算",
       vfsNodes: "基于虚拟文件系统节点统计",
       fsIndex: "基于文件索引记录统计",
