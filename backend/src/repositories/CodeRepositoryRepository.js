@@ -153,6 +153,7 @@ export class CodeRepositoryRepository extends BaseRepository {
       id: data.id,
       provider: data.provider,
       name: data.name || null,
+      remark: data.remark ?? "",
       repo_identifier: data.repo_identifier,
       track_mode: data.track_mode || "branch",
       track_ref: data.track_ref || null,
@@ -182,6 +183,7 @@ export class CodeRepositoryRepository extends BaseRepository {
     const updates = { updated_at: new Date().toISOString() };
 
     if (data.name !== undefined) updates.name = data.name;
+    if (data.remark !== undefined) updates.remark = data.remark;
     if (data.repo_identifier !== undefined) updates.repo_identifier = data.repo_identifier;
     if (data.track_mode !== undefined) updates.track_mode = data.track_mode;
     if (data.track_ref !== undefined) updates.track_ref = data.track_ref;

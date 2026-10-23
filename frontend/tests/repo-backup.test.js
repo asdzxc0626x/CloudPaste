@@ -172,6 +172,50 @@ async function setupForm(overrides = {}) {
 
 const existingRepo = { id: "existing", provider: "github", repoIdentifier: "owner/repo", trackMode: "branch", trackRefs: ["dev"], targetMountIds: ["mount-1"], targetPathPrefix: "/custom", config: { token: "********tail" } };
 
+test("registered repository form loads, submits and explicitly clears remarks", async () => {
+  const { state, submissions } = await setupForm({ oneOff: false, repo: { ...existingRepo, remark: "Existing note" } });
+  assert.equal(state.formData.remark, "Existing note");
+  state.formData.remark = "  Updated\nNote  ";
+  state.handleSubmit();
+  assert.equal(submissions[0].remark, "Updated\nNote");
+  state.formData.remark = "";
+  state.handleSubmit();
+  assert.equal(submissions[1].remark, "");
+});
+
+test("new repository remarks start empty and cannot submit more than 500 characters", async () => {
+  const { state, submissions } = await setupForm({ oneOff: false, writableMounts: [{ id: "mount-1" }] });
+  assert.equal(state.formData.remark, "");
+  state.formData.repoIdentifier = "owner/new";
+  state.formData.remark = "x".repeat(501);
+  state.handleSubmit();
+  assert.equal(submissions.length, 0);
+  assert.match(state.displayError.value, /500/);
+  state.formData.remark = "x".repeat(500);
+  state.handleSubmit();
+  assert.equal(submissions[0].remark.length, 500);
+});
+
+test("remarks render as escaped text in desktop rows and mobile cards", async () => {
+  const html = await renderTable({ repositories: [{ ...existingRepo, name: "Repository", remark: '<script>alert("note")</script>\nSecond line' }] });
+  assert.equal((html.match(/&lt;script&gt;/g) || []).length, 2);
+  assert.equal((html.match(/Second line/g) || []).length, 2);
+  assert.doesNotMatch(html, /<script>/);
+});
+
+test("remark textarea is labeled and limited in create/edit, absent from one-off forms", async () => {
+  for (const repo of [null, { ...existingRepo, remark: "Existing note" }]) {
+    const context = {};
+    await renderToString(withI18n(createSSRApp({ render: () => h(RepoBackupForm, { repo, writableMounts: [{ id: "mount-1" }] }) })), context);
+    assert.match(context.teleports.body, /<label[^>]*for="repo-remark"/);
+    assert.match(context.teleports.body, /<textarea[^>]*maxlength="500"/);
+    if (repo) assert.match(context.teleports.body, /Existing note<\/textarea>/);
+  }
+  const context = {};
+  await renderToString(withI18n(createSSRApp({ render: () => h(RepoBackupForm, { oneOff: true, repo: existingRepo }) })), context);
+  assert.doesNotMatch(context.teleports.body, /id="repo-remark"/);
+});
+
 test("returning to the original repository while defaults load does not leave submit disabled", async () => {
   let resolveDefaults;
   const { state, submissions } = await setupForm({ repo: existingRepo, loadDefaults: () => new Promise((resolve) => { resolveDefaults = resolve; }) });

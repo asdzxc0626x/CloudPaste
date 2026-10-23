@@ -16,6 +16,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 
 import { DatabaseSync } from "node:sqlite";
 import {
@@ -26,7 +27,9 @@ import {
   createScheduledJobsTables,
   createScheduledJobRunsTables,
 } from "../db/migrations/sqlite/engine/schema.js";
-import { listRepositories, batchDeleteRepositories } from "../services/codeRepositoryService.js";
+import { listRepositories, batchDeleteRepositories, createRepository, updateRepository, getRepository } from "../services/codeRepositoryService.js";
+import { runLegacyMigrationByVersion } from "../db/migrations/sqlite/engine/migrations.js";
+import { APP_SCHEMA_VERSION } from "../db/migrations/sqlite/engine/version.js";
 import { CodeRepositoryRepository } from "../repositories/CodeRepositoryRepository.js";
 import { ValidationError } from "../http/errors.js";
 
@@ -110,6 +113,83 @@ async function seedMany(db, n, createdAt = "2026-01-01T00:00:00.000Z") {
 }
 
 const list = (db, options) => listRepositories(db, null, ENV.ENCRYPTION_SECRET, ENV, options);
+
+async function createRemarkRepo(db, remark) {
+  await db.prepare(`INSERT OR IGNORE INTO storage_mounts
+    (id, name, storage_type, mount_path, created_by) VALUES ('mount-1', 'Backup', 'S3', '/backup', 'admin')`).run();
+  return createRepository(db, null, ENV.ENCRYPTION_SECRET, {
+    repoIdentifier: "owner/remark", trackRefs: ["main"], targetMountIds: ["mount-1"],
+    scheduleEnabled: false, remark,
+  }, ENV);
+}
+
+test("repository remarks persist, round-trip, preserve when omitted and clear explicitly", async (t) => {
+  const db = createTestDb();
+  t.after(() => db._raw.close());
+  await setupSchema(db);
+  const created = await createRemarkRepo(db, "  Release notes\nKeep this repository  ");
+  assert.equal(created.remark, "Release notes\nKeep this repository");
+  assert.equal((await list(db)).items[0].remark, created.remark);
+  assert.equal((await getRepository(db, null, ENV.ENCRYPTION_SECRET, created.id, ENV)).remark, created.remark);
+  const before = await db.prepare("SELECT config_json, track_refs_json, target_mount_ids_json FROM code_repositories WHERE id = ?").bind(created.id).first();
+  const updated = await updateRepository(db, null, ENV.ENCRYPTION_SECRET, created.id, { remark: "Updated" }, ENV);
+  assert.equal(updated.remark, "Updated");
+  assert.deepEqual(await db.prepare("SELECT config_json, track_refs_json, target_mount_ids_json FROM code_repositories WHERE id = ?").bind(created.id).first(), before);
+  assert.equal((await updateRepository(db, null, ENV.ENCRYPTION_SECRET, created.id, { name: "Renamed" }, ENV)).remark, "Updated");
+  assert.equal((await updateRepository(db, null, ENV.ENCRYPTION_SECRET, created.id, { remark: "   " }, ENV)).remark, "");
+});
+
+test("repository remarks reject invalid types and overlong input before writing", async (t) => {
+  const db = createTestDb();
+  t.after(() => db._raw.close());
+  await setupSchema(db);
+  for (const remark of ["x".repeat(501), {}, [], 123, true]) {
+    await assert.rejects(() => createRemarkRepo(db, remark), ValidationError);
+    assert.equal((await list(db)).total, 0);
+  }
+  const created = await createRemarkRepo(db, "x".repeat(500));
+  assert.equal(created.remark.length, 500);
+  for (const remark of ["x".repeat(501), {}]) {
+    await assert.rejects(() => updateRepository(db, null, ENV.ENCRYPTION_SECRET, created.id, { remark }, ENV), ValidationError);
+    assert.equal((await getRepository(db, null, ENV.ENCRYPTION_SECRET, created.id, ENV)).remark.length, 500);
+  }
+  assert.equal((await updateRepository(db, null, ENV.ENCRYPTION_SECRET, created.id, { remark: null }, ENV)).remark, "");
+});
+
+test("fresh and migrated repositories default to empty remarks; migration is repeatable", async (t) => {
+  const db = createTestDb();
+  t.after(() => db._raw.close());
+  await setupSchema(db);
+  await seedRepo(db, { id: "old" });
+  assert.equal((await list(db)).items[0].remark, "");
+  db._raw.exec("ALTER TABLE code_repositories DROP COLUMN remark");
+  assert.equal(APP_SCHEMA_VERSION, 41);
+  await runLegacyMigrationByVersion(db, 41);
+  assert.equal((await list(db)).items[0].remark, "");
+  await db.prepare("UPDATE code_repositories SET remark = 'Preserved' WHERE id = 'old'").run();
+  await runLegacyMigrationByVersion(db, 41);
+  assert.equal((await list(db)).items[0].remark, "Preserved");
+});
+
+test("remark migration propagates write failures instead of recording a broken upgrade", async () => {
+  const db = { prepare(sql) {
+    if (sql.startsWith("PRAGMA")) return { all: async () => ({ results: [] }) };
+    return { run: async () => { throw new Error("database unavailable"); } };
+  } };
+  await assert.rejects(() => runLegacyMigrationByVersion(db, 41), /database unavailable/);
+});
+
+test("manual SQL bootstrap supports empty and saved remarks", (t) => {
+  const db = createTestDb();
+  t.after(() => db._raw.close());
+  const sql = readFileSync(new URL("../../schema.sql", import.meta.url), "utf8");
+  const table = sql.match(/CREATE TABLE code_repositories\s*\([\s\S]*?\);/)[0];
+  db._raw.exec(table);
+  db._raw.exec("INSERT INTO code_repositories (id, provider, repo_identifier, target_mount_id) VALUES ('repo', 'github', 'owner/repo', 'mount-1')");
+  assert.equal(db._raw.prepare("SELECT remark FROM code_repositories WHERE id = 'repo'").get().remark, "");
+  db._raw.prepare("UPDATE code_repositories SET remark = ? WHERE id = 'repo'").run("Bootstrap note");
+  assert.equal(db._raw.prepare("SELECT remark FROM code_repositories WHERE id = 'repo'").get().remark, "Bootstrap note");
+});
 
 // 修改点（列表刷新提速）：约束真实 SQL 次数，防止重新引入逐仓库查询。
 async function seedBackup(db, repositoryId, id, createdAt, status = "success") {

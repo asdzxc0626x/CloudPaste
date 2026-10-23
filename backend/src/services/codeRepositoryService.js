@@ -106,6 +106,13 @@ function normalizeRepoIdentifier(raw) {
   return `${segments[0]}/${segments[1]}`;
 }
 
+function normalizeRemark(raw) {
+  if (raw === undefined || raw === null) return "";
+  if (typeof raw !== "string") throw new ValidationError("备注必须是文本");
+  if (raw.length > 500) throw new ValidationError("备注最多 500 字");
+  return raw.trim();
+}
+
 /**
  * 把传入的数组/单值规范成去重后的字符串数组
  * @param {unknown} raw
@@ -257,6 +264,7 @@ function toRepositoryDto(row, extra = {}) {
     provider: row.provider,
     providerDisplayName: RepoProviderFactory.getDisplayName(row.provider),
     name: row.name || row.repo_identifier,
+    remark: row.remark ?? "",
     repoIdentifier: row.repo_identifier,
     /**
      * 仓库网页地址（修改点：点击 owner/repo 跳转仓库）
@@ -766,6 +774,7 @@ export async function buildOneOffBackupPayload(db, repositoryFactory, encryption
 }
 
 export async function createRepository(db, repositoryFactory, encryptionSecret, body, env = {}) {
+  const remark = normalizeRemark(body?.remark);
   const factory = ensureRepositoryFactory(db, repositoryFactory, env);
   const codeRepo = factory.getCodeRepositoryRepository();
   const mountRepository = factory.getMountRepository();
@@ -819,6 +828,7 @@ export async function createRepository(db, repositoryFactory, encryptionSecret, 
     id,
     provider,
     name: body?.name ? String(body.name).trim() : null,
+    remark,
     repo_identifier: repoIdentifier,
     track_mode: trackMode,
     track_ref: trackRef,
@@ -890,6 +900,7 @@ export async function updateRepository(db, repositoryFactory, encryptionSecret, 
 
   const provider = existing.provider; // provider 不允许变更（变更等同于换一个仓库）
   const updates = {};
+  if (body?.remark !== undefined) updates.remark = normalizeRemark(body.remark);
 
   const repoIdentifier =
     body?.repoIdentifier !== undefined || body?.repo_identifier !== undefined

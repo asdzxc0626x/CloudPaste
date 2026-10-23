@@ -574,6 +574,7 @@ CREATE TABLE code_repositories (
 
   provider TEXT NOT NULL,                        -- 'github'（预留 gitlab/gitea）
   name TEXT,                                     -- 展示名（可选，默认取 repo_identifier）
+  remark TEXT NOT NULL DEFAULT '',
   repo_identifier TEXT NOT NULL,                 -- 'owner/repo'
 
   track_mode TEXT NOT NULL DEFAULT 'branch',     -- 'branch' | 'release'

@@ -196,6 +196,8 @@ export default {
       repoIdentifierHint: "支持 owner/repo 或完整仓库 URL，第一阶段仅支持公开仓库",
       name: "展示名称",
       namePlaceholder: "留空则使用 owner/repo",
+      remark: "备注",
+      remarkPlaceholder: "可选，最多 500 字",
 
       trackSection: "跟踪设置",
       trackMode: "跟踪模式",
@@ -379,6 +381,7 @@ export default {
     },
 
     validation: {
+      remarkTooLong: "备注最多 500 字",
       repoRequired: "请填写仓库标识（owner/repo）",
       branchRequired: "分支模式下至少需要添加一个分支",
       mountRequired: "请至少选择一个备份目标挂载点",

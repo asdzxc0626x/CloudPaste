@@ -493,6 +493,7 @@ const dimensionRows = (repo) => [
                 >{{ repo.repoIdentifier }}</a>
                 <template v-else>{{ repo.repoIdentifier }}</template>
               </div>
+              <p v-if="repo.remark" class="text-xs mt-1 whitespace-pre-wrap break-words [overflow-wrap:anywhere]" :class="darkMode ? 'text-gray-400' : 'text-gray-500'">{{ repo.remark }}</p>
               <!-- 状态：统一结果（修改点：状态显示不一致修复）。
                    「已是最新 / 已延迟重试 / 已被阻止」都不是失败，颜色由 tone 决定，
                    不再因为 last_error 非空就渲染成红字。 -->
@@ -723,6 +724,7 @@ const dimensionRows = (repo) => [
                 >{{ repo.repoIdentifier }}</a>
                 <template v-else>{{ repo.repoIdentifier }}</template>
               </div>
+              <p v-if="repo.remark" class="text-xs mt-1 whitespace-pre-wrap break-words [overflow-wrap:anywhere]" :class="darkMode ? 'text-gray-400' : 'text-gray-500'">{{ repo.remark }}</p>
             </div>
           </div>
           <!-- 主徽章（修改点：第 5 期 前端状态展示）：与桌面端保持一致，

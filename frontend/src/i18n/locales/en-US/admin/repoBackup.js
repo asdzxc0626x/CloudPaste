@@ -191,6 +191,8 @@ export default {
       repoIdentifierHint: "Accepts owner/repo or a full repository URL; public repositories only for now",
       name: "Display name",
       namePlaceholder: "Defaults to owner/repo",
+      remark: "Remark",
+      remarkPlaceholder: "Optional, up to 500 characters",
 
       trackSection: "Tracking",
       trackMode: "Tracking mode",
@@ -380,6 +382,7 @@ export default {
     },
 
     validation: {
+      remarkTooLong: "Remarks must be no longer than 500 characters",
       repoRequired: "Please enter the repository (owner/repo)",
       branchRequired: "Add at least one branch in branch mode",
       mountRequired: "Select at least one backup target mount",

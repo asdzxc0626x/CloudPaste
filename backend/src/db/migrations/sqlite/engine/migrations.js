@@ -1350,6 +1350,14 @@ export async function runLegacyMigrationByVersion(db, version) {
       break;
     }
 
+    case 41: {
+      const columns = await db.prepare(`PRAGMA table_info(${DbTables.CODE_REPOSITORIES})`).all();
+      if (!columns.results.some((column) => column.name === "remark")) {
+        await db.prepare(`ALTER TABLE ${DbTables.CODE_REPOSITORIES} ADD COLUMN remark TEXT NOT NULL DEFAULT ''`).run();
+      }
+      break;
+    }
+
     default:
       console.log(`未知的迁移版本: ${version}`);
       break;

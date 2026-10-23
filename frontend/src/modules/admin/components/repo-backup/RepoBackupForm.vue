@@ -86,6 +86,7 @@ const DEFAULT_CRON = "30 3 * * *";
 const formData = reactive({
   provider: "github",
   name: "",
+  remark: "",
   repoIdentifier: "",
   trackMode: "branch",
   /** branch 模式：分支名数组（修改点：多分支） */
@@ -222,6 +223,7 @@ const resetForm = () => {
     Object.assign(formData, {
       provider: props.repo.provider,
       name: props.repo.name || "",
+      remark: props.repo.remark || "",
       repoIdentifier: props.repo.repoIdentifier || "",
       branch: refs[0] || "main",
       commitSha: "",
@@ -249,6 +251,7 @@ const resetForm = () => {
   Object.assign(formData, {
     provider: props.providers[0]?.provider || "github",
     name: "",
+    remark: "",
     repoIdentifier: "",
     branch: "main",
     commitSha: "",
@@ -520,6 +523,11 @@ const handleSubmit = () => {
   }
   commitBranchDraft();
 
+  if (formData.remark.length > 500) {
+    localError.value = t("admin.repoBackup.validation.remarkTooLong");
+    return;
+  }
+
   if (!formData.repoIdentifier?.trim()) {
     localError.value = t("admin.repoBackup.validation.repoRequired");
     return;
@@ -565,6 +573,7 @@ const handleSubmit = () => {
     id: props.repo?.id || null,
     provider: formData.provider,
     name: formData.name?.trim() || undefined,
+    remark: formData.remark.trim(),
     repoIdentifier: formData.repoIdentifier.trim(),
     trackMode: formData.trackMode,
     // 修改点（多分支优化）：branch 模式提交数组；release 模式提交单个 tag
@@ -707,6 +716,18 @@ onBeforeUnmount(() => document.removeEventListener("keydown", onEscClose));
                 <label :class="labelClass">{{ $t("admin.repoBackup.form.name") }}</label>
                 <input v-model="formData.name" type="text" :class="inputClass" :placeholder="$t('admin.repoBackup.form.namePlaceholder')" />
               </div>
+            </div>
+
+            <div v-if="!oneOff">
+              <label for="repo-remark" :class="labelClass">{{ $t("admin.repoBackup.form.remark") }}</label>
+              <textarea
+                id="repo-remark"
+                v-model="formData.remark"
+                rows="2"
+                maxlength="500"
+                :class="[inputClass, 'resize-y']"
+                :placeholder="$t('admin.repoBackup.form.remarkPlaceholder')"
+              ></textarea>
             </div>
 
             <div>
